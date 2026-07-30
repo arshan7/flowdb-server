@@ -1,0 +1,21 @@
+{
+  "name": "flowdb-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Introspection API for Tablespace/FlowDB - connects to a live Postgres database (e.g. Neon) and returns its schema in the same {nodes, edges, enums} shape the frontend's SQL/DBML importers already produce.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nanoid": "^5.0.7",
+    "pg": "^8.12.0"
+  }
+}
