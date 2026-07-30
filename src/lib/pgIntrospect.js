@@ -24,10 +24,24 @@ async function withClient(connectionString, fn) {
   }
 }
 
+// Migration tools' own bookkeeping tables (Alembic, Rails/golang-migrate,
+// Knex, Flyway) are real tables in the schema, but not domain tables a user
+// importing their database wants to see on the canvas - confirmed live
+// against a real Alembic-managed Neon database, where alembic_version
+// otherwise showed up as its own node.
+const MIGRATION_TOOL_TABLES = [
+  "alembic_version",
+  "schema_migrations",
+  "knex_migrations",
+  "knex_migrations_lock",
+  "flyway_schema_history",
+];
+
 const TABLES_QUERY = `
   SELECT table_name
   FROM information_schema.tables
   WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+    AND table_name NOT IN (${MIGRATION_TOOL_TABLES.map((_, i) => `$${i + 2}`).join(", ")})
   ORDER BY table_name;
 `;
 
@@ -90,7 +104,7 @@ const INDEXES_QUERY = `
     t.relname AS table_name,
     i.relname AS index_name,
     ix.indisunique AS is_unique,
-    array_agg(a.attname ORDER BY array_position(ix.indkey::int[], a.attnum::int)) AS column_names
+    array_agg(a.attname::text ORDER BY array_position(ix.indkey::int[], a.attnum::int)) AS column_names
   FROM pg_index ix
   JOIN pg_class i ON i.oid = ix.indexrelid
   JOIN pg_class t ON t.oid = ix.indrelid
@@ -117,7 +131,7 @@ export async function introspectPostgres(connectionString, schema = "public") {
   return withClient(connectionString, async (client) => {
     const [tables, columns, primaryKeys, foreignKeys, uniqueConstraints, checkConstraints, indexes, enums] =
       await Promise.all([
-        client.query(TABLES_QUERY, [schema]),
+        client.query(TABLES_QUERY, [schema, ...MIGRATION_TOOL_TABLES]),
         client.query(COLUMNS_QUERY, [schema]),
         client.query(PRIMARY_KEYS_QUERY, [schema]),
         client.query(FOREIGN_KEYS_QUERY, [schema]),
