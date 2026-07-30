@@ -1,5 +1,34 @@
 import pg from "pg";
 
+// pg-connection-string (what `pg` uses to parse a connection string's own
+// sslmode) treats "require"/"prefer"/"verify-ca" as aliases for
+// "verify-full" - full certificate-chain + hostname verification - not the
+// weaker "encrypt, don't verify" that real libpq gives those modes. That
+// mismatch is silent: a connection string with sslmode=require still gets
+// full verification, so a self-signed or private-CA server (AWS RDS, most
+// self-hosted Postgres, Docker) fails identically whether sslmode is present
+// or not. Parsing it ourselves restores the semantics a user coming from
+// psql/DataGrip/pgAdmin actually expects.
+function resolveSsl(connectionString) {
+  const match = connectionString.match(/[?&]sslmode=([^&]+)/i);
+  const sslmode = match ? decodeURIComponent(match[1]).toLowerCase() : null;
+
+  if (sslmode === "disable") return false;
+  if (sslmode === "verify-ca" || sslmode === "verify-full") return { rejectUnauthorized: true };
+
+  // require/prefer/allow, or no sslmode at all - encrypt, but don't demand a
+  // certificate chain Node's default CA bundle happens to trust. AWS RDS
+  // (and most hosted-or-self-hosted Postgres outside a few providers like
+  // Neon that use a publicly-trusted CA) uses a cert that isn't in that
+  // bundle even though the connection is genuinely TLS-encrypted - exactly
+  // why DataGrip/psql connect fine here with their own default settings
+  // while strict verification alone doesn't. Whoever calls this endpoint
+  // already holds real credentials for the target database, so the risk
+  // this weakens (an attacker impersonating the DB server) is narrow
+  // relative to failing every non-Neon-like host by default.
+  return { rejectUnauthorized: false };
+}
+
 // One-shot, ephemeral connection - no pooling, no reuse across requests. This
 // endpoint's whole job is "borrow a connection just long enough to read the
 // catalog, then let it go" - holding a pool keyed by arbitrary user-supplied
@@ -9,10 +38,7 @@ import pg from "pg";
 async function withClient(connectionString, fn) {
   const client = new pg.Client({
     connectionString,
-    // Neon (and most hosted Postgres) requires TLS; connection strings from
-    // Neon already carry ?sslmode=require, which `pg` honors on its own, but
-    // this covers a bare connection string that omitted it.
-    ssl: connectionString.includes("sslmode=") ? undefined : { rejectUnauthorized: true },
+    ssl: resolveSsl(connectionString),
     connectionTimeoutMillis: 10_000,
     query_timeout: 20_000,
   });
@@ -24,17 +50,26 @@ async function withClient(connectionString, fn) {
   }
 }
 
-// Migration tools' own bookkeeping tables (Alembic, Rails/golang-migrate,
-// Knex, Flyway) are real tables in the schema, but not domain tables a user
-// importing their database wants to see on the canvas - confirmed live
-// against a real Alembic-managed Neon database, where alembic_version
-// otherwise showed up as its own node.
+// Migration tools' own bookkeeping tables (Alembic, Django, Rails/
+// golang-migrate, Knex, Flyway, Laravel) are real tables in the schema, but
+// not domain tables a user importing their database wants to see on the
+// canvas - confirmed live against a real Alembic-managed Neon database
+// (alembic_version) and a real Django/RDS production database
+// (django_migrations), both otherwise showing up as their own node.
+//
+// Deliberately narrow to migration-tracking tables specifically, not every
+// framework-internal table (e.g. Django's auth_user or django_session) -
+// those are real tables people often do want relationships drawn to/from,
+// so hiding them would be guessing at intent this list has no business
+// guessing at.
 const MIGRATION_TOOL_TABLES = [
   "alembic_version",
+  "django_migrations",
   "schema_migrations",
   "knex_migrations",
   "knex_migrations_lock",
   "flyway_schema_history",
+  "migrations",
 ];
 
 const TABLES_QUERY = `
