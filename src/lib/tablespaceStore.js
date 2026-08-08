@@ -30,7 +30,11 @@ export async function getProject(id) {
 }
 
 // Wrapped in a real transaction (not two independent pool.query() calls) -
-// a failed diagram insert must never leave an orphaned project row.
+// a failed branch insert must never leave an orphaned project row.
+// Unconditionally creates a main branch (previously only inserted a
+// tablespace_diagrams row `if (template)`) - branches are saved via a plain
+// UPDATE, not an upsert like the old diagram table was, so a project with
+// no row to target would 404 on its very first edit.
 export async function createProject({ name, template, createdAt }) {
   const client = await pool.connect();
   try {
@@ -42,12 +46,11 @@ export async function createProject({ name, template, createdAt }) {
       [name, createdAt || null],
     );
     const project = rows[0];
-    if (template) {
-      await client.query(
-        `INSERT INTO tablespace_diagrams (project_id, nodes, edges, enums) VALUES ($1, $2, $3, $4)`,
-        [project.id, toJson(template.nodes), toJson(template.edges), toJson(template.enums)],
-      );
-    }
+    await client.query(
+      `INSERT INTO tablespace_branches (project_id, name, is_main, nodes, edges, enums)
+       VALUES ($1, 'main', true, $2, $3, $4)`,
+      [project.id, toJson(template?.nodes), toJson(template?.edges), toJson(template?.enums)],
+    );
     await client.query("COMMIT");
     return project;
   } catch (err) {
@@ -89,26 +92,118 @@ export async function deleteProject(id) {
   return rowCount > 0; // ON DELETE CASCADE takes the diagram + checkpoints with it
 }
 
-export async function getDiagram(projectId) {
+// List rows are deliberately lightweight (a table-count derived from
+// jsonb_array_length, not the full nodes/edges/enums payload) - matches
+// this file's existing listProjects/listCheckpoints pattern of "list is
+// cheap, get is full."
+// canMerge: a branch can only ever be automatically merged into the exact
+// parent it forked from (no common-ancestor computation for arbitrary
+// pairs - see schemaMerge.js's own header comment), AND only if it has a
+// recorded fork-point snapshot (base_nodes - NULL for main and for any
+// branch created before automatic merge shipped). Computed here so the
+// UI can enable/disable the merge action from this lightweight list alone,
+// never fetching the JSONB base snapshot just to check eligibility.
+const BRANCH_LIST_COLUMNS = `
+  id, project_id AS "projectId", name, parent_branch_id AS "parentBranchId",
+  is_main AS "isMain", schema_version AS "schemaVersion",
+  jsonb_array_length(nodes) AS "tableCount",
+  (parent_branch_id IS NOT NULL AND base_nodes IS NOT NULL) AS "canMerge",
+  created_at AS "createdAt", updated_at AS "updatedAt"`;
+const BRANCH_FULL_COLUMNS = `
+  id, project_id AS "projectId", name, parent_branch_id AS "parentBranchId",
+  is_main AS "isMain", nodes, edges, enums, schema_version AS "schemaVersion",
+  created_at AS "createdAt", updated_at AS "updatedAt"`;
+// Only selected when actually merging - the normal load/switch/save path
+// (getBranch/getMainBranch) never pays for a JSONB payload it doesn't need.
+const BRANCH_FULL_COLUMNS_WITH_BASE = `${BRANCH_FULL_COLUMNS},
+  base_nodes AS "baseNodes", base_edges AS "baseEdges", base_enums AS "baseEnums"`;
+
+export async function listBranches(projectId) {
   const { rows } = await query(
-    `SELECT project_id AS "projectId", nodes, edges, enums, schema_version AS "schemaVersion", updated_at AS "updatedAt"
-     FROM tablespace_diagrams WHERE project_id = $1`,
+    `SELECT ${BRANCH_LIST_COLUMNS} FROM tablespace_branches WHERE project_id = $1 ORDER BY is_main DESC, created_at ASC`,
+    [projectId],
+  );
+  return rows;
+}
+
+export async function getMainBranch(projectId) {
+  const { rows } = await query(
+    `SELECT ${BRANCH_FULL_COLUMNS} FROM tablespace_branches WHERE project_id = $1 AND is_main = true`,
     [projectId],
   );
   return rows[0] || null;
 }
 
-export async function saveDiagram(projectId, { nodes, edges, enums, schemaVersion }) {
+export async function getBranch(projectId, branchId) {
   const { rows } = await query(
-    `INSERT INTO tablespace_diagrams (project_id, nodes, edges, enums, schema_version, updated_at)
-     VALUES ($1, $2, $3, $4, $5, now())
-     ON CONFLICT (project_id) DO UPDATE SET
-       nodes = EXCLUDED.nodes, edges = EXCLUDED.edges, enums = EXCLUDED.enums,
-       schema_version = EXCLUDED.schema_version, updated_at = now()
-     RETURNING project_id AS "projectId", nodes, edges, enums, schema_version AS "schemaVersion", updated_at AS "updatedAt"`,
-    [projectId, toJson(nodes), toJson(edges), toJson(enums), schemaVersion],
+    `SELECT ${BRANCH_FULL_COLUMNS} FROM tablespace_branches WHERE id = $1 AND project_id = $2`,
+    [branchId, projectId],
+  );
+  return rows[0] || null;
+}
+
+// The only place base_nodes/base_edges/base_enums are ever read - used
+// exclusively by the merge route.
+export async function getBranchWithBase(projectId, branchId) {
+  const { rows } = await query(
+    `SELECT ${BRANCH_FULL_COLUMNS_WITH_BASE} FROM tablespace_branches WHERE id = $1 AND project_id = $2`,
+    [branchId, projectId],
+  );
+  return rows[0] || null;
+}
+
+// A point-in-time copy of the source branch's current content - no live
+// link back afterward. Editing the source later never retroactively
+// changes a fork already taken from it; that drift is exactly what the
+// diff viewer exists to surface. The SAME copy is also captured into
+// base_nodes/base_edges/base_enums - the fork-point snapshot automatic
+// merge needs (see schemaMerge.js) - captured ONCE, here, and never
+// updated again, deliberately distinct from nodes/edges/enums which then
+// diverge via normal edits on this new branch.
+export async function createBranch(projectId, { name, sourceBranchId }) {
+  const source = await getBranch(projectId, sourceBranchId);
+  if (!source) return null;
+  const nodesJson = toJson(source.nodes);
+  const edgesJson = toJson(source.edges);
+  const enumsJson = toJson(source.enums);
+  const { rows } = await query(
+    `INSERT INTO tablespace_branches
+       (project_id, name, parent_branch_id, is_main, nodes, edges, enums, base_nodes, base_edges, base_enums, schema_version)
+     VALUES ($1, $2, $3, false, $4, $5, $6, $4, $5, $6, $7)
+     RETURNING ${BRANCH_FULL_COLUMNS}`,
+    [projectId, name, sourceBranchId, nodesJson, edgesJson, enumsJson, source.schemaVersion],
   );
   return rows[0];
+}
+
+export async function saveBranch(projectId, branchId, { nodes, edges, enums, schemaVersion }) {
+  const { rows } = await query(
+    `UPDATE tablespace_branches SET nodes = $3, edges = $4, enums = $5, schema_version = $6, updated_at = now()
+     WHERE id = $1 AND project_id = $2
+     RETURNING ${BRANCH_FULL_COLUMNS}`,
+    [branchId, projectId, toJson(nodes), toJson(edges), toJson(enums), schemaVersion],
+  );
+  return rows[0] || null;
+}
+
+export async function renameBranch(projectId, branchId, name) {
+  const { rows } = await query(
+    `UPDATE tablespace_branches SET name = $3, updated_at = now() WHERE id = $1 AND project_id = $2
+     RETURNING ${BRANCH_LIST_COLUMNS}`,
+    [branchId, projectId, name],
+  );
+  return rows[0] || null;
+}
+
+// is_main = false in the SQL is defense-in-depth; the route pre-checks
+// isMain separately first so it can return an accurate 400 ("can't delete
+// main") instead of a misleading 404 for that specific case.
+export async function deleteBranch(projectId, branchId) {
+  const { rows } = await query(
+    `DELETE FROM tablespace_branches WHERE id = $1 AND project_id = $2 AND is_main = false RETURNING id`,
+    [branchId, projectId],
+  );
+  return rows.length > 0;
 }
 
 export async function listCheckpoints(projectId) {
