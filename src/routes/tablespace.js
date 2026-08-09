@@ -2,6 +2,8 @@ import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
 import { diffSchemas } from "../lib/schemaDiff.js";
 import { mergeSchemas } from "../lib/schemaMerge.js";
+import { syncSource } from "../lib/syncSource.js";
+import { describeIntrospectError } from "../lib/introspectErrors.js";
 
 export const tablespaceRouter = Router();
 
@@ -30,7 +32,7 @@ tablespaceRouter.post(
       res.status(201).json(project);
     } catch (err) {
       if (err.code === "23505") {
-        res.status(409).json({ error: `A database named "${name.trim()}" already exists` });
+        res.status(409).json({ error: `A project named "${name.trim()}" already exists` });
         return;
       }
       throw err;
@@ -74,10 +76,168 @@ tablespaceRouter.delete(
   }),
 );
 
+// --- Sources: the connected systems living inside one project (ROADMAP.md
+// Phase 3 - a Neon database, a Supabase project, a Mongo project, etc, each
+// its own full canvas). Nested under /projects/:id since a source only ever
+// makes sense in the context of the project that owns it, but branches and
+// checkpoints below are scoped by source ALONE (not project+source) since
+// source_id is already the sufficient, unambiguous key for those.
+
 tablespaceRouter.get(
-  "/projects/:id/branches",
+  "/projects/:id/sources",
   wrap(async (req, res) => {
-    res.json(await store.listBranches(req.params.id));
+    res.json(await store.listSources(req.params.id));
+  }),
+);
+
+tablespaceRouter.post(
+  "/projects/:id/sources",
+  wrap(async (req, res) => {
+    const { name, type } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    try {
+      const source = await store.createSource(req.params.id, { name: name.trim(), type });
+      res.status(201).json(source);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A source named "${name.trim()}" already exists in this project.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.get(
+  "/projects/:id/sources/:sourceId",
+  wrap(async (req, res) => {
+    const source = await store.getSource(req.params.sourceId);
+    if (!source || String(source.projectId) !== String(req.params.id)) {
+      res.status(404).json({ error: "Source not found." });
+      return;
+    }
+    res.json(source);
+  }),
+);
+
+tablespaceRouter.patch(
+  "/projects/:id/sources/:sourceId",
+  wrap(async (req, res) => {
+    const { name } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    const existing = await store.getSource(req.params.sourceId);
+    if (!existing || String(existing.projectId) !== String(req.params.id)) {
+      res.status(404).json({ error: "Source not found." });
+      return;
+    }
+    try {
+      const source = await store.renameSource(req.params.sourceId, name.trim());
+      res.json(source);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A source named "${name.trim()}" already exists in this project.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.delete(
+  "/projects/:id/sources/:sourceId",
+  wrap(async (req, res) => {
+    const existing = await store.getSource(req.params.sourceId);
+    if (!existing || String(existing.projectId) !== String(req.params.id)) {
+      res.status(404).json({ error: "Source not found." });
+      return;
+    }
+    await store.deleteSource(req.params.sourceId);
+    res.json({ success: true });
+  }),
+);
+
+// --- Connected sources: linking a source to a real live Postgres/MySQL
+// database (flowdb-server's own introspection only speaks Postgres wire
+// protocol today - MySQL is a client-side type label with no live path
+// yet). Connecting triggers an immediate full sync; after that,
+// syncScheduler.js keeps it current periodically, and /sync below is the
+// on-demand version of the exact same operation. See syncSource.js for
+// the full pull-only, additive reconciliation rules.
+
+tablespaceRouter.post(
+  "/projects/:id/sources/:sourceId/connection",
+  wrap(async (req, res) => {
+    const { connectionString, schema } = req.body || {};
+    if (!connectionString || typeof connectionString !== "string") {
+      res.status(400).json({ error: "connectionString is required." });
+      return;
+    }
+    const existing = await store.getSource(req.params.sourceId);
+    if (!existing || String(existing.projectId) !== String(req.params.id)) {
+      res.status(404).json({ error: "Source not found." });
+      return;
+    }
+    await store.setSourceConnection(req.params.sourceId, { connectionString, schema });
+    try {
+      const result = await syncSource(req.params.sourceId);
+      res.status(201).json(result);
+    } catch (err) {
+      // The connection was saved, but the first sync failed (bad
+      // credentials, unreachable host, empty schema, etc.) - roll the
+      // source back to disconnected rather than leaving it stuck
+      // "Connected" with a connection string that's never actually been
+      // proven to work.
+      await store.clearSourceConnection(req.params.sourceId);
+      // eslint-disable-next-line no-console
+      console.error("[sources] connect failed:", err.code || err.message);
+      res.status(502).json({ error: err.isFriendly ? err.message : describeIntrospectError(err) });
+    }
+  }),
+);
+
+tablespaceRouter.delete(
+  "/projects/:id/sources/:sourceId/connection",
+  wrap(async (req, res) => {
+    const existing = await store.getSource(req.params.sourceId);
+    if (!existing || String(existing.projectId) !== String(req.params.id)) {
+      res.status(404).json({ error: "Source not found." });
+      return;
+    }
+    const source = await store.clearSourceConnection(req.params.sourceId);
+    res.json(source);
+  }),
+);
+
+tablespaceRouter.post(
+  "/sources/:sourceId/sync",
+  wrap(async (req, res) => {
+    try {
+      const result = await syncSource(req.params.sourceId);
+      res.json(result);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] sync failed:", err.code || err.message);
+      res
+        .status(err.isFriendly ? 400 : 502)
+        .json({ error: err.isFriendly ? err.message : describeIntrospectError(err) });
+    }
+  }),
+);
+
+// --- Branches: one source's schema-definition lines. Scoped by sourceId
+// alone below /sources/:sourceId, not nested under /projects, since a
+// source_id is already the unambiguous owner.
+
+tablespaceRouter.get(
+  "/sources/:sourceId/branches",
+  wrap(async (req, res) => {
+    res.json(await store.listBranches(req.params.sourceId));
   }),
 );
 
@@ -86,11 +246,11 @@ tablespaceRouter.get(
 // Express matches routes in registration order, and :branchId would
 // otherwise bind to the literal string "main"/"diff" first.
 tablespaceRouter.get(
-  "/projects/:id/branches/main",
+  "/sources/:sourceId/branches/main",
   wrap(async (req, res) => {
-    const branch = await store.getMainBranch(req.params.id);
+    const branch = await store.getMainBranch(req.params.sourceId);
     if (!branch) {
-      res.status(404).json({ error: "This project has no main branch yet." });
+      res.status(404).json({ error: "This source has no main branch yet." });
       return;
     }
     res.json(branch);
@@ -98,7 +258,7 @@ tablespaceRouter.get(
 );
 
 tablespaceRouter.get(
-  "/projects/:id/branches/diff",
+  "/sources/:sourceId/branches/diff",
   wrap(async (req, res) => {
     const { base, compare } = req.query;
     if (!base || !compare) {
@@ -106,8 +266,8 @@ tablespaceRouter.get(
       return;
     }
     const [baseBranch, compareBranch] = await Promise.all([
-      store.getBranch(req.params.id, base),
-      store.getBranch(req.params.id, compare),
+      store.getBranch(req.params.sourceId, base),
+      store.getBranch(req.params.sourceId, compare),
     ]);
     if (!baseBranch || !compareBranch) {
       res.status(404).json({ error: "One or both branches were not found." });
@@ -122,7 +282,7 @@ tablespaceRouter.get(
 );
 
 tablespaceRouter.post(
-  "/projects/:id/branches",
+  "/sources/:sourceId/branches",
   wrap(async (req, res) => {
     const { name, sourceBranchId } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
@@ -134,7 +294,7 @@ tablespaceRouter.post(
       return;
     }
     try {
-      const branch = await store.createBranch(req.params.id, { name: name.trim(), sourceBranchId });
+      const branch = await store.createBranch(req.params.sourceId, { name: name.trim(), sourceBranchId });
       if (!branch) {
         res.status(404).json({ error: "Source branch not found." });
         return;
@@ -151,9 +311,9 @@ tablespaceRouter.post(
 );
 
 tablespaceRouter.get(
-  "/projects/:id/branches/:branchId",
+  "/sources/:sourceId/branches/:branchId",
   wrap(async (req, res) => {
-    const branch = await store.getBranch(req.params.id, req.params.branchId);
+    const branch = await store.getBranch(req.params.sourceId, req.params.branchId);
     if (!branch) {
       res.status(404).json({ error: "Branch not found." });
       return;
@@ -163,13 +323,14 @@ tablespaceRouter.get(
 );
 
 tablespaceRouter.put(
-  "/projects/:id/branches/:branchId",
+  "/sources/:sourceId/branches/:branchId",
   wrap(async (req, res) => {
-    const { nodes, edges, enums, schemaVersion } = req.body || {};
-    const branch = await store.saveBranch(req.params.id, req.params.branchId, {
+    const { nodes, edges, enums, pages, schemaVersion } = req.body || {};
+    const branch = await store.saveBranch(req.params.sourceId, req.params.branchId, {
       nodes: nodes || [],
       edges: edges || [],
       enums: enums || [],
+      pages: pages || [],
       schemaVersion: schemaVersion || 1,
     });
     if (!branch) {
@@ -181,7 +342,7 @@ tablespaceRouter.put(
 );
 
 tablespaceRouter.patch(
-  "/projects/:id/branches/:branchId",
+  "/sources/:sourceId/branches/:branchId",
   wrap(async (req, res) => {
     const { name } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
@@ -189,7 +350,7 @@ tablespaceRouter.patch(
       return;
     }
     try {
-      const branch = await store.renameBranch(req.params.id, req.params.branchId, name.trim());
+      const branch = await store.renameBranch(req.params.sourceId, req.params.branchId, name.trim());
       if (!branch) {
         res.status(404).json({ error: "Branch not found." });
         return;
@@ -209,7 +370,7 @@ tablespaceRouter.patch(
 // header comment for why an arbitrary branch pair has no correct merge
 // base without a full commit DAG, which this app deliberately doesn't have.
 tablespaceRouter.post(
-  "/projects/:id/branches/:targetBranchId/merge",
+  "/sources/:sourceId/branches/:targetBranchId/merge",
   wrap(async (req, res) => {
     const { sourceBranchId } = req.body || {};
     if (!sourceBranchId) {
@@ -217,8 +378,8 @@ tablespaceRouter.post(
       return;
     }
     const [targetBranch, sourceBranch] = await Promise.all([
-      store.getBranch(req.params.id, req.params.targetBranchId),
-      store.getBranchWithBase(req.params.id, sourceBranchId),
+      store.getBranch(req.params.sourceId, req.params.targetBranchId),
+      store.getBranchWithBase(req.params.sourceId, sourceBranchId),
     ]);
     if (!targetBranch || !sourceBranch) {
       res.status(404).json({ error: "One or both branches were not found." });
@@ -247,8 +408,12 @@ tablespaceRouter.post(
     // etc. for free instead of re-deriving counts from `conflicts`.
     const { summary } = diffSchemas(targetBranch, { nodes, edges, enums });
 
-    const branch = await store.saveBranch(req.params.id, targetBranch.id, {
+    const branch = await store.saveBranch(req.params.sourceId, targetBranch.id, {
       nodes, edges, enums,
+      // Merge only ever reconciles nodes/edges/enums (see schemaMerge.js) -
+      // the target's own pages are preserved as-is, not overwritten with an
+      // empty array just because this save call doesn't otherwise touch them.
+      pages: targetBranch.pages,
       schemaVersion: Math.max(targetBranch.schemaVersion, sourceBranch.schemaVersion),
     });
     // The SOURCE branch is left completely untouched - matches git's own
@@ -258,12 +423,12 @@ tablespaceRouter.post(
 );
 
 tablespaceRouter.delete(
-  "/projects/:id/branches/:branchId",
+  "/sources/:sourceId/branches/:branchId",
   wrap(async (req, res) => {
     // Pre-fetch rather than relying solely on the store's is_main=false
     // guard, so "it's the main branch" (400) and "it doesn't exist" (404)
     // return distinct, accurate statuses instead of one ambiguous 404.
-    const branch = await store.getBranch(req.params.id, req.params.branchId);
+    const branch = await store.getBranch(req.params.sourceId, req.params.branchId);
     if (!branch) {
       res.status(404).json({ error: "Branch not found." });
       return;
@@ -272,7 +437,7 @@ tablespaceRouter.delete(
       res.status(400).json({ error: "The main branch can't be deleted." });
       return;
     }
-    const deleted = await store.deleteBranch(req.params.id, req.params.branchId);
+    const deleted = await store.deleteBranch(req.params.sourceId, req.params.branchId);
     if (!deleted) {
       res.status(404).json({ error: "Branch not found." });
       return;
@@ -282,21 +447,21 @@ tablespaceRouter.delete(
 );
 
 tablespaceRouter.get(
-  "/projects/:id/checkpoints",
+  "/sources/:sourceId/checkpoints",
   wrap(async (req, res) => {
-    res.json(await store.listCheckpoints(req.params.id));
+    res.json(await store.listCheckpoints(req.params.sourceId));
   }),
 );
 
 tablespaceRouter.post(
-  "/projects/:id/checkpoints",
+  "/sources/:sourceId/checkpoints",
   wrap(async (req, res) => {
     const { label, nodes, edges, enums } = req.body || {};
     if (!label || typeof label !== "string") {
       res.status(400).json({ error: "label is required." });
       return;
     }
-    const checkpoint = await store.createCheckpoint(req.params.id, {
+    const checkpoint = await store.createCheckpoint(req.params.sourceId, {
       label,
       nodes: nodes || [],
       edges: edges || [],
@@ -307,9 +472,9 @@ tablespaceRouter.post(
 );
 
 tablespaceRouter.get(
-  "/projects/:id/checkpoints/:checkpointId",
+  "/sources/:sourceId/checkpoints/:checkpointId",
   wrap(async (req, res) => {
-    const checkpoint = await store.getCheckpoint(req.params.id, req.params.checkpointId);
+    const checkpoint = await store.getCheckpoint(req.params.sourceId, req.params.checkpointId);
     if (!checkpoint) {
       res.status(404).json({ error: "Checkpoint not found." });
       return;
@@ -319,9 +484,9 @@ tablespaceRouter.get(
 );
 
 tablespaceRouter.delete(
-  "/projects/:id/checkpoints/:checkpointId",
+  "/sources/:sourceId/checkpoints/:checkpointId",
   wrap(async (req, res) => {
-    const deleted = await store.deleteCheckpoint(req.params.id, req.params.checkpointId);
+    const deleted = await store.deleteCheckpoint(req.params.sourceId, req.params.checkpointId);
     if (!deleted) {
       res.status(404).json({ error: "Checkpoint not found." });
       return;

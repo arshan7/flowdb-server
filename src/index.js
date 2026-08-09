@@ -4,6 +4,7 @@ import cors from "cors";
 import { introspectRouter } from "./routes/introspect.js";
 import { tablespaceRouter } from "./routes/tablespace.js";
 import { requireApiKey } from "./middleware/apiKey.js";
+import { startSyncScheduler } from "./lib/syncScheduler.js";
 
 const app = express();
 
@@ -43,3 +44,5 @@ app.listen(port, () => {
   // eslint-disable-next-line no-console
   console.log(`flowdb-server listening on port ${port}`);
 });
+
+startSyncScheduler();
