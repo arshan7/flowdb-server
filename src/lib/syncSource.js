@@ -33,6 +33,32 @@ function maxNodeY(nodes) {
   return max;
 }
 
+// Reconstructs the same handle id TableNode.jsx generates for a column
+// (mirrors schemaStore.js's own findColumnByHandle) so a column can be
+// resolved back from an edge's stored handle without parsing the id
+// string apart - nanoid ids can contain dashes, so splitting is unreliable.
+function findColumnByHandle(node, handle) {
+  if (!node || !handle) return null;
+  return (node.data?.columns || []).find(
+    (col) => `${node.id}-${col.id}-source` === handle || `${node.id}-${col.id}-target` === handle,
+  );
+}
+
+// A stable, name-based identity for a relationship - "orders.customer_id
+// -> customers.id" - independent of the transient node/column ids a fresh
+// introspection mints every single run. This is what the sync ledger
+// stores and compares against, since ids alone give no way to recognize
+// "this is the same relationship I synced last time" across two
+// completely separate introspection passes.
+function edgeSignature(nodesById, edge) {
+  const sourceNode = nodesById.get(edge.source);
+  const targetNode = nodesById.get(edge.target);
+  const sourceColumn = findColumnByHandle(sourceNode, edge.sourceHandle);
+  const targetColumn = findColumnByHandle(targetNode, edge.targetHandle);
+  if (!sourceNode || !targetNode || !sourceColumn || !targetColumn) return null;
+  return `${sourceNode.data.label}.${sourceColumn.name}->${targetNode.data.label}.${targetColumn.name}`;
+}
+
 // Pull-only, additive reconciliation - never pushes anything back to the
 // live database, and never silently overwrites a table the user made by
 // hand. Every synced table is tagged `data.sourceOrigin === "synced"` (the
@@ -43,22 +69,33 @@ function maxNodeY(nodes) {
 // reported back, same reasoning schemaMerge.js uses for real edit
 // conflicts elsewhere in this app (a fixed, deterministic policy, never a
 // silent guess).
-export function reconcileSchema(existingBranch, introspected) {
+//
+// `ledger` ({tables: [...names], edges: [...signatures]}) is what makes a
+// deliberate removal STAY removed: the current schema state alone can't
+// tell "never seen before" apart from "synced once, then the user deleted
+// it" - both simply look like "not there." A name/signature the ledger
+// already has is never re-added, no matter how many times it still shows
+// up in a fresh introspection. The ledger only ever grows.
+export function reconcileSchema(existingBranch, introspected, ledger) {
   const existingNodes = existingBranch.nodes || [];
   const existingEdges = existingBranch.edges || [];
   const existingEnums = existingBranch.enums || [];
+  const ledgerTables = new Set(ledger?.tables || []);
+  const ledgerEdges = new Set(ledger?.edges || []);
 
   const existingByName = new Map(
     existingNodes.filter((n) => n.type === "tableNode").map((n) => [n.data?.label, n]),
   );
+  const introspectedNodesById = new Map(introspected.nodes.map((n) => [n.id, n]));
 
   const added = [];
   const conflicts = [];
   // Old (introspected-batch) node id -> final node id - needed to remap
   // edges below, since an edge from THIS sync can connect a brand new
   // table to one that was already synced in an earlier pass. Tables that
-  // hit a conflict are never added to this map, which is exactly what
-  // makes an edge touching one get dropped further down.
+  // hit a conflict, OR that the ledger says were deliberately removed,
+  // are never added to this map, which is exactly what makes an edge
+  // touching one get dropped further down.
   const introspectedIdToFinalId = new Map();
   const nextNodes = [...existingNodes];
   let gridIndex = 0;
@@ -69,6 +106,8 @@ export function reconcileSchema(existingBranch, introspected) {
     const existing = existingByName.get(name);
 
     if (!existing) {
+      if (ledgerTables.has(name)) continue; // synced before, user removed it - stays removed
+
       const position = {
         x: (gridIndex % GRID_COLUMNS) * GRID_SPACING_X,
         y: startY + Math.floor(gridIndex / GRID_COLUMNS) * GRID_SPACING_Y,
@@ -78,6 +117,7 @@ export function reconcileSchema(existingBranch, introspected) {
       introspectedIdToFinalId.set(incoming.id, newNode.id);
       nextNodes.push(newNode);
       added.push(name);
+      ledgerTables.add(name);
       continue;
     }
 
@@ -98,8 +138,10 @@ export function reconcileSchema(existingBranch, introspected) {
 
   // Additive only - an edge already present (matched by endpoint node ids
   // + column names) is left exactly as-is, never re-created/updated. Any
-  // edge touching a conflicted (and therefore skipped) table has no valid
-  // final id to remap to and is correctly dropped here.
+  // edge touching a conflicted/removed-and-ignored table has no valid
+  // final id to remap to and is correctly dropped here. A signature the
+  // ledger already has - synced before, then deliberately deleted - is
+  // never re-added either, same reasoning as tables above.
   const existingEdgeKeys = new Set(
     existingEdges.map((e) => `${e.source}|${e.target}|${e.sourceHandle || ""}|${e.targetHandle || ""}`),
   );
@@ -113,6 +155,9 @@ export function reconcileSchema(existingBranch, introspected) {
     const targetHandle = incomingEdge.targetHandle?.replace(incomingEdge.target, targetId);
     const key = `${sourceId}|${targetId}|${sourceHandle || ""}|${targetHandle || ""}`;
     if (existingEdgeKeys.has(key)) continue;
+
+    const signature = edgeSignature(introspectedNodesById, incomingEdge);
+    if (signature && ledgerEdges.has(signature)) continue;
 
     nextEdges.push({
       ...incomingEdge,
@@ -135,6 +180,7 @@ export function reconcileSchema(existingBranch, introspected) {
       },
     });
     existingEdgeKeys.add(key);
+    if (signature) ledgerEdges.add(signature);
   }
 
   // Enums: additive by name only - an existing enum (whatever its origin)
@@ -148,7 +194,14 @@ export function reconcileSchema(existingBranch, introspected) {
     existingEnumNames.add(incomingEnum.name);
   }
 
-  return { nodes: nextNodes, edges: nextEdges, enums: nextEnums, added, conflicts };
+  return {
+    nodes: nextNodes,
+    edges: nextEdges,
+    enums: nextEnums,
+    added,
+    conflicts,
+    ledger: { tables: [...ledgerTables], edges: [...ledgerEdges] },
+  };
 }
 
 // Orchestrates one full sync for a single Connected source: decrypt ->
@@ -172,7 +225,8 @@ export async function syncSource(sourceId) {
     throw friendlyError("This source has no main branch to sync into.");
   }
 
-  const result = reconcileSchema(branch, introspected);
+  const ledger = await store.getSourceSyncLedger(sourceId);
+  const result = reconcileSchema(branch, introspected, ledger);
   await store.saveBranch(sourceId, branch.id, {
     nodes: result.nodes,
     edges: result.edges,
@@ -180,6 +234,7 @@ export async function syncSource(sourceId) {
     pages: branch.pages,
     schemaVersion: branch.schemaVersion,
   });
+  await store.saveSourceSyncLedger(sourceId, result.ledger);
   await store.markSourceSynced(sourceId);
 
   return { added: result.added, conflicts: result.conflicts };

@@ -228,6 +228,21 @@ export async function getSourceConnectionSecrets(sourceId) {
   return { connectionString: decrypt(row.encrypted), schema: row.schema || "public" };
 }
 
+// { tables: [...names], edges: [...signatures] } - every table/relationship
+// this source has EVER synced in, independent of the branch's current
+// nodes/edges. Read once at the start of a sync, written back once at the
+// end with whatever reconcileSchema (syncSource.js) added - see that
+// file's own comment for why this has to live outside the branch's own
+// JSONB (a deleted table/edge leaves no trace there to check against).
+export async function getSourceSyncLedger(sourceId) {
+  const { rows } = await query(`SELECT sync_ledger AS "syncLedger" FROM tablespace_sources WHERE id = $1`, [sourceId]);
+  return rows[0]?.syncLedger || { tables: [], edges: [] };
+}
+
+export async function saveSourceSyncLedger(sourceId, ledger) {
+  await query(`UPDATE tablespace_sources SET sync_ledger = $2 WHERE id = $1`, [sourceId, toJson(ledger)]);
+}
+
 // Every Connected source, for the periodic scheduler (syncScheduler.js) to
 // iterate - id and lastSyncedAt only, never the secret itself; each
 // source's connection string is decrypted individually, right before use,
