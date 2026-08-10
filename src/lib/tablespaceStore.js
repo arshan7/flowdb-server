@@ -243,6 +243,15 @@ export async function saveSourceSyncLedger(sourceId, ledger) {
   await query(`UPDATE tablespace_sources SET sync_ledger = $2 WHERE id = $1`, [sourceId, toJson(ledger)]);
 }
 
+// Wipes the ledger back to empty - the next sync treats every table/
+// relationship the live database currently has as brand new again,
+// including anything previously deleted and therefore ignored. Doesn't
+// touch the branch's own nodes/edges at all by itself; nothing changes
+// until the next actual sync runs.
+export async function resetSourceSyncLedger(sourceId) {
+  await query(`UPDATE tablespace_sources SET sync_ledger = '{"tables": [], "edges": []}' WHERE id = $1`, [sourceId]);
+}
+
 // Every Connected source, for the periodic scheduler (syncScheduler.js) to
 // iterate - id and lastSyncedAt only, never the secret itself; each
 // source's connection string is decrypted individually, right before use,

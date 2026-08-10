@@ -230,6 +230,18 @@ tablespaceRouter.post(
   }),
 );
 
+// Clears the sync ledger only - doesn't touch the branch's own nodes/edges
+// or run a sync itself. A previously-removed table/relationship stays
+// exactly as removed until the next actual "Sync now" (or the periodic
+// one) re-pulls it.
+tablespaceRouter.post(
+  "/sources/:sourceId/sync/reset",
+  wrap(async (req, res) => {
+    await store.resetSourceSyncLedger(req.params.sourceId);
+    res.json({ success: true });
+  }),
+);
+
 // --- Branches: one source's schema-definition lines. Scoped by sourceId
 // alone below /sources/:sourceId, not nested under /projects, since a
 // source_id is already the unambiguous owner.
