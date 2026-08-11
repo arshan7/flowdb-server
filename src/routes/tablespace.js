@@ -4,6 +4,45 @@ import { diffSchemas } from "../lib/schemaDiff.js";
 import { mergeSchemas } from "../lib/schemaMerge.js";
 import { syncSource } from "../lib/syncSource.js";
 import { describeIntrospectError } from "../lib/introspectErrors.js";
+import {
+  compileQuery,
+  runQuery,
+  paginateRows,
+  ALLOWED_PAGE_SIZES,
+  DEFAULT_PAGE_SIZE,
+  MAX_ROWS,
+} from "../lib/queryEngine.js";
+
+const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max"]);
+const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains"]);
+// Phase 4.4b - calculated measures' arithmetic operator.
+const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
+
+// Phase 4.4a - direct (1-hop) join resolution for /sources/:sourceId/query.
+// Reuses column.references (the same source of truth syncEdgeReference/
+// schemaStore.js already writes for the canvas's own relationship edges)
+// rather than re-deriving a join path from edge cardinality strings.
+// Checks both FK directions since either table could hold the foreign
+// key. If multiple FK paths exist between the same two tables, the first
+// one found wins - a known v1 simplification (no picker for which path).
+function findJoinPath(baseNode, joinNode) {
+  const baseColumns = baseNode.data?.columns || [];
+  const joinColumns = joinNode.data?.columns || [];
+
+  for (const col of baseColumns) {
+    if (col.isForeignKey && col.references?.tableId === joinNode.id) {
+      const target = joinColumns.find((c) => c.id === col.references.columnId);
+      if (target) return { baseColumn: col.name, joinColumn: target.name };
+    }
+  }
+  for (const col of joinColumns) {
+    if (col.isForeignKey && col.references?.tableId === baseNode.id) {
+      const target = baseColumns.find((c) => c.id === col.references.columnId);
+      if (target) return { baseColumn: target.name, joinColumn: col.name };
+    }
+  }
+  return null;
+}
 
 export const tablespaceRouter = Router();
 
@@ -238,6 +277,333 @@ tablespaceRouter.post(
   "/sources/:sourceId/sync/reset",
   wrap(async (req, res) => {
     await store.resetSourceSyncLedger(req.params.sourceId);
+    res.json({ success: true });
+  }),
+);
+
+// Phase 4.2 (single table) / 4.4a (direct joins + SQL transparency) - runs
+// a report query against a Connected source's real live database. The
+// request only ever carries ids referencing entries already saved in a
+// table's own semanticModel (set via SemanticLayerScreen.jsx) or real
+// tables it's directly related to - every table/column name actually used
+// in the compiled SQL is resolved HERE, server-side, against stored data,
+// never taken from the request body directly. `aggregation`/filter
+// `operator` are re-validated against a fixed set even though the editor
+// UI already only ever writes one of these - the branch's own nodes JSONB
+// has no other validation on save (see saveBranch), so a hand-crafted
+// request could otherwise have written anything into
+// semanticModel.aggregation before this route ever reads it back.
+tablespaceRouter.post(
+  "/sources/:sourceId/query",
+  wrap(async (req, res) => {
+    const {
+      tableId,
+      joinTableIds = [],
+      measureIds = [],
+      dimensionIds = [],
+      filters = [],
+      offset = 0,
+      pageSize = DEFAULT_PAGE_SIZE,
+    } = req.body || {};
+    if (!tableId) {
+      res.status(400).json({ error: "tableId is required." });
+      return;
+    }
+    if (!ALLOWED_PAGE_SIZES.includes(pageSize)) {
+      res.status(400).json({ error: `pageSize must be one of ${ALLOWED_PAGE_SIZES.join(", ")}.` });
+      return;
+    }
+    if (!Number.isInteger(offset) || offset < 0 || offset + pageSize > MAX_ROWS) {
+      res.status(400).json({ error: `offset must be a non-negative integer, and offset + pageSize can't exceed ${MAX_ROWS}.` });
+      return;
+    }
+
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const nodesById = new Map((branch?.nodes || []).map((n) => [n.id, n]));
+    const node = nodesById.get(tableId);
+    if (!node || node.type !== "tableNode") {
+      res.status(404).json({ error: "Table not found." });
+      return;
+    }
+
+    // Every joinTableId is verified against a REAL foreign-key
+    // relationship to the base table - the client only ever claims a
+    // table id, never the join columns themselves.
+    const joinNodes = [];
+    const joinClauses = [];
+    for (const joinTableId of joinTableIds) {
+      const joinNode = nodesById.get(joinTableId);
+      if (!joinNode || joinNode.type !== "tableNode") {
+        res.status(400).json({ error: `Table ${joinTableId} not found.` });
+        return;
+      }
+      const path = findJoinPath(node, joinNode);
+      if (!path) {
+        res.status(400).json({
+          error: `"${joinNode.data?.label}" isn't directly related to "${node.data?.label}".`,
+        });
+        return;
+      }
+      joinNodes.push(joinNode);
+      joinClauses.push({ tableName: joinNode.data.label, baseColumn: path.baseColumn, joinColumn: path.joinColumn });
+    }
+
+    // Dimensions/filters may reference the base table or any validated
+    // join table; measures resolve against the base table ONLY (see
+    // queryEngine.js's own comment on why - avoids join-fanout
+    // double-counting an aggregate).
+    const dimensionSources = [node, ...joinNodes];
+    const findDimension = (id) => {
+      for (const src of dimensionSources) {
+        const model = src.data?.semanticModel || {};
+        const dim = (model.dimensions || []).find((d) => d.id === id);
+        if (!dim) continue;
+        const col = (src.data?.columns || []).find((c) => c.id === dim.columnId);
+        if (!col) continue;
+        return { id: dim.id, label: dim.label || col.name, columnName: col.name, tableName: src.data.label };
+      }
+      return null;
+    };
+
+    const baseSemanticModel = node.data?.semanticModel || { dimensions: [], measures: [] };
+    const baseColumnsById = new Map((node.data?.columns || []).map((c) => [c.id, c]));
+    const unknown = [];
+
+    const dimensions = dimensionIds.map((id) => {
+      const resolved = findDimension(id);
+      if (!resolved) unknown.push(id);
+      return resolved;
+    });
+
+    // Phase 4.4b - a calculated measure's terms resolve exactly like a
+    // simple measure's own aggregation/columnId (base table only, same
+    // join-fanout reasoning) - this just does that resolution twice.
+    const resolveTerm = (term) => {
+      if (!term || !QUERY_AGGREGATIONS.has(term.aggregation)) return null;
+      if (term.aggregation === "count") return { aggregation: "count", columnName: null };
+      const col = baseColumnsById.get(term.columnId);
+      return col ? { aggregation: term.aggregation, columnName: col.name } : null;
+    };
+
+    const measures = measureIds.map((id) => {
+      const measure = (baseSemanticModel.measures || []).find((m) => m.id === id);
+      if (!measure) {
+        unknown.push(id);
+        return null;
+      }
+
+      if (measure.kind === "calculated") {
+        if (!QUERY_CALC_OPERATORS.has(measure.operator)) {
+          unknown.push(id);
+          return null;
+        }
+        const termA = resolveTerm(measure.termA);
+        const termB = resolveTerm(measure.termB);
+        if (!termA || !termB) {
+          unknown.push(id);
+          return null;
+        }
+        return {
+          id: measure.id,
+          label: measure.label || "Calculated",
+          kind: "calculated",
+          operator: measure.operator,
+          termA,
+          termB,
+        };
+      }
+
+      if (!QUERY_AGGREGATIONS.has(measure.aggregation)) {
+        unknown.push(id);
+        return null;
+      }
+      if (measure.aggregation === "count") {
+        return { id: measure.id, label: measure.label || "Count", aggregation: "count", columnName: null };
+      }
+      const col = baseColumnsById.get(measure.columnId);
+      if (!col) {
+        unknown.push(id);
+        return null;
+      }
+      return { id: measure.id, label: measure.label || col.name, aggregation: measure.aggregation, columnName: col.name };
+    });
+
+    const resolvedFilters = [];
+    for (const f of filters) {
+      const dim = findDimension(f?.dimensionId);
+      if (!dim || !QUERY_OPERATORS.has(f.operator)) {
+        res.status(400).json({ error: "Invalid filter." });
+        return;
+      }
+      resolvedFilters.push({ columnName: dim.columnName, tableName: dim.tableName, operator: f.operator, value: f.value });
+    }
+
+    if (unknown.length) {
+      res.status(400).json({ error: `Unknown dimension/measure id(s): ${unknown.join(", ")}` });
+      return;
+    }
+
+    let compiled;
+    try {
+      compiled = compileQuery({
+        tableName: node.data.label,
+        measures,
+        dimensions,
+        filters: resolvedFilters,
+        joins: joinClauses,
+        offset,
+        pageSize,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+
+    try {
+      const rawRows = await runQuery(secrets.connectionString, compiled.sql, compiled.params);
+      const { rows, hasMore } = paginateRows(rawRows, pageSize);
+      res.json({
+        columns: [...dimensions, ...measures].map((c) => ({ id: c.id, label: c.label })),
+        rows,
+        hasMore,
+        sql: compiled.sql,
+        params: compiled.params,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] query failed:", err.code || err.message);
+      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+    }
+  }),
+);
+
+// --- Reports (ROADMAP.md Phase 4.4): saved, reusable query definitions
+// against a source's semantic model. Scoped by sourceId alone, same
+// reasoning as /sources/:sourceId/query above - a report's fields only
+// ever resolve against that source's main branch regardless of which
+// branch is currently checked out client-side.
+
+tablespaceRouter.get(
+  "/sources/:sourceId/reports",
+  wrap(async (req, res) => {
+    res.json(await store.listReports(req.params.sourceId));
+  }),
+);
+
+tablespaceRouter.get(
+  "/sources/:sourceId/reports/:reportId",
+  wrap(async (req, res) => {
+    const report = await store.getReport(req.params.sourceId, req.params.reportId);
+    if (!report) {
+      res.status(404).json({ error: "Report not found." });
+      return;
+    }
+    res.json(report);
+  }),
+);
+
+tablespaceRouter.post(
+  "/sources/:sourceId/reports",
+  wrap(async (req, res) => {
+    const { name, tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    if (!tableId) {
+      res.status(400).json({ error: "tableId is required." });
+      return;
+    }
+    try {
+      const report = await store.createReport(req.params.sourceId, {
+        name: name.trim(),
+        tableId,
+        joinTableIds,
+        dimensionIds,
+        measureIds,
+        filters,
+        chartType,
+        pageSize,
+      });
+      res.status(201).json(report);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A report named "${name.trim()}" already exists for this source.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.patch(
+  "/sources/:sourceId/reports/:reportId",
+  wrap(async (req, res) => {
+    const { name } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    try {
+      const report = await store.renameReport(req.params.sourceId, req.params.reportId, name.trim());
+      if (!report) {
+        res.status(404).json({ error: "Report not found." });
+        return;
+      }
+      res.json(report);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A report named "${name.trim()}" already exists for this source.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+// IA redesign (post-4.4a) - full-definition update, distinct from PATCH's
+// rename-only. Used by the Report Builder's "Save" once it has a real
+// edit context (opened from a gallery card) - see updateReport's own
+// comment in tablespaceStore.js for why name isn't touched here.
+tablespaceRouter.put(
+  "/sources/:sourceId/reports/:reportId",
+  wrap(async (req, res) => {
+    const { tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize } = req.body || {};
+    if (!tableId) {
+      res.status(400).json({ error: "tableId is required." });
+      return;
+    }
+    const report = await store.updateReport(req.params.sourceId, req.params.reportId, {
+      tableId,
+      joinTableIds,
+      dimensionIds,
+      measureIds,
+      filters,
+      chartType,
+      pageSize,
+    });
+    if (!report) {
+      res.status(404).json({ error: "Report not found." });
+      return;
+    }
+    res.json(report);
+  }),
+);
+
+tablespaceRouter.delete(
+  "/sources/:sourceId/reports/:reportId",
+  wrap(async (req, res) => {
+    const deleted = await store.deleteReport(req.params.sourceId, req.params.reportId);
+    if (!deleted) {
+      res.status(404).json({ error: "Report not found." });
+      return;
+    }
     res.json({ success: true });
   }),
 );

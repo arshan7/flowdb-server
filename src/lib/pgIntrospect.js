@@ -9,7 +9,7 @@ import pg from "pg";
 // self-hosted Postgres, Docker) fails identically whether sslmode is present
 // or not. Parsing it ourselves restores the semantics a user coming from
 // psql/DataGrip/pgAdmin actually expects.
-function resolveSsl(connectionString) {
+export function resolveSsl(connectionString) {
   const match = connectionString.match(/[?&]sslmode=([^&]+)/i);
   const sslmode = match ? decodeURIComponent(match[1]).toLowerCase() : null;
 

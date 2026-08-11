@@ -267,6 +267,110 @@ export async function markSourceSynced(sourceId) {
   await query(`UPDATE tablespace_sources SET last_synced_at = now() WHERE id = $1`, [sourceId]);
 }
 
+// Phase 4.4 - saved/reusable reports. Source-scoped, not branch-scoped -
+// see app/models/tablespace_report.py (flowdb-migrations) for the full
+// reasoning. table_id/dimension_ids/measure_ids are soft references into
+// a branch's own nodes JSONB (node/dimension/measure ids) - nothing here
+// enforces they still exist; ReportBuilderScreen.jsx degrades gracefully
+// client-side if a saved report's table/fields were since removed.
+const REPORT_COLUMNS = `
+  id, source_id AS "sourceId", name, table_id AS "tableId",
+  join_table_ids AS "joinTableIds",
+  dimension_ids AS "dimensionIds", measure_ids AS "measureIds", filters,
+  chart_type AS "chartType", page_size AS "pageSize",
+  created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function listReports(sourceId) {
+  const { rows } = await query(
+    `SELECT ${REPORT_COLUMNS} FROM tablespace_reports WHERE source_id = $1 ORDER BY created_at ASC`,
+    [sourceId],
+  );
+  return rows;
+}
+
+export async function getReport(sourceId, reportId) {
+  const { rows } = await query(
+    `SELECT ${REPORT_COLUMNS} FROM tablespace_reports WHERE id = $1 AND source_id = $2`,
+    [reportId, sourceId],
+  );
+  return rows[0] || null;
+}
+
+export async function createReport(
+  sourceId,
+  { name, tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize },
+) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_reports
+       (source_id, name, table_id, join_table_ids, dimension_ids, measure_ids, filters, chart_type, page_size)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING ${REPORT_COLUMNS}`,
+    [
+      sourceId,
+      name,
+      tableId,
+      toJson(joinTableIds || []),
+      toJson(dimensionIds || []),
+      toJson(measureIds || []),
+      toJson(filters || []),
+      chartType || "table",
+      pageSize || 100,
+    ],
+  );
+  return rows[0];
+}
+
+export async function renameReport(sourceId, reportId, name) {
+  const { rows } = await query(
+    `UPDATE tablespace_reports SET name = $3, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
+    [reportId, sourceId, name],
+  );
+  return rows[0] || null;
+}
+
+// IA redesign (post-4.4a) - the Report Builder now has a real edit
+// context (opened from a gallery card), so "Save" on an already-saved
+// report updates its query definition in place instead of always forcing
+// a new row - the delete-and-resave v1 behavior stays available as
+// "Save as new" (client-side: just calls createReport again). Name is
+// deliberately NOT touched here - renaming stays the gallery's job
+// (renameReport above), same separation of concerns Metabase draws
+// between "Save" and "Rename."
+export async function updateReport(
+  sourceId,
+  reportId,
+  { tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize },
+) {
+  const { rows } = await query(
+    `UPDATE tablespace_reports
+     SET table_id = $3, join_table_ids = $4, dimension_ids = $5, measure_ids = $6,
+         filters = $7, chart_type = $8, page_size = $9, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
+    [
+      reportId,
+      sourceId,
+      tableId,
+      toJson(joinTableIds || []),
+      toJson(dimensionIds || []),
+      toJson(measureIds || []),
+      toJson(filters || []),
+      chartType || "table",
+      pageSize || 100,
+    ],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteReport(sourceId, reportId) {
+  const { rowCount } = await query(
+    `DELETE FROM tablespace_reports WHERE id = $1 AND source_id = $2`,
+    [reportId, sourceId],
+  );
+  return rowCount > 0;
+}
+
 // List rows are deliberately lightweight (a table-count derived from
 // jsonb_array_length, not the full nodes/edges/enums payload) - matches
 // this file's existing listProjects/listCheckpoints pattern of "list is
