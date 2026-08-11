@@ -9,6 +9,19 @@ const OPERATORS = { eq: "=", neq: "<>", gt: ">", gte: ">=", lt: "<", lte: "<=", 
 // filters.
 const CALC_OPERATORS = { "+": "+", "-": "-", "*": "*", "/": "/" };
 
+// Cross-table calculated measures (post-4.4b) - the aggregation used to
+// COMBINE a joined table's already-per-base-row value across whatever the
+// outer query is actually grouped at. Not always the same as the inner
+// aggregation: "count of items per flow" needs SUM to total across a
+// group of flows (re-COUNTing would count how many flows had items, not
+// how many items) - SUM composes additively, so both count and sum wrap
+// in SUM. min/max compose with themselves (the min of per-flow minimums
+// IS the global minimum), so they wrap in themselves. avg wraps in avg
+// too, as a documented approximation - the average of each entity's own
+// average, not a single true weighted average, which would need extra
+// machinery out of scope for v1.
+const OUTER_WRAP = { count: "sum", sum: "sum", avg: "avg", min: "min", max: "max" };
+
 // Phase 4.3 follow-up - pagination. `pageSize` IS client-choosable now
 // (per explicit request), but only from this fixed allow-list - never an
 // arbitrary client-supplied number. MAX_ROWS is the real hard cap
@@ -41,6 +54,38 @@ function aggExpr(aggregation, columnName, tableName) {
   return aggregation === "count" ? "COUNT(*)" : `${AGGREGATIONS[aggregation]}(${quoteQualified(tableName, columnName)})`;
 }
 
+// Cross-table calculated measure terms - a term whose `tableName` differs
+// from the measure's own base table. Naively joining the two tables and
+// aggregating both in one flat query re-introduces exactly the fan-out
+// bug 4.4a's base-table-only rule exists to avoid (an order joined to 3
+// order_items appears 3 times, so COUNT(*)/SUM on either side inflates).
+//
+// The fix: pre-aggregate the joined table BY ITS OWN FK column first (one
+// row per base entity, never more), LEFT JOIN that already-deduplicated
+// result onto the base table, and only THEN let the outer query's actual
+// GROUP BY (or lack of one) combine values - by that point every row in
+// the FROM clause maps to at most one base row, so no aggregate - base-
+// column or joined-value alike - can be inflated by it. `crossSubqueries`
+// collects one such LEFT JOIN per cross-table term used across the whole
+// query (mutated in place - a plain array, not a Map, since a few
+// redundant identical subqueries cost nothing Postgres can't handle and
+// aren't worth the bookkeeping to dedupe).
+function compileTermExpr(term, baseTableName, crossSubqueries) {
+  if (!term.tableName || term.tableName === baseTableName) {
+    return aggExpr(term.aggregation, term.columnName, baseTableName);
+  }
+  const alias = `_cx${crossSubqueries.length}`;
+  const innerExpr = aggExpr(term.aggregation, term.columnName, term.tableName);
+  const fkCol = quoteQualified(term.tableName, term.joinInfo.joinColumn);
+  crossSubqueries.push(
+    `LEFT JOIN (SELECT ${fkCol} AS ${quoteIdent("_jk")}, ${innerExpr} AS ${quoteIdent("_v")} ` +
+      `FROM ${quoteIdent(term.tableName)} GROUP BY ${fkCol}) AS ${quoteIdent(alias)} ` +
+      `ON ${quoteQualified(baseTableName, term.joinInfo.baseColumn)} = ${quoteQualified(alias, "_jk")}`,
+  );
+  const outerAgg = OUTER_WRAP[term.aggregation];
+  return `${AGGREGATIONS[outerAgg]}(${quoteQualified(alias, "_v")})`;
+}
+
 // Phase 4.2 (single table) / 4.4a (direct joins) - compiles an
 // ALREADY-SERVER-VALIDATED query spec into parameterized SQL. Every
 // table/column name passed in here was resolved by the
@@ -58,14 +103,22 @@ function aggExpr(aggregation, columnName, tableName) {
 // table OR a joined one (each entry carries its own `tableName`).
 //
 // Phase 4.4b - a measure with `kind: "calculated"` carries `operator` +
-// `termA`/`termB` (each `{aggregation, columnName}`, same shape as a
-// simple measure) instead of a single `aggregation`/`columnName` pair -
-// two aggregate results combined with one arithmetic operator (e.g.
-// SUM(revenue) - SUM(cost)). Division guards against a zero denominator
-// with NULLIF rather than letting Postgres raise a division-by-zero error
-// mid-query. v1 is deliberately two terms, not an arbitrary expression
-// tree - same "prove the narrow case first" scoping every other
-// sub-phase here has used.
+// `termA`/`termB` (each `{aggregation, columnName, tableName, joinInfo}`)
+// instead of a single `aggregation`/`columnName` pair - two aggregate
+// results combined with one arithmetic operator (e.g. SUM(revenue) -
+// SUM(cost)). Division guards against a zero denominator with NULLIF
+// rather than letting Postgres raise a division-by-zero error mid-query.
+// v1 is deliberately two terms, not an arbitrary expression tree - same
+// "prove the narrow case first" scoping every other sub-phase here has
+// used.
+//
+// Cross-table calculated measures (post-4.4b) - a term's `tableName` can
+// now be a table directly joined to the base one (`joinInfo` carries the
+// real FK relationship columns, same shape `joins` entries already use);
+// see compileTermExpr()'s own comment for how that's compiled safely
+// (pre-aggregate-then-LEFT-JOIN, never a flat join across both
+// aggregates) and OUTER_WRAP for why the combining aggregation isn't
+// always the term's own chosen one.
 export function compileQuery({
   tableName,
   measures = [],
@@ -79,13 +132,19 @@ export function compileQuery({
     throw new Error("Pick at least one dimension or measure.");
   }
 
+  // Populated by compileTermExpr() below as a side effect, for any
+  // calculated measure term whose table isn't the base table - see that
+  // function's own comment for why this has to be a LEFT JOIN onto a
+  // pre-aggregated subquery rather than a flat join.
+  const crossSubqueries = [];
+
   const selectParts = [
     ...dimensions.map((dim) => `${quoteQualified(dim.tableName, dim.columnName)} AS ${quoteIdent(dim.id)}`),
     ...measures.map((measure) => {
       let expr;
       if (measure.kind === "calculated") {
-        const a = aggExpr(measure.termA.aggregation, measure.termA.columnName, tableName);
-        const b = aggExpr(measure.termB.aggregation, measure.termB.columnName, tableName);
+        const a = compileTermExpr(measure.termA, tableName, crossSubqueries);
+        const b = compileTermExpr(measure.termB, tableName, crossSubqueries);
         const op = CALC_OPERATORS[measure.operator];
         expr = op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
       } else {
@@ -116,6 +175,7 @@ export function compileQuery({
   const distinct = dimensions.length > 0 && measures.length === 0 ? "DISTINCT " : "";
   let sql = `SELECT ${distinct}${selectParts.join(", ")} FROM ${quoteIdent(tableName)}`;
   if (joinParts.length) sql += ` ${joinParts.join(" ")}`;
+  if (crossSubqueries.length) sql += ` ${crossSubqueries.join(" ")}`;
   if (whereParts.length) sql += ` WHERE ${whereParts.join(" AND ")}`;
   if (dimensions.length > 0 && measures.length > 0) {
     sql += ` GROUP BY ${dimensions.map((dim) => quoteQualified(dim.tableName, dim.columnName)).join(", ")}`;

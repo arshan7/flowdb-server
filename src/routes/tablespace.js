@@ -382,14 +382,36 @@ tablespaceRouter.post(
       return resolved;
     });
 
-    // Phase 4.4b - a calculated measure's terms resolve exactly like a
-    // simple measure's own aggregation/columnId (base table only, same
-    // join-fanout reasoning) - this just does that resolution twice.
+    // Phase 4.4b - a calculated measure's terms resolve like a simple
+    // measure's own aggregation/columnId. Post-4.4b: a term's stored
+    // `tableId` can now name a table DIRECTLY related to the base one
+    // (same findJoinPath check joinTableIds above already goes through -
+    // a client claiming an unrelated table is rejected the same way) -
+    // omitted/equal to the base table id keeps today's exact behavior for
+    // every calculated measure saved before this existed. `tableName`/
+    // `joinInfo` on the resolved term are what queryEngine.js's
+    // compileTermExpr() uses to decide whether it needs the pre-
+    // aggregate-then-LEFT-JOIN treatment - see its own comment for why.
     const resolveTerm = (term) => {
       if (!term || !QUERY_AGGREGATIONS.has(term.aggregation)) return null;
-      if (term.aggregation === "count") return { aggregation: "count", columnName: null };
-      const col = baseColumnsById.get(term.columnId);
-      return col ? { aggregation: term.aggregation, columnName: col.name } : null;
+
+      let termNode = node;
+      let joinInfo = null;
+      if (term.tableId && term.tableId !== node.id) {
+        termNode = nodesById.get(term.tableId);
+        if (!termNode || termNode.type !== "tableNode") return null;
+        const path = findJoinPath(node, termNode);
+        if (!path) return null;
+        joinInfo = { baseColumn: path.baseColumn, joinColumn: path.joinColumn };
+      }
+
+      if (term.aggregation === "count") {
+        return { aggregation: "count", columnName: null, tableName: termNode.data.label, joinInfo };
+      }
+      const termColumnsById =
+        termNode === node ? baseColumnsById : new Map((termNode.data?.columns || []).map((c) => [c.id, c]));
+      const col = termColumnsById.get(term.columnId);
+      return col ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, joinInfo } : null;
     };
 
     const measures = measureIds.map((id) => {
