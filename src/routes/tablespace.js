@@ -12,6 +12,7 @@ import {
   DEFAULT_PAGE_SIZE,
   MAX_ROWS,
 } from "../lib/queryEngine.js";
+import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
 
 const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max"]);
 const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains"]);
@@ -466,7 +467,17 @@ tablespaceRouter.post(
     }
 
     try {
-      const rawRows = await runQuery(secrets.connectionString, compiled.sql, compiled.params);
+      // Phase 4.4c - keyed by the exact compiled SQL+params (already
+      // deterministic per resolved spec, offset/pageSize included), scoped
+      // by sourceId. A repeated Run/reopen of the same report within the
+      // TTL window skips the live database entirely.
+      const key = cacheKey(req.params.sourceId, compiled.sql, compiled.params);
+      let rawRows = getCachedQuery(key)?.rows;
+      const cached = !!rawRows;
+      if (!rawRows) {
+        rawRows = await runQuery(secrets.connectionString, compiled.sql, compiled.params);
+        setCachedQuery(key, rawRows);
+      }
       const { rows, hasMore } = paginateRows(rawRows, pageSize);
       res.json({
         columns: [...dimensions, ...measures].map((c) => ({ id: c.id, label: c.label })),
@@ -474,6 +485,7 @@ tablespaceRouter.post(
         hasMore,
         sql: compiled.sql,
         params: compiled.params,
+        cached,
       });
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -602,6 +614,107 @@ tablespaceRouter.delete(
     const deleted = await store.deleteReport(req.params.sourceId, req.params.reportId);
     if (!deleted) {
       res.status(404).json({ error: "Report not found." });
+      return;
+    }
+    res.json({ success: true });
+  }),
+);
+
+// --- Dashboards (ROADMAP.md Phase 4.5): a named, ordered list of report
+// ids, rendered client-side as a grid. Same source-scoped/no-stored-
+// result-data shape reports already use - see tablespaceStore.js's own
+// comment. report_ids isn't validated against real report rows here
+// (soft reference, same contract a report's own table_id/dimension_ids
+// have) - the client fetches each report and skips ones that 404.
+
+tablespaceRouter.get(
+  "/sources/:sourceId/dashboards",
+  wrap(async (req, res) => {
+    res.json(await store.listDashboards(req.params.sourceId));
+  }),
+);
+
+tablespaceRouter.get(
+  "/sources/:sourceId/dashboards/:dashboardId",
+  wrap(async (req, res) => {
+    const dashboard = await store.getDashboard(req.params.sourceId, req.params.dashboardId);
+    if (!dashboard) {
+      res.status(404).json({ error: "Dashboard not found." });
+      return;
+    }
+    res.json(dashboard);
+  }),
+);
+
+tablespaceRouter.post(
+  "/sources/:sourceId/dashboards",
+  wrap(async (req, res) => {
+    const { name, reportIds } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    try {
+      const dashboard = await store.createDashboard(req.params.sourceId, { name: name.trim(), reportIds });
+      res.status(201).json(dashboard);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A dashboard named "${name.trim()}" already exists for this source.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.patch(
+  "/sources/:sourceId/dashboards/:dashboardId",
+  wrap(async (req, res) => {
+    const { name } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    try {
+      const dashboard = await store.renameDashboard(req.params.sourceId, req.params.dashboardId, name.trim());
+      if (!dashboard) {
+        res.status(404).json({ error: "Dashboard not found." });
+        return;
+      }
+      res.json(dashboard);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A dashboard named "${name.trim()}" already exists for this source.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.put(
+  "/sources/:sourceId/dashboards/:dashboardId",
+  wrap(async (req, res) => {
+    const { reportIds } = req.body || {};
+    if (!Array.isArray(reportIds)) {
+      res.status(400).json({ error: "reportIds must be an array." });
+      return;
+    }
+    const dashboard = await store.updateDashboardReports(req.params.sourceId, req.params.dashboardId, reportIds);
+    if (!dashboard) {
+      res.status(404).json({ error: "Dashboard not found." });
+      return;
+    }
+    res.json(dashboard);
+  }),
+);
+
+tablespaceRouter.delete(
+  "/sources/:sourceId/dashboards/:dashboardId",
+  wrap(async (req, res) => {
+    const deleted = await store.deleteDashboard(req.params.sourceId, req.params.dashboardId);
+    if (!deleted) {
+      res.status(404).json({ error: "Dashboard not found." });
       return;
     }
     res.json({ success: true });

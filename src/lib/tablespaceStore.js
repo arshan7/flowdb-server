@@ -371,6 +371,74 @@ export async function deleteReport(sourceId, reportId) {
   return rowCount > 0;
 }
 
+// Phase 4.5 - dashboards. A named, ordered list of report ids (array
+// order IS the grid order - v1 has no per-tile x/y/w/h, just an
+// auto-flowing grid, same "prove the narrow case first" scoping every
+// other sub-phase here has used). No stored result data, same as
+// reports - a dashboard just points at report ids; the client re-runs
+// each report's query live via the existing /sources/:sourceId/query
+// route per tile.
+const DASHBOARD_COLUMNS = `
+  id, source_id AS "sourceId", name, report_ids AS "reportIds",
+  created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function listDashboards(sourceId) {
+  const { rows } = await query(
+    `SELECT ${DASHBOARD_COLUMNS} FROM tablespace_dashboards WHERE source_id = $1 ORDER BY created_at ASC`,
+    [sourceId],
+  );
+  return rows;
+}
+
+export async function getDashboard(sourceId, dashboardId) {
+  const { rows } = await query(
+    `SELECT ${DASHBOARD_COLUMNS} FROM tablespace_dashboards WHERE id = $1 AND source_id = $2`,
+    [dashboardId, sourceId],
+  );
+  return rows[0] || null;
+}
+
+export async function createDashboard(sourceId, { name, reportIds }) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_dashboards (source_id, name, report_ids)
+     VALUES ($1, $2, $3)
+     RETURNING ${DASHBOARD_COLUMNS}`,
+    [sourceId, name, toJson(reportIds || [])],
+  );
+  return rows[0];
+}
+
+export async function renameDashboard(sourceId, dashboardId, name) {
+  const { rows } = await query(
+    `UPDATE tablespace_dashboards SET name = $3, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${DASHBOARD_COLUMNS}`,
+    [dashboardId, sourceId, name],
+  );
+  return rows[0] || null;
+}
+
+// The one mutation a dashboard's contents ever needs - the full ordered
+// report_ids array, replaced wholesale. Covers add/remove/reorder alike
+// (the client sends the complete next array each time) rather than
+// separate add/remove/move endpoints for what's really one operation.
+export async function updateDashboardReports(sourceId, dashboardId, reportIds) {
+  const { rows } = await query(
+    `UPDATE tablespace_dashboards SET report_ids = $3, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${DASHBOARD_COLUMNS}`,
+    [dashboardId, sourceId, toJson(reportIds || [])],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteDashboard(sourceId, dashboardId) {
+  const { rowCount } = await query(
+    `DELETE FROM tablespace_dashboards WHERE id = $1 AND source_id = $2`,
+    [dashboardId, sourceId],
+  );
+  return rowCount > 0;
+}
+
 // List rows are deliberately lightweight (a table-count derived from
 // jsonb_array_length, not the full nodes/edges/enums payload) - matches
 // this file's existing listProjects/listCheckpoints pattern of "list is

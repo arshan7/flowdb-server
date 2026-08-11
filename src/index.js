@@ -5,6 +5,7 @@ import { introspectRouter } from "./routes/introspect.js";
 import { tablespaceRouter } from "./routes/tablespace.js";
 import { requireApiKey } from "./middleware/apiKey.js";
 import { startSyncScheduler } from "./lib/syncScheduler.js";
+import { startQueryCacheSweeper } from "./lib/queryCache.js";
 
 const app = express();
 
@@ -46,3 +47,4 @@ app.listen(port, () => {
 });
 
 startSyncScheduler();
+startQueryCacheSweeper();
