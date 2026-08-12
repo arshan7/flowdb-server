@@ -100,19 +100,29 @@ function compileFilterCondition(tableName, columnName, operator, value, params) 
 // point every row in the FROM clause maps to at most one base row, so no
 // aggregate - base-column or joined-value alike - can be inflated by it.
 //
-// "value" terms (post-4.4b - read a directly-related table's column with
-// no real aggregation, e.g. a purchase's club's tax rate) reuse this
-// exact same machinery with MAX as the inner function: the route only
-// ever resolves a "value" term when the relationship guarantees at most
-// one matching joined row per base row (see resolveTerm's own comment),
-// so MAX simply returns that one value - and composes safely with any
-// outer GROUP BY the same way a true aggregate does, without needing to
-// add it to that GROUP BY itself.
+// "value" terms (post-4.4b - read a related table's column with no real
+// aggregation, e.g. a purchase's club's tax rate) reuse this exact same
+// machinery with MAX as the inner function: the route only ever resolves
+// a "value" term when the relationship guarantees at most one matching
+// joined row per base row (see resolveTerm's own comment), so MAX simply
+// returns that one value - and composes safely with any outer GROUP BY
+// the same way a true aggregate does, without needing to add it to that
+// GROUP BY itself.
 //
-// `crossSubqueries` collects one such LEFT JOIN per cross-table leaf term
-// used across the whole query (mutated in place - a plain array, not a
-// Map, since a few redundant identical subqueries cost nothing Postgres
-// can't handle and aren't worth the bookkeeping to dedupe).
+// Further post-4.4b: `term.chain` can have MORE than one hop - a "value"
+// term reached through a multi-hop all-many-to-one path (e.g. purchase ->
+// club -> region), not just a direct neighbor. Compiled as a SEQUENCE of
+// plain LEFT JOINs, each hop uniquely aliased so it can never collide
+// with another term's (or this same term's) joins elsewhere in the query
+// - a few redundant identical joins cost nothing Postgres can't handle,
+// same reasoning `crossSubqueries` not deduping already relied on. Every
+// OTHER cross-table aggregation (count/sum/avg/min/max) still only ever
+// gets a single-hop chain (`chain.length === 1`, resolved via the
+// original 1-hop findJoinPath) - multi-hop AGGREGATION is a harder,
+// separate, still-unbuilt problem.
+//
+// `crossSubqueries` collects one such LEFT JOIN (or LEFT JOIN chain) per
+// cross-table leaf term used across the whole query (mutated in place).
 function compileTermExpr(term, baseTableName, crossSubqueries, params) {
   if (term.kind === "calculated") {
     const a = compileTermExpr(term.termA, baseTableName, crossSubqueries, params);
@@ -126,8 +136,23 @@ function compileTermExpr(term, baseTableName, crossSubqueries, params) {
   }
 
   const alias = `_cx${crossSubqueries.length}`;
+
+  if (term.aggregation === "value") {
+    let fromIdent = baseTableName; // raw, unquoted - only ever passed through quoteQualified/quoteIdent below
+    term.chain.forEach((hop, i) => {
+      const hopAlias = `${alias}_${i}`;
+      crossSubqueries.push(
+        `LEFT JOIN ${quoteIdent(hop.tableName)} AS ${quoteIdent(hopAlias)} ` +
+          `ON ${quoteQualified(fromIdent, hop.baseColumn)} = ${quoteQualified(hopAlias, hop.joinColumn)}`,
+      );
+      fromIdent = hopAlias;
+    });
+    return `MAX(${quoteQualified(fromIdent, term.columnName)})`;
+  }
+
+  const hop = term.chain[0];
   const innerExpr = aggExpr(term.aggregation, term.columnName, term.tableName);
-  const fkCol = quoteQualified(term.tableName, term.joinInfo.joinColumn);
+  const fkCol = quoteQualified(term.tableName, hop.joinColumn);
   const filterParts = (term.filters || []).map((f) =>
     compileFilterCondition(term.tableName, f.columnName, f.operator, f.value, params),
   );
@@ -135,7 +160,7 @@ function compileTermExpr(term, baseTableName, crossSubqueries, params) {
   crossSubqueries.push(
     `LEFT JOIN (SELECT ${fkCol} AS ${quoteIdent("_jk")}, ${innerExpr} AS ${quoteIdent("_v")} ` +
       `FROM ${quoteIdent(term.tableName)}${whereClause} GROUP BY ${fkCol}) AS ${quoteIdent(alias)} ` +
-      `ON ${quoteQualified(baseTableName, term.joinInfo.baseColumn)} = ${quoteQualified(alias, "_jk")}`,
+      `ON ${quoteQualified(baseTableName, hop.baseColumn)} = ${quoteQualified(alias, "_jk")}`,
   );
   const outerAgg = OUTER_WRAP[term.aggregation];
   return `${AGGREGATIONS[outerAgg]}(${quoteQualified(alias, "_v")})`;
@@ -226,12 +251,16 @@ export function compileQuery({
 
   const whereParts = filters.map((f) => compileFilterCondition(f.tableName, f.columnName, f.operator, f.value, params));
 
-  // Each join is resolved server-side (route) against a real FK
-  // relationship before ever reaching here - baseColumn/joinColumn are
-  // always real, verified column names, never client-supplied strings.
+  // Each join is resolved server-side (route) against a real relationship
+  // before ever reaching here - baseColumn/joinColumn are always real,
+  // verified column names, never client-supplied strings. Post-4.4b, a
+  // join's `fromTableName` isn't always the query's own base table - a
+  // multi-hop chain's later hops join FROM the previous hop's table, not
+  // the original one (route: buildForwardJoinGraph/chainTo). Defaults to
+  // `tableName` for every join built before that existed.
   const joinParts = joins.map(
     (j) =>
-      `JOIN ${quoteIdent(j.tableName)} ON ${quoteQualified(tableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
+      `JOIN ${quoteIdent(j.tableName)} ON ${quoteQualified(j.fromTableName || tableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
   );
 
   // Dimensions-only -> DISTINCT (no aggregation happening, so GROUP BY

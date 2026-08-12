@@ -58,6 +58,77 @@ function findJoinPath(baseNode, joinNode) {
   return null;
 }
 
+// Post-4.4b - multi-hop join chains. Real BI tools (Power BI's snowflake
+// relationship chains, Cube.dev's Dijkstra-based cube-to-cube path
+// finding) walk the FULL relationship graph, not just direct neighbors -
+// confirmed against their actual docs rather than assumed, since this
+// changes what's actually safe to build. The safety property that makes
+// this OK: as long as every hop in a chain is "base_to_join" (many-to-one
+// - this table's FK points at the next one), each row of the ORIGINAL
+// base table still maps to at most one row at the far end of the chain,
+// transitively, no matter how many hops - the same guarantee a single
+// "value" hop already relies on. A chain through a "join_to_base" (many)
+// hop would break that guarantee, so this graph only ever follows
+// forward FK edges - it deliberately can't discover those tables at all
+// (they're the existing 1-hop-only aggregate case, unchanged, still
+// resolved by findJoinPath above).
+function getForwardNeighbors(node, allNodes) {
+  const neighbors = [];
+  for (const col of node.data?.columns || []) {
+    if (!col.isForeignKey || !col.references?.tableId) continue;
+    const target = allNodes.find((n) => n.id === col.references.tableId);
+    if (!target) continue;
+    const targetCol = (target.data?.columns || []).find((c) => c.id === col.references.columnId);
+    if (!targetCol) continue;
+    neighbors.push({ node: target, baseColumn: col.name, joinColumn: targetCol.name });
+  }
+  return neighbors;
+}
+
+// One BFS from `baseNode` over forward (many-to-one) edges only, reused
+// for every chain lookup against that base table in a single request -
+// BFS naturally finds the SHORTEST path to each reachable table, which
+// is also how Cube.dev resolves ambiguity when more than one path could
+// exist (Dijkstra, which BFS is the unweighted special case of) rather
+// than picking arbitrarily. `visited` doubles as cycle protection - a
+// schema can have a relationship cycle (A -> B -> C -> A), this stops
+// there instead of looping forever.
+function buildForwardJoinGraph(baseNode, allNodes) {
+  const parent = new Map(); // tableId -> { fromTableId, baseColumn, joinColumn }
+  const order = []; // tableIds in BFS-discovery (= dependency-safe) order
+  const visited = new Set([baseNode.id]);
+  const queue = [baseNode];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const { node: neighborNode, baseColumn, joinColumn } of getForwardNeighbors(current, allNodes)) {
+      if (visited.has(neighborNode.id)) continue;
+      visited.add(neighborNode.id);
+      parent.set(neighborNode.id, { fromTableId: current.id, baseColumn, joinColumn });
+      order.push(neighborNode.id);
+      queue.push(neighborNode);
+    }
+  }
+  return { parent, order };
+}
+
+// Walks `graph.parent` back from `targetId` to the base table, returning
+// the chain in base-to-target order. null if targetId is unreachable via
+// an all-forward path (including: not related at all, or only reachable
+// through a "many" hop this graph deliberately never follows).
+function chainTo(graph, nodesById, targetId) {
+  if (!graph.parent.has(targetId)) return null;
+  const hops = [];
+  let cur = targetId;
+  while (graph.parent.has(cur)) {
+    const { fromTableId, baseColumn, joinColumn } = graph.parent.get(cur);
+    const tableName = nodesById.get(cur)?.data?.label;
+    if (!tableName) return null;
+    hops.unshift({ tableName, baseColumn, joinColumn, fromTableId });
+    cur = fromTableId;
+  }
+  return hops;
+}
+
 export const tablespaceRouter = Router();
 
 // Wraps an async route handler so a rejected promise reaches Express's
@@ -346,26 +417,47 @@ tablespaceRouter.post(
       return;
     }
 
-    // Every joinTableId is verified against a REAL foreign-key
-    // relationship to the base table - the client only ever claims a
-    // table id, never the join columns themselves.
+    // Every joinTableId is verified against a REAL relationship to the
+    // base table - the client only ever claims a table id, never the
+    // join columns themselves. Direct (1-hop, either direction) is tried
+    // first - unchanged from before, so every join that already worked
+    // still resolves exactly the same way. Only if that fails does a
+    // requested table fall back to the multi-hop forward (many-to-one)
+    // chain - see buildForwardJoinGraph's own comment for why that's
+    // safe and how it mirrors Power BI/Cube.dev. `joinedTableNames`
+    // dedupes hops shared by more than one requested join's chain (or a
+    // chain that happens to pass through another explicitly-requested
+    // table) so the same table is never joined into the FROM clause
+    // twice.
+    const allTableNodes = (branch?.nodes || []).filter((n) => n.type === "tableNode");
+    const forwardGraph = buildForwardJoinGraph(node, allTableNodes);
     const joinNodes = [];
     const joinClauses = [];
+    const joinedTableNames = new Set();
     for (const joinTableId of joinTableIds) {
       const joinNode = nodesById.get(joinTableId);
       if (!joinNode || joinNode.type !== "tableNode") {
         res.status(400).json({ error: `Table ${joinTableId} not found.` });
         return;
       }
-      const path = findJoinPath(node, joinNode);
-      if (!path) {
+      const direct = findJoinPath(node, joinNode);
+      const chain = direct
+        ? [{ tableName: joinNode.data.label, baseColumn: direct.baseColumn, joinColumn: direct.joinColumn, fromTableId: node.id }]
+        : chainTo(forwardGraph, nodesById, joinTableId);
+      if (!chain) {
         res.status(400).json({
-          error: `"${joinNode.data?.label}" isn't directly related to "${node.data?.label}".`,
+          error: `"${joinNode.data?.label}" isn't reachable from "${node.data?.label}" through a direct or many-to-one relationship.`,
         });
         return;
       }
-      joinNodes.push(joinNode);
-      joinClauses.push({ tableName: joinNode.data.label, baseColumn: path.baseColumn, joinColumn: path.joinColumn });
+      for (const hop of chain) {
+        if (joinedTableNames.has(hop.tableName)) continue;
+        joinedTableNames.add(hop.tableName);
+        const fromTableName = hop.fromTableId === node.id ? node.data.label : nodesById.get(hop.fromTableId)?.data?.label;
+        joinClauses.push({ tableName: hop.tableName, fromTableName, baseColumn: hop.baseColumn, joinColumn: hop.joinColumn });
+        const hopNode = allTableNodes.find((n) => n.data?.label === hop.tableName);
+        if (hopNode) joinNodes.push(hopNode);
+      }
     }
 
     // Dimensions/filters may reference the base table or any validated
@@ -396,30 +488,37 @@ tablespaceRouter.post(
     });
 
     // Phase 4.4b - a calculated measure's terms resolve like a simple
-    // measure's own aggregation/columnId. Post-4.4b, three extensions,
+    // measure's own aggregation/columnId. Post-4.4b, four extensions,
     // each guarded independently:
     //
-    // 1. A term's stored `tableId` can name a table DIRECTLY related to
-    //    the base one (same findJoinPath check joinTableIds above already
-    //    goes through - a client claiming an unrelated table is rejected
-    //    the same way) - omitted/equal to the base table id keeps today's
+    // 1. A term's stored `tableId` can name a table related to the base
+    //    one - directly (same findJoinPath check joinTableIds above
+    //    already goes through) or, for `aggregation: "value"` only,
+    //    through a multi-hop all-many-to-one chain (buildForwardJoinGraph
+    //    above) - a client claiming an unreachable table is rejected
+    //    either way. Omitted/equal to the base table id keeps today's
     //    exact behavior for every calculated measure saved before this
     //    existed.
     // 2. `aggregation: "value"` (read a related column directly, no real
-    //    aggregation) is only valid when the relationship's `direction`
-    //    is "base_to_join" - the base table holds the FK, so each base
-    //    row matches at most one joined row. In the other direction
-    //    ("join_to_base") a base row could match many joined rows, so
-    //    "which one's value?" has no safe single answer - rejected here,
-    //    same as any other unresolvable id, rather than silently picking
-    //    one arbitrarily.
-    // 3. A term's own `filters` (only meaningful cross-table - e.g. "only
+    //    aggregation) is only valid when the forward graph can reach the
+    //    term's table at all - since that graph only ever follows
+    //    many-to-one edges, reachability there already IS the safety
+    //    check (no separate direction check needed - a `join_to_base`
+    //    first hop, or ANY "many" hop further along a chain, simply isn't
+    //    in this graph, so chainTo returns null and the term is rejected
+    //    the same way an unrelated table would be).
+    // 3. Every OTHER cross-table aggregation (count/sum/avg/min/max)
+    //    stays exactly 1-hop, either direction, via findJoinPath -
+    //    unchanged from before. Multi-hop AGGREGATION (as opposed to a
+    //    multi-hop VALUE read) is a harder, still-unbuilt problem - see
+    //    the plan doc.
+    // 4. A term's own `filters` (only meaningful cross-table - e.g. "only
     //    completed bookings") resolve against the TERM's table, not the
     //    base table's `findDimension`/filter machinery above, since
     //    they're scoped to what's being pre-aggregated, not the outer
     //    query's own WHERE clause.
     //
-    // `tableName`/`joinInfo`/`filters` on the resolved term are what
+    // `tableName`/`chain`/`filters` on the resolved term are what
     // queryEngine.js's compileTermExpr() uses to decide whether it needs
     // the pre-aggregate-then-LEFT-JOIN treatment - see its own comment.
     const resolveTerm = (term, visiting) => {
@@ -428,14 +527,18 @@ tablespaceRouter.post(
       if (!QUERY_TERM_AGGREGATIONS.has(term.aggregation)) return null;
 
       let termNode = node;
-      let joinInfo = null;
+      let chain = null;
       if (term.tableId && term.tableId !== node.id) {
         termNode = nodesById.get(term.tableId);
         if (!termNode || termNode.type !== "tableNode") return null;
-        const path = findJoinPath(node, termNode);
-        if (!path) return null;
-        if (term.aggregation === "value" && path.direction !== "base_to_join") return null;
-        joinInfo = { baseColumn: path.baseColumn, joinColumn: path.joinColumn };
+        if (term.aggregation === "value") {
+          chain = chainTo(forwardGraph, nodesById, term.tableId);
+          if (!chain) return null;
+        } else {
+          const path = findJoinPath(node, termNode);
+          if (!path) return null;
+          chain = [{ tableName: termNode.data.label, baseColumn: path.baseColumn, joinColumn: path.joinColumn, fromTableId: node.id }];
+        }
       } else if (term.aggregation === "value") {
         // "value" only means anything cross-table - a same-table term
         // already reads the base table's own column directly.
@@ -454,11 +557,11 @@ tablespaceRouter.post(
       }
 
       if (term.aggregation === "count") {
-        return { aggregation: "count", columnName: null, tableName: termNode.data.label, joinInfo, filters };
+        return { aggregation: "count", columnName: null, tableName: termNode.data.label, chain, filters };
       }
       const col = termColumnsById.get(term.columnId);
       return col
-        ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, joinInfo, filters }
+        ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, chain, filters }
         : null;
     };
 
@@ -487,11 +590,11 @@ tablespaceRouter.post(
       }
       if (!QUERY_AGGREGATIONS.has(measure.aggregation)) return null;
       if (measure.aggregation === "count") {
-        return { aggregation: "count", columnName: null, tableName: node.data.label, joinInfo: null, filters: [] };
+        return { aggregation: "count", columnName: null, tableName: node.data.label, chain: null, filters: [] };
       }
       const col = baseColumnsById.get(measure.columnId);
       return col
-        ? { aggregation: measure.aggregation, columnName: col.name, tableName: node.data.label, joinInfo: null, filters: [] }
+        ? { aggregation: measure.aggregation, columnName: col.name, tableName: node.data.label, chain: null, filters: [] }
         : null;
     };
 
