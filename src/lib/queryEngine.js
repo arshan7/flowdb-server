@@ -2,6 +2,9 @@ import pg from "pg";
 import { resolveSsl } from "./pgIntrospect.js";
 
 const AGGREGATIONS = { count: "COUNT", sum: "SUM", avg: "AVG", min: "MIN", max: "MAX" };
+// "in" has no fixed symbol - it's special-cased in compileFilterCondition
+// as `= ANY($n)` (a single parameterized array, not string-built
+// `IN ($1,$2,$3)` for variable arity).
 const OPERATORS = { eq: "=", neq: "<>", gt: ">", gte: ">=", lt: "<", lte: "<=", contains: "ILIKE" };
 // Phase 4.4b - calculated measures. Only these four symbols ever reach the
 // SQL string, and only by exact map lookup (never a client value passed
@@ -19,8 +22,12 @@ const CALC_OPERATORS = { "+": "+", "-": "-", "*": "*", "/": "/" };
 // IS the global minimum), so they wrap in themselves. avg wraps in avg
 // too, as a documented approximation - the average of each entity's own
 // average, not a single true weighted average, which would need extra
-// machinery out of scope for v1.
-const OUTER_WRAP = { count: "sum", sum: "sum", avg: "avg", min: "min", max: "max" };
+// machinery out of scope for v1. "value" (a joined-table column read
+// directly, not really aggregated - see compileTermExpr) wraps in "max"
+// for the same reason it's compiled as MAX inside the subquery: there's
+// only ever one distinct value per base entity, so MAX just returns it,
+// at any outer grouping level.
+const OUTER_WRAP = { count: "sum", sum: "sum", avg: "avg", min: "min", max: "max", value: "max" };
 
 // Phase 4.3 follow-up - pagination. `pageSize` IS client-choosable now
 // (per explicit request), but only from this fixed allow-list - never an
@@ -48,38 +55,86 @@ function quoteQualified(table, column) {
 }
 
 // A single aggregate expression - COUNT(*) or AGG("table"."column"). The
-// one building block both a simple measure and each side of a calculated
-// measure (4.4b) reduce to.
+// one building block both a simple measure and each leaf term of a
+// calculated measure (4.4b) reduce to. "value" (post-4.4b) compiles to
+// MAX - see compileTermExpr's own comment for why that's correct, not
+// just convenient.
 function aggExpr(aggregation, columnName, tableName) {
-  return aggregation === "count" ? "COUNT(*)" : `${AGGREGATIONS[aggregation]}(${quoteQualified(tableName, columnName)})`;
+  if (aggregation === "count") return "COUNT(*)";
+  const fn = aggregation === "value" ? "max" : aggregation;
+  return `${AGGREGATIONS[fn]}(${quoteQualified(tableName, columnName)})`;
 }
 
-// Cross-table calculated measure terms - a term whose `tableName` differs
-// from the measure's own base table. Naively joining the two tables and
-// aggregating both in one flat query re-introduces exactly the fan-out
-// bug 4.4a's base-table-only rule exists to avoid (an order joined to 3
-// order_items appears 3 times, so COUNT(*)/SUM on either side inflates).
+// Shared by the main WHERE clause and a cross-table term's own subquery
+// WHERE clause - one place that decides how a filter condition becomes
+// SQL, so the two can't silently drift into different behavior for the
+// same operator.
+function compileFilterCondition(tableName, columnName, operator, value, params) {
+  const colExpr = quoteQualified(tableName, columnName);
+  if (operator === "in") {
+    params.push(value);
+    return `${colExpr} = ANY($${params.length})`;
+  }
+  params.push(operator === "contains" ? `%${value}%` : value);
+  return `${colExpr} ${OPERATORS[operator]} $${params.length}`;
+}
+
+// Compiles one calculated-measure term - RECURSIVE, since post-4.4b a
+// term can itself be another calculated expression (a measure referencing
+// another measure, inlined here rather than as a separate query layer -
+// see tablespace.js's resolveMeasureAsTerm for why inlining an
+// already-resolved expression is simpler than restructuring this query
+// into dependency-ordered CTEs, and just as correct: substituting a
+// verified-correct sub-expression can never make the outer one wrong).
 //
+// Leaf terms whose `tableName` differs from the base table are the
+// original cross-table case: naively joining the two tables and
+// aggregating both in one flat query reintroduces exactly the fan-out bug
+// 4.4a's base-table-only rule exists to avoid (an order joined to 3
+// order_items appears 3 times, so COUNT(*)/SUM on either side inflates).
 // The fix: pre-aggregate the joined table BY ITS OWN FK column first (one
-// row per base entity, never more), LEFT JOIN that already-deduplicated
-// result onto the base table, and only THEN let the outer query's actual
-// GROUP BY (or lack of one) combine values - by that point every row in
-// the FROM clause maps to at most one base row, so no aggregate - base-
-// column or joined-value alike - can be inflated by it. `crossSubqueries`
-// collects one such LEFT JOIN per cross-table term used across the whole
-// query (mutated in place - a plain array, not a Map, since a few
-// redundant identical subqueries cost nothing Postgres can't handle and
-// aren't worth the bookkeeping to dedupe).
-function compileTermExpr(term, baseTableName, crossSubqueries) {
+// row per base entity, never more, optionally narrowed by the term's own
+// `filters` - post-4.4b, e.g. "only completed bookings"), LEFT JOIN that
+// already-deduplicated result onto the base table, and only THEN let the
+// outer query's actual GROUP BY (or lack of one) combine values - by that
+// point every row in the FROM clause maps to at most one base row, so no
+// aggregate - base-column or joined-value alike - can be inflated by it.
+//
+// "value" terms (post-4.4b - read a directly-related table's column with
+// no real aggregation, e.g. a purchase's club's tax rate) reuse this
+// exact same machinery with MAX as the inner function: the route only
+// ever resolves a "value" term when the relationship guarantees at most
+// one matching joined row per base row (see resolveTerm's own comment),
+// so MAX simply returns that one value - and composes safely with any
+// outer GROUP BY the same way a true aggregate does, without needing to
+// add it to that GROUP BY itself.
+//
+// `crossSubqueries` collects one such LEFT JOIN per cross-table leaf term
+// used across the whole query (mutated in place - a plain array, not a
+// Map, since a few redundant identical subqueries cost nothing Postgres
+// can't handle and aren't worth the bookkeeping to dedupe).
+function compileTermExpr(term, baseTableName, crossSubqueries, params) {
+  if (term.kind === "calculated") {
+    const a = compileTermExpr(term.termA, baseTableName, crossSubqueries, params);
+    const b = compileTermExpr(term.termB, baseTableName, crossSubqueries, params);
+    const op = CALC_OPERATORS[term.operator];
+    return op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
+  }
+
   if (!term.tableName || term.tableName === baseTableName) {
     return aggExpr(term.aggregation, term.columnName, baseTableName);
   }
+
   const alias = `_cx${crossSubqueries.length}`;
   const innerExpr = aggExpr(term.aggregation, term.columnName, term.tableName);
   const fkCol = quoteQualified(term.tableName, term.joinInfo.joinColumn);
+  const filterParts = (term.filters || []).map((f) =>
+    compileFilterCondition(term.tableName, f.columnName, f.operator, f.value, params),
+  );
+  const whereClause = filterParts.length ? ` WHERE ${filterParts.join(" AND ")}` : "";
   crossSubqueries.push(
     `LEFT JOIN (SELECT ${fkCol} AS ${quoteIdent("_jk")}, ${innerExpr} AS ${quoteIdent("_v")} ` +
-      `FROM ${quoteIdent(term.tableName)} GROUP BY ${fkCol}) AS ${quoteIdent(alias)} ` +
+      `FROM ${quoteIdent(term.tableName)}${whereClause} GROUP BY ${fkCol}) AS ${quoteIdent(alias)} ` +
       `ON ${quoteQualified(baseTableName, term.joinInfo.baseColumn)} = ${quoteQualified(alias, "_jk")}`,
   );
   const outerAgg = OUTER_WRAP[term.aggregation];
@@ -119,6 +174,15 @@ function compileTermExpr(term, baseTableName, crossSubqueries) {
 // (pre-aggregate-then-LEFT-JOIN, never a flat join across both
 // aggregates) and OUTER_WRAP for why the combining aggregation isn't
 // always the term's own chosen one.
+//
+// Further post-4.4b: a term can carry its own `filters` (only meaningful
+// for a cross-table term - e.g. "only completed bookings" before
+// counting them), applied inside that term's own pre-aggregation
+// subquery. A term can also itself be `{kind: "calculated", operator,
+// termA, termB}` - a measure referencing another measure, already fully
+// resolved and inlined by the route (tablespace.js's
+// resolveMeasureAsTerm) before it ever reaches here, so compileTermExpr
+// just recurses.
 export function compileQuery({
   tableName,
   measures = [],
@@ -135,16 +199,22 @@ export function compileQuery({
   // Populated by compileTermExpr() below as a side effect, for any
   // calculated measure term whose table isn't the base table - see that
   // function's own comment for why this has to be a LEFT JOIN onto a
-  // pre-aggregated subquery rather than a flat join.
+  // pre-aggregated subquery rather than a flat join. params is declared
+  // here (not down by the main WHERE clause, as it used to be) since a
+  // cross-table term's own filters (post-4.4b) can now push parameters
+  // while selectParts is still being built - order only matters in that
+  // every push happens before its own $N is computed, which both sections
+  // already do independently.
   const crossSubqueries = [];
+  const params = [];
 
   const selectParts = [
     ...dimensions.map((dim) => `${quoteQualified(dim.tableName, dim.columnName)} AS ${quoteIdent(dim.id)}`),
     ...measures.map((measure) => {
       let expr;
       if (measure.kind === "calculated") {
-        const a = compileTermExpr(measure.termA, tableName, crossSubqueries);
-        const b = compileTermExpr(measure.termB, tableName, crossSubqueries);
+        const a = compileTermExpr(measure.termA, tableName, crossSubqueries, params);
+        const b = compileTermExpr(measure.termB, tableName, crossSubqueries, params);
         const op = CALC_OPERATORS[measure.operator];
         expr = op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
       } else {
@@ -154,11 +224,7 @@ export function compileQuery({
     }),
   ];
 
-  const params = [];
-  const whereParts = filters.map((f) => {
-    params.push(f.operator === "contains" ? `%${f.value}%` : f.value);
-    return `${quoteQualified(f.tableName, f.columnName)} ${OPERATORS[f.operator]} $${params.length}`;
-  });
+  const whereParts = filters.map((f) => compileFilterCondition(f.tableName, f.columnName, f.operator, f.value, params));
 
   // Each join is resolved server-side (route) against a real FK
   // relationship before ever reaching here - baseColumn/joinColumn are

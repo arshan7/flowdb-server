@@ -15,7 +15,12 @@ import {
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
 
 const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max"]);
-const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains"]);
+// Post-4.4b - "value" (a directly-related table's column, read as-is, not
+// really aggregated) is a term-only concept, deliberately NOT in this
+// set - it's checked separately in resolveTerm, where the join direction
+// can also be validated (see that function's own comment for why).
+const QUERY_TERM_AGGREGATIONS = new Set([...QUERY_AGGREGATIONS, "value"]);
+const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains", "in"]);
 // Phase 4.4b - calculated measures' arithmetic operator.
 const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
 
@@ -26,6 +31,14 @@ const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
 // Checks both FK directions since either table could hold the foreign
 // key. If multiple FK paths exist between the same two tables, the first
 // one found wins - a known v1 simplification (no picker for which path).
+//
+// `direction` (post-4.4b) says WHICH side holds the FK - "base_to_join"
+// means the base table has the FK (so each base row matches AT MOST ONE
+// joined row - the safe direction for a "value" term to read a joined
+// column directly, no aggregation needed since there's only ever one
+// candidate value); "join_to_base" means the joined table has the FK (the
+// base table could match MANY joined rows - the original cross-table
+// case genuine aggregation, not a bare "value" read, exists for).
 function findJoinPath(baseNode, joinNode) {
   const baseColumns = baseNode.data?.columns || [];
   const joinColumns = joinNode.data?.columns || [];
@@ -33,13 +46,13 @@ function findJoinPath(baseNode, joinNode) {
   for (const col of baseColumns) {
     if (col.isForeignKey && col.references?.tableId === joinNode.id) {
       const target = joinColumns.find((c) => c.id === col.references.columnId);
-      if (target) return { baseColumn: col.name, joinColumn: target.name };
+      if (target) return { baseColumn: col.name, joinColumn: target.name, direction: "base_to_join" };
     }
   }
   for (const col of joinColumns) {
     if (col.isForeignKey && col.references?.tableId === baseNode.id) {
       const target = baseColumns.find((c) => c.id === col.references.columnId);
-      if (target) return { baseColumn: target.name, joinColumn: col.name };
+      if (target) return { baseColumn: target.name, joinColumn: col.name, direction: "join_to_base" };
     }
   }
   return null;
@@ -383,17 +396,36 @@ tablespaceRouter.post(
     });
 
     // Phase 4.4b - a calculated measure's terms resolve like a simple
-    // measure's own aggregation/columnId. Post-4.4b: a term's stored
-    // `tableId` can now name a table DIRECTLY related to the base one
-    // (same findJoinPath check joinTableIds above already goes through -
-    // a client claiming an unrelated table is rejected the same way) -
-    // omitted/equal to the base table id keeps today's exact behavior for
-    // every calculated measure saved before this existed. `tableName`/
-    // `joinInfo` on the resolved term are what queryEngine.js's
-    // compileTermExpr() uses to decide whether it needs the pre-
-    // aggregate-then-LEFT-JOIN treatment - see its own comment for why.
-    const resolveTerm = (term) => {
-      if (!term || !QUERY_AGGREGATIONS.has(term.aggregation)) return null;
+    // measure's own aggregation/columnId. Post-4.4b, three extensions,
+    // each guarded independently:
+    //
+    // 1. A term's stored `tableId` can name a table DIRECTLY related to
+    //    the base one (same findJoinPath check joinTableIds above already
+    //    goes through - a client claiming an unrelated table is rejected
+    //    the same way) - omitted/equal to the base table id keeps today's
+    //    exact behavior for every calculated measure saved before this
+    //    existed.
+    // 2. `aggregation: "value"` (read a related column directly, no real
+    //    aggregation) is only valid when the relationship's `direction`
+    //    is "base_to_join" - the base table holds the FK, so each base
+    //    row matches at most one joined row. In the other direction
+    //    ("join_to_base") a base row could match many joined rows, so
+    //    "which one's value?" has no safe single answer - rejected here,
+    //    same as any other unresolvable id, rather than silently picking
+    //    one arbitrarily.
+    // 3. A term's own `filters` (only meaningful cross-table - e.g. "only
+    //    completed bookings") resolve against the TERM's table, not the
+    //    base table's `findDimension`/filter machinery above, since
+    //    they're scoped to what's being pre-aggregated, not the outer
+    //    query's own WHERE clause.
+    //
+    // `tableName`/`joinInfo`/`filters` on the resolved term are what
+    // queryEngine.js's compileTermExpr() uses to decide whether it needs
+    // the pre-aggregate-then-LEFT-JOIN treatment - see its own comment.
+    const resolveTerm = (term, visiting) => {
+      if (!term) return null;
+      if (term.measureId) return resolveMeasureAsTerm(term.measureId, visiting);
+      if (!QUERY_TERM_AGGREGATIONS.has(term.aggregation)) return null;
 
       let termNode = node;
       let joinInfo = null;
@@ -402,16 +434,65 @@ tablespaceRouter.post(
         if (!termNode || termNode.type !== "tableNode") return null;
         const path = findJoinPath(node, termNode);
         if (!path) return null;
+        if (term.aggregation === "value" && path.direction !== "base_to_join") return null;
         joinInfo = { baseColumn: path.baseColumn, joinColumn: path.joinColumn };
+      } else if (term.aggregation === "value") {
+        // "value" only means anything cross-table - a same-table term
+        // already reads the base table's own column directly.
+        return null;
+      }
+
+      const termColumnsById =
+        termNode === node ? baseColumnsById : new Map((termNode.data?.columns || []).map((c) => [c.id, c]));
+
+      const filters = [];
+      for (const f of term.filters || []) {
+        const col = termColumnsById.get(f?.columnId);
+        if (!col || !QUERY_OPERATORS.has(f.operator)) return null;
+        if (f.operator === "in" && !Array.isArray(f.value)) return null;
+        filters.push({ columnName: col.name, operator: f.operator, value: f.value });
       }
 
       if (term.aggregation === "count") {
-        return { aggregation: "count", columnName: null, tableName: termNode.data.label, joinInfo };
+        return { aggregation: "count", columnName: null, tableName: termNode.data.label, joinInfo, filters };
       }
-      const termColumnsById =
-        termNode === node ? baseColumnsById : new Map((termNode.data?.columns || []).map((c) => [c.id, c]));
       const col = termColumnsById.get(term.columnId);
-      return col ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, joinInfo } : null;
+      return col
+        ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, joinInfo, filters }
+        : null;
+    };
+
+    // Post-4.4b - a calculated measure's term can reference ANOTHER
+    // measure on this same table instead of aggregating a column
+    // directly (e.g. "net earnings" built from "gross earnings", itself
+    // built from "completed sessions"). Resolved by recursively
+    // inlining the referenced measure's own already-validated expression
+    // - see queryEngine.js's compileTermExpr for why inlining (rather
+    // than a separate query layer) is both simpler and just as correct.
+    // `visiting` is the set of measure ids already on the current
+    // resolution path - a measure appearing twice on its own path means
+    // a cycle (A -> B -> A), rejected outright rather than infinitely
+    // recursing or silently picking one expansion.
+    const resolveMeasureAsTerm = (measureId, visiting) => {
+      if (visiting.has(measureId)) return null;
+      const measure = (baseSemanticModel.measures || []).find((m) => m.id === measureId);
+      if (!measure) return null;
+      const nextVisiting = new Set(visiting).add(measureId);
+
+      if (measure.kind === "calculated") {
+        if (!QUERY_CALC_OPERATORS.has(measure.operator)) return null;
+        const termA = resolveTerm(measure.termA, nextVisiting);
+        const termB = resolveTerm(measure.termB, nextVisiting);
+        return termA && termB ? { kind: "calculated", operator: measure.operator, termA, termB } : null;
+      }
+      if (!QUERY_AGGREGATIONS.has(measure.aggregation)) return null;
+      if (measure.aggregation === "count") {
+        return { aggregation: "count", columnName: null, tableName: node.data.label, joinInfo: null, filters: [] };
+      }
+      const col = baseColumnsById.get(measure.columnId);
+      return col
+        ? { aggregation: measure.aggregation, columnName: col.name, tableName: node.data.label, joinInfo: null, filters: [] }
+        : null;
     };
 
     const measures = measureIds.map((id) => {
@@ -426,8 +507,9 @@ tablespaceRouter.post(
           unknown.push(id);
           return null;
         }
-        const termA = resolveTerm(measure.termA);
-        const termB = resolveTerm(measure.termB);
+        const visiting = new Set([measure.id]);
+        const termA = resolveTerm(measure.termA, visiting);
+        const termB = resolveTerm(measure.termB, visiting);
         if (!termA || !termB) {
           unknown.push(id);
           return null;
