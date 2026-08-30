@@ -11,6 +11,8 @@ import {
   resolveNativeVars,
   paginateRows,
   quoteTable,
+  quoteIdent,
+  compileFilterCondition,
   ALLOWED_PAGE_SIZES,
   DEFAULT_PAGE_SIZE,
   MAX_ROWS,
@@ -39,6 +41,11 @@ const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contain
 // against this, the engine re-derives the actual date_trunc unit.
 const QUERY_BUCKETS = new Set(["day", "week", "month", "quarter", "year"]);
 const QUERY_SORT_DIRECTIONS = new Set(["asc", "desc"]);
+// Data-browse /preview row filters - plain-language operators ("is", "is
+// not", "contains", "greater than"..., "is empty", "is not empty") map to
+// these keys, then through the shared compileFilterCondition.
+// "isnull"/"notnull" bind no value.
+const PREVIEW_OPERATORS = new Set(["eq", "neq", "contains", "gt", "gte", "lt", "lte", "isnull", "notnull"]);
 
 // Slice 5 - resolve a stored Model row into { sql, params, columns } using
 // the branch's canvas nodes (same node/join/column resolution the /query
@@ -1024,14 +1031,32 @@ tablespaceRouter.post(
 );
 
 // Slice 5 - preview a physical table's rows (the "Data" browse layer).
-// Read-only, hard row cap; just `SELECT * FROM "<table>"` wrapped by
-// runNativeQuery's own LIMIT/OFFSET.
+// Read-only, hard row cap. The browse UI (DataBrowseScreen) drives paging
+// (`offset`/`pageSize`), a single sort key (`orderBy: {column, direction}`),
+// and plain-language row filters (`filters: [{column, operator, value}]`)
+// from here. Every column name is re-validated against the modeled node's
+// own columns before it reaches the SQL string; filter values bind as
+// params via compileFilterCondition (shared with the report engine); and
+// runNativeQuery still wraps the whole thing in a READ ONLY txn plus an
+// un-removable LIMIT/OFFSET.
 tablespaceRouter.post(
   "/sources/:sourceId/preview",
   wrap(async (req, res) => {
-    const { tableId, limit = 50 } = req.body || {};
+    const { tableId, offset = 0, pageSize = 50, orderBy = null, filters = [] } = req.body || {};
     if (!tableId) {
       res.status(400).json({ error: "tableId is required." });
+      return;
+    }
+    if (!ALLOWED_PAGE_SIZES.includes(pageSize)) {
+      res.status(400).json({ error: `pageSize must be one of ${ALLOWED_PAGE_SIZES.join(", ")}.` });
+      return;
+    }
+    if (!Number.isInteger(offset) || offset < 0 || offset + pageSize > MAX_ROWS) {
+      res.status(400).json({ error: `offset must be a non-negative integer, and offset + pageSize can't exceed ${MAX_ROWS}.` });
+      return;
+    }
+    if (!Array.isArray(filters)) {
+      res.status(400).json({ error: "filters must be an array." });
       return;
     }
     const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
@@ -1045,19 +1070,44 @@ tablespaceRouter.post(
       res.status(404).json({ error: "Table not found." });
       return;
     }
-    const size = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+    // A client-named column never reaches the SQL: only a column the
+    // modeled table actually has can be sorted or filtered on. `label` is
+    // the FROM range-table name - compileFilterCondition qualifies as
+    // "label"."col", which binds to it whatever schema the FROM used.
+    const columnNames = new Set((node.data?.columns || []).map((c) => c.name));
+    const label = node.data.label;
+    const params = [];
+    const whereParts = [];
+    for (const f of filters) {
+      if (!f || typeof f.column !== "string" || !columnNames.has(f.column) || !PREVIEW_OPERATORS.has(f.operator)) {
+        res.status(400).json({ error: "Invalid filter." });
+        return;
+      }
+      whereParts.push(compileFilterCondition(label, f.column, f.operator, f.value, params));
+    }
+
+    let orderClause = "";
+    if (orderBy && typeof orderBy === "object" && typeof orderBy.column === "string" && orderBy.column) {
+      if (!columnNames.has(orderBy.column)) {
+        res.status(400).json({ error: `Can't sort by "${orderBy.column}" - it isn't a column of this table.` });
+        return;
+      }
+      orderClause = ` ORDER BY ${quoteIdent(orderBy.column)} ${orderBy.direction === "desc" ? "DESC" : "ASC"}`;
+    }
+
     try {
       // node.data.schema is authoritative; fall back to the source's pinned
       // connection_schema for a single-schema source whose nodes predate
       // schema tagging (a resync back-fills them - see reconcile.js).
-      const from = quoteTable(node.data.schema ?? secrets.schema ?? null, node.data.label);
-      const out = await runNativeQuery(secrets.connectionString, `SELECT * FROM ${from}`, [], {
-        offset: 0,
-        pageSize: size,
-      });
+      const from = quoteTable(node.data.schema ?? secrets.schema ?? null, label);
+      const inner = `SELECT * FROM ${from}${whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : ""}${orderClause}`;
+      const out = await runNativeQuery(secrets.connectionString, inner, params, { offset, pageSize });
+      const { rows, hasMore } = paginateRows(out.rows, pageSize);
       res.json({
         columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
-        rows: paginateRows(out.rows, size).rows,
+        rows,
+        hasMore,
       });
     } catch (err) {
       // eslint-disable-next-line no-console

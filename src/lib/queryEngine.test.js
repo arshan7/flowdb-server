@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compileQuery, resolveNativeVars, quoteTable } from "./queryEngine.js";
+import { compileQuery, resolveNativeVars, quoteTable, compileFilterCondition } from "./queryEngine.js";
 
 // Slice 1 (reporting parity) - date bucketing, sort, row limit, and the
 // distinct/median aggregations. compileQuery takes an already-resolved
@@ -179,6 +179,23 @@ test("join tableSchema - JOIN target is schema-qualified, ON columns are bare", 
     ],
   });
   assert.match(sql, /FROM "shop"\."orders" JOIN "shop"\."customers" ON "orders"\."customer_id" = "customers"\."id"/);
+});
+
+test("compileFilterCondition - isnull / notnull bind no parameter", () => {
+  const p1 = [];
+  assert.equal(compileFilterCondition("orders", "shipped_at", "isnull", undefined, p1), '"orders"."shipped_at" IS NULL');
+  assert.equal(p1.length, 0);
+
+  const p2 = [];
+  assert.equal(compileFilterCondition("orders", "shipped_at", "notnull", undefined, p2), '"orders"."shipped_at" IS NOT NULL');
+  assert.equal(p2.length, 0);
+});
+
+test("compileFilterCondition - value operators still bind $N in order", () => {
+  const params = [];
+  assert.equal(compileFilterCondition("orders", "status", "eq", "paid", params), '"orders"."status" = $1');
+  assert.equal(compileFilterCondition("orders", "name", "contains", "ann", params), '"orders"."name" ILIKE $2');
+  assert.deepEqual(params, ["paid", "%ann%"]);
 });
 
 test("bucket + sort + limit + distinct compose in one query", () => {

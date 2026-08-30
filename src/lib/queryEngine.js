@@ -103,12 +103,19 @@ export function dimExpr(dim) {
   return `DATE_TRUNC('${unit}', ${col})`;
 }
 
-// Shared by the main WHERE clause and a cross-table term's own subquery
-// WHERE clause - one place that decides how a filter condition becomes
-// SQL, so the two can't silently drift into different behavior for the
-// same operator.
+// Shared by the main WHERE clause, a cross-table term's own subquery
+// WHERE clause, and the Data-browse /preview route - one place that
+// decides how a filter condition becomes SQL, so they can't silently
+// drift into different behavior for the same operator.
+//
+// `isnull` / `notnull` take no value and bind no parameter (the /preview
+// "is empty" / "is not empty" operators). The semantic /query route's own
+// QUERY_OPERATORS set doesn't list them, so this branch is only ever
+// reached from preview - the shared helper just stays complete.
 export function compileFilterCondition(tableName, columnName, operator, value, params) {
   const colExpr = quoteQualified(tableName, columnName);
+  if (operator === "isnull") return `${colExpr} IS NULL`;
+  if (operator === "notnull") return `${colExpr} IS NOT NULL`;
   if (operator === "in") {
     params.push(value);
     return `${colExpr} = ANY($${params.length})`;
