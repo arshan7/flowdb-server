@@ -462,6 +462,11 @@ tablespaceRouter.post(
       // ([{id, column, bucket?}] / [{id, aggregation, column}]) and
       // `filters` reference `column` by name - no semantic model exists.
       modelId,
+      // Direct-on-table report: `tableId` + `direct: true` uses the SAME
+      // column-shaped dims/measures/filters as a model, but resolved
+      // against the table's own physical columns and compiled straight
+      // against it (single table, no joins - joins are a Model's job).
+      direct = false,
       dimensions: modelDimensions = [],
       measures: modelMeasures = [],
       joinTableIds = [],
@@ -608,6 +613,129 @@ tablespaceRouter.post(
     const node = nodesById.get(tableId);
     if (!node || node.type !== "tableNode") {
       res.status(404).json({ error: "Table not found." });
+      return;
+    }
+
+    // --- Direct-on-table report. Same column-shaped body as a model
+    // report, but every dimension/measure/filter names a PHYSICAL column,
+    // validated here against node.data.columns, then handed to the exact
+    // same compileQuery the semantic path uses. One table, no joins.
+    if (direct) {
+      const colsByName = new Map((node.data?.columns || []).map((c) => [c.name, c]));
+      const directSchema = node.data.schema ?? secrets.schema ?? null;
+
+      const rDims = [];
+      for (const d of modelDimensions) {
+        const col = d && typeof d.column === "string" ? colsByName.get(d.column) : null;
+        if (!col) {
+          res.status(400).json({ error: `Unknown column "${d?.column}".` });
+          return;
+        }
+        const rd = {
+          id: d.id || d.column,
+          label: d.label || col.name,
+          tableName: node.data.label,
+          columnName: col.name,
+          columnType: col.type,
+        };
+        if (d.bucket) {
+          if (!QUERY_BUCKETS.has(d.bucket)) {
+            res.status(400).json({ error: `Unsupported time grouping "${d.bucket}".` });
+            return;
+          }
+          if (col.type !== "date" && col.type !== "timestamp") {
+            res.status(400).json({ error: `"${col.name}" isn't a date column, so it can't be grouped by ${d.bucket}.` });
+            return;
+          }
+          rd.bucket = d.bucket;
+        }
+        rDims.push(rd);
+      }
+
+      const rMeasures = [];
+      for (const m of modelMeasures) {
+        if (!m || !QUERY_AGGREGATIONS.has(m.aggregation)) {
+          res.status(400).json({ error: `Invalid aggregation "${m?.aggregation}".` });
+          return;
+        }
+        if (m.aggregation === "count") {
+          rMeasures.push({ id: m.id, label: m.label || "Count", aggregation: "count", columnName: null });
+          continue;
+        }
+        const col = typeof m.column === "string" ? colsByName.get(m.column) : null;
+        if (!col) {
+          res.status(400).json({ error: `Unknown column "${m?.column}".` });
+          return;
+        }
+        rMeasures.push({ id: m.id, label: m.label || `${m.aggregation} of ${col.name}`, aggregation: m.aggregation, columnName: col.name });
+      }
+
+      if (rDims.length === 0 && rMeasures.length === 0) {
+        res.status(400).json({ error: "Pick at least one column to group by, or a measure." });
+        return;
+      }
+
+      const rFilters = [];
+      for (const f of filters) {
+        const col = f && typeof f.column === "string" ? colsByName.get(f.column) : null;
+        if (!col || !QUERY_OPERATORS.has(f.operator)) {
+          res.status(400).json({ error: "Invalid filter." });
+          return;
+        }
+        rFilters.push({ tableName: node.data.label, columnName: col.name, operator: f.operator, value: f.value });
+      }
+
+      let directOrderBy = null;
+      if (orderBy && orderBy.field) {
+        const ids = new Set([...rDims, ...rMeasures].map((c) => c.id));
+        if (!ids.has(orderBy.field)) {
+          res.status(400).json({ error: "Can't sort by a field that isn't in the report." });
+          return;
+        }
+        directOrderBy = { field: orderBy.field, direction: QUERY_SORT_DIRECTIONS.has(orderBy.direction) ? orderBy.direction : "asc" };
+      }
+
+      let directCompiled;
+      try {
+        directCompiled = compileQuery({
+          tableName: node.data.label,
+          tableSchema: directSchema,
+          measures: rMeasures,
+          dimensions: rDims,
+          filters: rFilters,
+          joins: [],
+          offset,
+          pageSize,
+          orderBy: directOrderBy,
+          rowLimit,
+        });
+      } catch (err) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+
+      try {
+        const key = cacheKey(req.params.sourceId, `direct:${tableId}:${directCompiled.sql}`, directCompiled.params);
+        let rawRows = getCachedQuery(key)?.rows;
+        const cached = !!rawRows;
+        if (!rawRows) {
+          rawRows = await runQuery(secrets.connectionString, directCompiled.sql, directCompiled.params);
+          setCachedQuery(key, rawRows);
+        }
+        const { rows, hasMore } = paginateRows(rawRows, directCompiled.windowSize);
+        res.json({
+          columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label })),
+          rows,
+          hasMore,
+          sql: directCompiled.sql,
+          params: directCompiled.params,
+          cached,
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[sources] direct query failed:", err.code || err.message);
+        res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+      }
       return;
     }
 
