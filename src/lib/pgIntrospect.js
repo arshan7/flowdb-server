@@ -136,12 +136,31 @@ const MIGRATION_TOOL_TABLES = [
   "migrations",
 ];
 
+// User schemas only - everything Postgres reserves under the pg_ prefix
+// (pg_catalog, pg_toast, every pg_temp_*/pg_toast_temp_*) plus
+// information_schema is machinery, not the user's data. `has_schema_privilege`
+// keeps a schema we can't actually read out of the list rather than letting
+// its first introspection query blow up the whole pass.
+const SCHEMAS_QUERY = `
+  SELECT nspname
+  FROM pg_namespace
+  WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+    AND nspname <> 'information_schema'
+    AND has_schema_privilege(nspname, 'USAGE')
+  ORDER BY nspname;
+`;
+
+// Every query below takes a text[] of schema names as $1 and filters with
+// `= ANY($1)` - a one-element array behaves exactly like the old `= $1`, so
+// single-schema and all-schemas introspection share one code path. Each row
+// carries its own schema so toTablespaceSchema can key tables by schema+name
+// (two schemas are allowed to hold a table of the same name).
 const TABLES_QUERY = `
-  SELECT table_name
+  SELECT table_schema, table_name
   FROM information_schema.tables
-  WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+  WHERE table_schema = ANY($1) AND table_type = 'BASE TABLE'
     AND table_name NOT IN (${MIGRATION_TOOL_TABLES.map((_, i) => `$${i + 2}`).join(", ")})
-  ORDER BY table_name;
+  ORDER BY table_schema, table_name;
 `;
 
 // pg_catalog rather than information_schema for columns/PK/FK/unique/check -
@@ -162,6 +181,7 @@ const TABLES_QUERY = `
 // sidesteps that class of bug entirely, not just the slowness.
 const COLUMNS_QUERY = `
   SELECT
+    n.nspname AS table_schema,
     c.relname AS table_name,
     a.attname AS column_name,
     t.typname AS data_type,
@@ -177,28 +197,33 @@ const COLUMNS_QUERY = `
   JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_type t ON t.oid = a.atttypid
   LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-  WHERE n.nspname = $1 AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
-  ORDER BY c.relname, a.attnum;
+  WHERE n.nspname = ANY($1) AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
+  ORDER BY n.nspname, c.relname, a.attnum;
 `;
 
 const PRIMARY_KEYS_QUERY = `
-  SELECT tc.relname AS table_name, col.attname AS column_name
+  SELECT n.nspname AS table_schema, tc.relname AS table_name, col.attname AS column_name
   FROM pg_constraint con
   JOIN pg_class tc ON tc.oid = con.conrelid
   JOIN pg_namespace n ON n.oid = con.connamespace
   CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
   JOIN pg_attribute col ON col.attrelid = tc.oid AND col.attnum = k.attnum
-  WHERE con.contype = 'p' AND n.nspname = $1
-  ORDER BY tc.relname, k.ord;
+  WHERE con.contype = 'p' AND n.nspname = ANY($1)
+  ORDER BY n.nspname, tc.relname, k.ord;
 `;
 
 // unnest(conkey, confkey) zips the two arrays together column-by-column, so
 // this - unlike the information_schema equivalent it replaced - is also
-// correct for composite (multi-column) foreign keys.
+// correct for composite (multi-column) foreign keys. from_schema is the
+// constraint's own namespace (== the child table's); to_schema comes off
+// the referenced table separately so a cross-schema FK resolves on both
+// ends when both schemas are in the introspection set.
 const FOREIGN_KEYS_QUERY = `
   SELECT
     con.conname AS constraint_name,
+    n.nspname AS from_schema,
     tc.relname AS from_table,
+    fn.nspname AS to_schema,
     fc.relname AS to_table,
     fromcol.attname AS from_column,
     tocol.attname AS to_column
@@ -206,21 +231,22 @@ const FOREIGN_KEYS_QUERY = `
   JOIN pg_class tc ON tc.oid = con.conrelid
   JOIN pg_class fc ON fc.oid = con.confrelid
   JOIN pg_namespace n ON n.oid = con.connamespace
+  JOIN pg_namespace fn ON fn.oid = fc.relnamespace
   CROSS JOIN LATERAL unnest(con.conkey, con.confkey) AS cols(from_attnum, to_attnum)
   JOIN pg_attribute fromcol ON fromcol.attrelid = tc.oid AND fromcol.attnum = cols.from_attnum
   JOIN pg_attribute tocol ON tocol.attrelid = fc.oid AND tocol.attnum = cols.to_attnum
-  WHERE con.contype = 'f' AND n.nspname = $1;
+  WHERE con.contype = 'f' AND n.nspname = ANY($1);
 `;
 
 const UNIQUE_CONSTRAINTS_QUERY = `
-  SELECT tc.relname AS table_name, con.conname AS constraint_name, col.attname AS column_name
+  SELECT n.nspname AS table_schema, tc.relname AS table_name, con.conname AS constraint_name, col.attname AS column_name
   FROM pg_constraint con
   JOIN pg_class tc ON tc.oid = con.conrelid
   JOIN pg_namespace n ON n.oid = con.connamespace
   CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
   JOIN pg_attribute col ON col.attrelid = tc.oid AND col.attnum = k.attnum
-  WHERE con.contype = 'u' AND n.nspname = $1
-  ORDER BY tc.relname, con.conname, k.ord;
+  WHERE con.contype = 'u' AND n.nspname = ANY($1)
+  ORDER BY n.nspname, tc.relname, con.conname, k.ord;
 `;
 
 // pg_get_constraintdef always returns "CHECK " followed by the expression
@@ -232,13 +258,14 @@ const UNIQUE_CONSTRAINTS_QUERY = `
 // view.
 const CHECK_CONSTRAINTS_QUERY = `
   SELECT
+    n.nspname AS table_schema,
     tc.relname AS table_name,
     con.conname AS constraint_name,
     regexp_replace(pg_get_constraintdef(con.oid), '^CHECK\\s+', '') AS check_clause
   FROM pg_constraint con
   JOIN pg_class tc ON tc.oid = con.conrelid
   JOIN pg_namespace n ON n.oid = con.connamespace
-  WHERE con.contype = 'c' AND n.nspname = $1 AND con.conname NOT LIKE '%_not_null';
+  WHERE con.contype = 'c' AND n.nspname = ANY($1) AND con.conname NOT LIKE '%_not_null';
 `;
 
 // pg_catalog rather than information_schema for indexes - information_schema
@@ -247,6 +274,7 @@ const CHECK_CONSTRAINTS_QUERY = `
 // constraints.primaryKey) - those aren't a separate user-defined index.
 const INDEXES_QUERY = `
   SELECT
+    n.nspname AS table_schema,
     t.relname AS table_name,
     i.relname AS index_name,
     ix.indisunique AS is_unique,
@@ -256,25 +284,52 @@ const INDEXES_QUERY = `
   JOIN pg_class t ON t.oid = ix.indrelid
   JOIN pg_namespace n ON n.oid = t.relnamespace
   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
-  WHERE n.nspname = $1 AND t.relkind = 'r' AND NOT ix.indisprimary
-  GROUP BY t.relname, i.relname, ix.indisunique
-  ORDER BY t.relname, i.relname;
+  WHERE n.nspname = ANY($1) AND t.relkind = 'r' AND NOT ix.indisprimary
+  GROUP BY n.nspname, t.relname, i.relname, ix.indisunique
+  ORDER BY n.nspname, t.relname, i.relname;
 `;
 
+// Enum identity stays name-only downstream (toTablespaceSchema), so an enum
+// of the same name in two schemas collapses to the first seen - a rare
+// edge, kept simple on purpose. enum_schema is selected for completeness.
 const ENUMS_QUERY = `
-  SELECT t.typname AS enum_name, e.enumlabel AS value
+  SELECT n.nspname AS enum_schema, t.typname AS enum_name, e.enumlabel AS value
   FROM pg_type t
   JOIN pg_enum e ON t.oid = e.enumtypid
   JOIN pg_namespace n ON n.oid = t.typnamespace
-  WHERE n.nspname = $1
+  WHERE n.nspname = ANY($1)
   ORDER BY t.typname, e.enumsortorder;
 `;
 
 // Runs every introspection query against one connection and hands back the
 // raw rows - shaping this into the app's {nodes, edges, enums} schema is a
 // separate concern, see toTablespaceSchema.js.
-export async function introspectPostgres(connectionString, schema = "public") {
+//
+// `schema` null/empty means "every user schema in this database" - the
+// Metabase-style multi-schema source. A named schema keeps the old
+// single-schema behavior. Internally both become a text[] bound as $1, so
+// there's one query path either way.
+export async function introspectPostgres(connectionString, schema = null) {
   return withClient(connectionString, async (client) => {
+    const named = typeof schema === "string" && schema.trim();
+    const schemas = named
+      ? [schema.trim()]
+      : (await client.query(SCHEMAS_QUERY)).rows.map((r) => r.nspname);
+
+    if (schemas.length === 0) {
+      return {
+        schemas: [],
+        tables: [],
+        columns: [],
+        primaryKeys: [],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+        enums: [],
+      };
+    }
+
     // pg_catalog is world-readable on a stock Postgres, but some hardened
     // shared/public instances (e.g. EBI's RNAcentral) revoke SELECT on
     // pg_enum from unprivileged roles. Enums are the most skippable part of
@@ -282,23 +337,24 @@ export async function introspectPostgres(connectionString, schema = "public") {
     // the whole introspection - treat it as "no enums" and carry on. Only
     // 42501 (insufficient_privilege); anything else still means the
     // connection is compromised and must propagate.
-    const enums = client.query(ENUMS_QUERY, [schema]).catch((err) => {
+    const enums = client.query(ENUMS_QUERY, [schemas]).catch((err) => {
       if (err.code === "42501") return { rows: [] };
       throw err;
     });
     const [tables, columns, primaryKeys, foreignKeys, uniqueConstraints, checkConstraints, indexes, enumsResult] =
       await Promise.all([
-        client.query(TABLES_QUERY, [schema, ...MIGRATION_TOOL_TABLES]),
-        client.query(COLUMNS_QUERY, [schema]),
-        client.query(PRIMARY_KEYS_QUERY, [schema]),
-        client.query(FOREIGN_KEYS_QUERY, [schema]),
-        client.query(UNIQUE_CONSTRAINTS_QUERY, [schema]),
-        client.query(CHECK_CONSTRAINTS_QUERY, [schema]),
-        client.query(INDEXES_QUERY, [schema]),
+        client.query(TABLES_QUERY, [schemas, ...MIGRATION_TOOL_TABLES]),
+        client.query(COLUMNS_QUERY, [schemas]),
+        client.query(PRIMARY_KEYS_QUERY, [schemas]),
+        client.query(FOREIGN_KEYS_QUERY, [schemas]),
+        client.query(UNIQUE_CONSTRAINTS_QUERY, [schemas]),
+        client.query(CHECK_CONSTRAINTS_QUERY, [schemas]),
+        client.query(INDEXES_QUERY, [schemas]),
         enums,
       ]);
 
     return {
+      schemas,
       tables: tables.rows,
       columns: columns.rows,
       primaryKeys: primaryKeys.rows,

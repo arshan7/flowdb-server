@@ -93,6 +93,7 @@ const SOURCE_LIST_QUERY = `
   SELECT
     s.id, s.project_id AS "projectId", s.name, s.type,
     s.is_connected AS "isConnected", s.last_synced_at AS "lastSyncedAt",
+    s.connection_schema AS "connectionSchema",
     b.name AS "mainBranchName",
     COALESCE(jsonb_array_length(b.nodes), 0) AS "tableCount",
     s.created_at AS "createdAt", s.updated_at AS "updatedAt"
@@ -104,6 +105,7 @@ const SOURCE_LIST_QUERY = `
 const SOURCE_COLUMNS = `
   id, project_id AS "projectId", name, type,
   is_connected AS "isConnected", last_synced_at AS "lastSyncedAt",
+  connection_schema AS "connectionSchema",
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
@@ -171,12 +173,16 @@ export async function deleteSource(sourceId) {
 // actual sync has run, so "Connected, never synced" stays a real,
 // visible state rather than looking identical to "just synced."
 export async function setSourceConnection(sourceId, { connectionString, schema }) {
+  // A blank schema is stored as NULL and means "every schema in this
+  // database" (Metabase-style multi-schema source) - it is NOT coerced to
+  // "public" any more. A named schema keeps the old single-schema import.
+  const normalizedSchema = typeof schema === "string" && schema.trim() ? schema.trim() : null;
   const { rows } = await query(
     `UPDATE tablespace_sources
      SET is_connected = true, connection_string_encrypted = $2, connection_schema = $3, updated_at = now()
      WHERE id = $1
      RETURNING ${SOURCE_COLUMNS}`,
-    [sourceId, encrypt(connectionString), schema || "public"],
+    [sourceId, encrypt(connectionString), normalizedSchema],
   );
   return rows[0] || null;
 }
@@ -207,7 +213,8 @@ export async function getSourceConnectionSecrets(sourceId) {
   );
   const row = rows[0];
   if (!row || !row.encrypted) return null;
-  return { connectionString: decrypt(row.encrypted), schema: row.schema || "public" };
+  // schema null => introspect every schema (see pgIntrospect.introspectPostgres).
+  return { connectionString: decrypt(row.encrypted), schema: row.schema || null };
 }
 
 // { tables: [...names], edges: [...signatures] } - every table/relationship

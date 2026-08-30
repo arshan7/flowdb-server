@@ -21,21 +21,35 @@ function emptyConstraints() {
   return { primaryKey: [], uniqueConstraints: [], checkConstraints: [], indexes: [] };
 }
 
+// Two schemas in one database may each hold a table (or column) of the same
+// name, so every internal lookup below is keyed by schema + name, not name
+// alone. The NUL separator can't collide with any real identifier. A
+// missing schema (older single-schema introspection, hand-drawn nodes)
+// folds to "public" so those keep resolving unchanged.
+const SEP = "\u0000";
+const nodeKey = (schema, table) => `${schema || "public"}${SEP}${table}`;
+const colKey = (schema, table, column) => `${schema || "public"}${SEP}${table}${SEP}${column}`;
+
 // Mirrors astToSchema.js's output shape exactly (id/type/position/data with
 // columns+constraints, edges with source/target/handles/data, enums with
 // id/name/values) so the frontend's existing import handling - and every
 // exporter downstream of it - can consume a live-DB introspection with zero
 // special-casing versus a pasted-SQL one.
+//
+// Every table node carries data.schema (the Postgres schema it came from);
+// the canvas shows one schema at a time and the reporting data pickers
+// group by it. data.label stays the bare table name.
 export function toTablespaceSchema(raw) {
-  const nodesByTable = new Map();
+  const nodesByKey = new Map();
 
   raw.tables.forEach((t) => {
-    nodesByTable.set(t.table_name, {
+    nodesByKey.set(nodeKey(t.table_schema, t.table_name), {
       id: nanoid(),
       type: "tableNode",
       position: { x: 0, y: 0 },
       data: {
         label: t.table_name,
+        schema: t.table_schema ?? null,
         description: "",
         color: null,
         isExpanded: true,
@@ -45,13 +59,13 @@ export function toTablespaceSchema(raw) {
     });
   });
 
-  // Column id lookup keyed by "table.column" - needed repeatedly below to
-  // resolve PK/FK/unique/index rows (which only carry names) back to the
+  // Column id lookup keyed by schema+table+column - needed repeatedly below
+  // to resolve PK/FK/unique/index rows (which only carry names) back to the
   // actual column objects.
   const columnsByKey = new Map();
 
   raw.columns.forEach((c) => {
-    const node = nodesByTable.get(c.table_name);
+    const node = nodesByKey.get(nodeKey(c.table_schema, c.table_name));
     if (!node) return;
 
     const type = mapPostgresType(c.data_type);
@@ -77,11 +91,11 @@ export function toTablespaceSchema(raw) {
       isIndex: false,
     };
     node.data.columns.push(column);
-    columnsByKey.set(`${c.table_name}.${c.column_name}`, { node, column });
+    columnsByKey.set(colKey(c.table_schema, c.table_name, c.column_name), { node, column });
   });
 
   raw.primaryKeys.forEach((pk) => {
-    const entry = columnsByKey.get(`${pk.table_name}.${pk.column_name}`);
+    const entry = columnsByKey.get(colKey(pk.table_schema, pk.table_name, pk.column_name));
     if (!entry) return;
     entry.column.isPrimaryKey = true;
     entry.node.data.constraints.primaryKey.push(entry.column.id);
@@ -93,22 +107,27 @@ export function toTablespaceSchema(raw) {
   // same split the frontend already makes.
   const uniqueByConstraint = new Map();
   raw.uniqueConstraints.forEach((row) => {
-    const key = `${row.table_name}.${row.constraint_name}`;
+    const key = colKey(row.table_schema, row.table_name, row.constraint_name);
     if (!uniqueByConstraint.has(key)) {
-      uniqueByConstraint.set(key, { tableName: row.table_name, name: row.constraint_name, columnNames: [] });
+      uniqueByConstraint.set(key, {
+        schema: row.table_schema,
+        tableName: row.table_name,
+        name: row.constraint_name,
+        columnNames: [],
+      });
     }
     uniqueByConstraint.get(key).columnNames.push(row.column_name);
   });
-  uniqueByConstraint.forEach(({ tableName, name, columnNames }) => {
-    const node = nodesByTable.get(tableName);
+  uniqueByConstraint.forEach(({ schema, tableName, name, columnNames }) => {
+    const node = nodesByKey.get(nodeKey(schema, tableName));
     if (!node) return;
     if (columnNames.length === 1) {
-      const entry = columnsByKey.get(`${tableName}.${columnNames[0]}`);
+      const entry = columnsByKey.get(colKey(schema, tableName, columnNames[0]));
       if (entry) entry.column.isUnique = true;
       return;
     }
     const columnIds = columnNames
-      .map((n) => columnsByKey.get(`${tableName}.${n}`)?.column.id)
+      .map((n) => columnsByKey.get(colKey(schema, tableName, n))?.column.id)
       .filter(Boolean);
     if (columnIds.length) {
       node.data.constraints.uniqueConstraints.push({ id: nanoid(), name, columnIds });
@@ -116,7 +135,7 @@ export function toTablespaceSchema(raw) {
   });
 
   raw.checkConstraints.forEach((row) => {
-    const node = nodesByTable.get(row.table_name);
+    const node = nodesByKey.get(nodeKey(row.table_schema, row.table_name));
     if (!node) return;
     node.data.constraints.checkConstraints.push({
       id: nanoid(),
@@ -132,7 +151,7 @@ export function toTablespaceSchema(raw) {
   const uniqueConstraintNames = new Set([...uniqueByConstraint.values()].map((u) => u.name));
   raw.indexes.forEach((row) => {
     if (uniqueConstraintNames.has(row.index_name)) return;
-    const node = nodesByTable.get(row.table_name);
+    const node = nodesByKey.get(nodeKey(row.table_schema, row.table_name));
     if (!node) return;
     node.data.constraints.indexes.push({
       id: nanoid(),
@@ -157,10 +176,12 @@ export function toTablespaceSchema(raw) {
   // same two-pass reasoning astToSchema.js uses, just never needing a
   // "pending, not yet resolvable" list since introspection (unlike parsing
   // hand-written SQL) can't reference a table that turns out not to exist.
+  // A cross-schema FK resolves here whenever both schemas were part of the
+  // introspection set (always true for an all-schemas source).
   const edges = [];
   raw.foreignKeys.forEach((fk) => {
-    const child = columnsByKey.get(`${fk.from_table}.${fk.from_column}`);
-    const parent = columnsByKey.get(`${fk.to_table}.${fk.to_column}`);
+    const child = columnsByKey.get(colKey(fk.from_schema, fk.from_table, fk.from_column));
+    const parent = columnsByKey.get(colKey(fk.to_schema, fk.to_table, fk.to_column));
     if (!child || !parent) return;
 
     child.column.isForeignKey = true;
@@ -190,5 +211,5 @@ export function toTablespaceSchema(raw) {
     });
   });
 
-  return { nodes: Array.from(nodesByTable.values()), edges, enums };
+  return { nodes: Array.from(nodesByKey.values()), edges, enums };
 }
