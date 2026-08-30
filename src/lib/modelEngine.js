@@ -16,6 +16,37 @@ import {
 
 const MODEL_ALIAS = "_tsm";
 
+// Custom column arithmetic - only these four symbols ever reach the SQL
+// string, and only by exact map lookup (same discipline queryEngine.js's
+// CALC_OPERATORS uses for calculated measures).
+const SCALAR_OPERATORS = { "+": "+", "-": "-", "*": "*", "/": "/" };
+
+// Compile a model's custom column - a row-level arithmetic expression over
+// its other columns. Walks the same `{ kind:"calculated", operator, termA,
+// termB }` tree formulaExpr.parseFormula produces for calculated measures,
+// but the leaves here are plain scalars: a qualified column or a bound
+// constant, never an aggregate. The route (resolveModelSql) resolves the
+// client's token stream into this tree and validates every column ref
+// first - nothing here comes from a raw client string. `/` is guarded
+// with NULLIF so a zero divisor yields NULL, not a query error.
+function compileScalarExpr(node, params) {
+  if (!node || typeof node !== "object") throw new Error("This model has an invalid custom column.");
+  if (node.kind === "calculated") {
+    const a = compileScalarExpr(node.termA, params);
+    const b = compileScalarExpr(node.termB, params);
+    const op = SCALAR_OPERATORS[node.operator];
+    if (!op) throw new Error("This model has an invalid custom column.");
+    return op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
+  }
+  if (node.column) return quoteQualified(node.column.tableName, node.column.columnName);
+  if (node.constant !== undefined) {
+    if (!Number.isFinite(node.constant)) throw new Error("This model has an invalid custom column.");
+    params.push(node.constant);
+    return `$${params.length}`;
+  }
+  throw new Error("This model has an invalid custom column.");
+}
+
 // Compile a model to its own SELECT.
 //
 // kind "sql": `spec.sql` is raw user SELECT text with its `{{vars}}`
@@ -41,8 +72,14 @@ export function compileModel(spec) {
   }
 
   const params = [];
-  const selectParts = spec.columns.map(
-    (c) => `${quoteQualified(c.tableName, c.columnName)} AS ${quoteIdent(c.alias)}`,
+  // A column is either a direct reference { tableName, columnName } or a
+  // custom expression { kind:"exprTree", tree } - the route resolves both
+  // shapes before they reach here. Expression constants push onto `params`
+  // in column order, ahead of the WHERE clause's own params.
+  const selectParts = spec.columns.map((c) =>
+    c.kind === "exprTree"
+      ? `${compileScalarExpr(c.tree, params)} AS ${quoteIdent(c.alias)}`
+      : `${quoteQualified(c.tableName, c.columnName)} AS ${quoteIdent(c.alias)}`,
   );
   const joinParts = (spec.joinClauses || []).map(
     (j) =>

@@ -36,6 +36,50 @@ test("compileModel builder - no columns throws", () => {
   assert.throws(() => compileModel({ kind: "builder", baseTableName: "orders", columns: [] }), /at least one column/);
 });
 
+test("compileModel builder - custom column expression, constants parameterised in column order", () => {
+  // (revenue - cost) * 1.08, left-associative like the composer reads it.
+  const tree = {
+    kind: "calculated",
+    operator: "*",
+    termA: {
+      kind: "calculated",
+      operator: "-",
+      termA: { column: { tableName: "orders", columnName: "revenue" } },
+      termB: { column: { tableName: "orders", columnName: "cost" } },
+    },
+    termB: { constant: 1.08 },
+  };
+  const { sql, params, columns } = compileModel({
+    kind: "builder",
+    baseTableName: "orders",
+    columns: [
+      { tableName: "orders", columnName: "id", alias: "id" },
+      { kind: "exprTree", tree, alias: "margin" },
+    ],
+    filters: [{ tableName: "orders", columnName: "status", operator: "eq", value: "paid" }],
+  });
+  assert.match(sql, /\(\("orders"\."revenue" - "orders"\."cost"\) \* \$1\) AS "margin"/);
+  // expr constant occupies $1 (SELECT order), the filter value $2 (WHERE after).
+  assert.match(sql, /WHERE "orders"\."status" = \$2$/);
+  assert.deepEqual(params, [1.08, "paid"]);
+  assert.deepEqual(columns, ["id", "margin"]);
+});
+
+test("compileModel builder - custom column division guards with NULLIF", () => {
+  const tree = {
+    kind: "calculated",
+    operator: "/",
+    termA: { column: { tableName: "orders", columnName: "total" } },
+    termB: { column: { tableName: "orders", columnName: "qty" } },
+  };
+  const { sql } = compileModel({
+    kind: "builder",
+    baseTableName: "orders",
+    columns: [{ kind: "exprTree", tree, alias: "unit_price" }],
+  });
+  assert.match(sql, /\("orders"\."total" \/ NULLIF\("orders"\."qty", 0\)\) AS "unit_price"/);
+});
+
 test("compileModelReport - subquery FROM, _tsm refs, modelParams ordered first", () => {
   const { sql, params } = compileModelReport({
     modelSql: 'SELECT status, total FROM "orders" WHERE status <> $1',

@@ -86,6 +86,19 @@ function resolveModelSql(model, branch) {
 
   const columns = [];
   for (const c of model.columns || []) {
+    // A custom column - a row-level arithmetic formula over the model's
+    // other columns. Its token stream is resolved + parsed here (every
+    // column ref validated against a real node/column) into the tree
+    // modelEngine.compileScalarExpr walks; a raw client string never
+    // reaches the SQL.
+    if (c && c.kind === "expr") {
+      const alias = (c.alias || "").trim();
+      if (!alias) return { error: "A custom column needs a name." };
+      const tree = resolveColumnFormula(c.tokens, nodeFor);
+      if (!tree) return { error: `The custom column "${alias}" has an incomplete or invalid formula.` };
+      columns.push({ kind: "exprTree", tree, alias });
+      continue;
+    }
     const n = nodeFor(c.tableId);
     const col = (n?.data?.columns || []).find((x) => x.id === c.columnId);
     if (!n || !col) return { error: "This model references a column that no longer exists." };
@@ -106,6 +119,43 @@ function resolveModelSql(model, branch) {
   } catch (err) {
     return { error: err.message };
   }
+}
+
+// Resolve a model custom column's flat token stream (value / op / paren,
+// the same shape a calculated measure's formula uses) into the nested tree
+// formulaExpr.parseFormula returns. Row-level: a "value" token is either a
+// constant number or a plain column reference - no aggregation. Every
+// column ref is checked against a real node/column via `nodeFor`; returns
+// null on any dangling ref, unknown operator, or grammar violation, so the
+// caller can reject the model rather than emit half a formula.
+function resolveColumnFormula(tokens, nodeFor) {
+  if (!Array.isArray(tokens) || tokens.length === 0 || tokens.length > MAX_FORMULA_TOKENS) return null;
+  const resolved = [];
+  for (const t of tokens) {
+    if (!t || typeof t !== "object") return null;
+    if (t.kind === "op") {
+      if (!QUERY_CALC_OPERATORS.has(t.value)) return null;
+      resolved.push(t);
+    } else if (t.kind === "paren") {
+      if (t.value !== "(" && t.value !== ")") return null;
+      resolved.push(t);
+    } else if (t.kind === "value") {
+      const term = t.term || {};
+      if (term.type === "constant") {
+        const n = Number(term.value);
+        if (!Number.isFinite(n)) return null;
+        resolved.push({ kind: "value", node: { constant: n } });
+      } else {
+        const node = nodeFor(term.tableId);
+        const col = (node?.data?.columns || []).find((x) => x.id === term.columnId);
+        if (!node || !col) return null;
+        resolved.push({ kind: "value", node: { column: { tableName: node.data.label, columnName: col.name } } });
+      }
+    } else {
+      return null;
+    }
+  }
+  return parseFormula(resolved);
 }
 // Phase 4.4b - calculated measures' arithmetic operator.
 const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
@@ -143,13 +193,13 @@ tablespaceRouter.get(
 tablespaceRouter.post(
   "/projects",
   wrap(async (req, res) => {
-    const { name, template, createdAt } = req.body || {};
+    const { name, createdAt } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       res.status(400).json({ error: "name is required." });
       return;
     }
     try {
-      const project = await store.createProject({ name: name.trim(), template, createdAt });
+      const project = await store.createProject({ name: name.trim(), createdAt });
       res.status(201).json(project);
     } catch (err) {
       if (err.code === "23505") {
@@ -214,13 +264,19 @@ tablespaceRouter.get(
 tablespaceRouter.post(
   "/projects/:id/sources",
   wrap(async (req, res) => {
-    const { name, type } = req.body || {};
+    const { name, type, template } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       res.status(400).json({ error: "name is required." });
       return;
     }
     try {
-      const source = await store.createSource(req.params.id, { name: name.trim(), type });
+      const source = await store.createSource(req.params.id, {
+        name: name.trim(),
+        type,
+        // Optional starter-schema seed (validated client-side, same as it
+        // was for project creation before templates moved here).
+        template: template && typeof template === "object" ? template : undefined,
+      });
       res.status(201).json(source);
     } catch (err) {
       if (err.code === "23505") {

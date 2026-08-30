@@ -30,40 +30,18 @@ export async function getProject(id) {
   return rows[0] || null;
 }
 
-// Wrapped in a real transaction (not independent pool.query() calls) - a
-// failed source/branch insert must never leave an orphaned project row.
-// Every project gets exactly one source ("Main", type 'postgres') with
-// exactly one main branch (ROADMAP.md Phase 3 - a project can hold
-// multiple sources, but it always starts with one, matching how every
-// project has always behaved up to this point).
-export async function createProject({ name, template, createdAt }) {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const { rows: projectRows } = await client.query(
-      `INSERT INTO tablespace_projects (name, created_at, updated_at)
-       VALUES ($1, COALESCE($2, now()), COALESCE($2, now()))
-       RETURNING id, name, status, is_favorite AS "isFavorite", created_at AS "createdAt", updated_at AS "modifiedAt"`,
-      [name, createdAt || null],
-    );
-    const project = projectRows[0];
-    const { rows: sourceRows } = await client.query(
-      `INSERT INTO tablespace_sources (project_id, name, type) VALUES ($1, 'Main', 'postgres') RETURNING id`,
-      [project.id],
-    );
-    await client.query(
-      `INSERT INTO tablespace_branches (source_id, name, is_main, nodes, edges, enums, pages)
-       VALUES ($1, 'main', true, $2, $3, $4, $5)`,
-      [sourceRows[0].id, toJson(template?.nodes), toJson(template?.edges), toJson(template?.enums), toJson(template?.pages)],
-    );
-    await client.query("COMMIT");
-    return project;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+// A new project is an empty shell - no sources. The user adds one or more
+// explicitly from the Sources screen (each connects a real database or
+// starts from a template/blank canvas). A project with zero sources is a
+// designed-for state, not an invalid one (see deleteSource's own note).
+export async function createProject({ name, createdAt }) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_projects (name, created_at, updated_at)
+     VALUES ($1, COALESCE($2, now()), COALESCE($2, now()))
+     RETURNING id, name, status, is_favorite AS "isFavorite", created_at AS "createdAt", updated_at AS "modifiedAt"`,
+    [name, createdAt || null],
+  );
+  return rows[0];
 }
 
 export async function updateProject(id, changes) {
@@ -143,7 +121,7 @@ export async function getSource(sourceId) {
 // invariant every project's own creation already guarantees) - created in
 // the same transaction, not a separate follow-up call a failure could
 // leave half-done.
-export async function createSource(projectId, { name, type }) {
+export async function createSource(projectId, { name, type, template }) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -152,9 +130,13 @@ export async function createSource(projectId, { name, type }) {
       [projectId, name, type || "custom"],
     );
     const source = sourceRows[0];
+    // The main branch starts empty, or seeded from a starter template
+    // (the "From a template" option in the Add Source dialog - templates
+    // moved here from project creation).
     await client.query(
-      `INSERT INTO tablespace_branches (source_id, name, is_main, nodes, edges, enums, pages) VALUES ($1, 'main', true, '[]', '[]', '[]', '[]')`,
-      [source.id],
+      `INSERT INTO tablespace_branches (source_id, name, is_main, nodes, edges, enums, pages)
+       VALUES ($1, 'main', true, $2, $3, $4, $5)`,
+      [source.id, toJson(template?.nodes), toJson(template?.edges), toJson(template?.enums), toJson(template?.pages)],
     );
     await client.query("COMMIT");
     return source;
