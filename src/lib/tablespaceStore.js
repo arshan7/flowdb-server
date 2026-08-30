@@ -385,6 +385,17 @@ export async function updateReportMeta(sourceId, reportId, { name, collectionId,
   return rows[0] || null;
 }
 
+// Point a report at its owned dataset model (or null). Also clears
+// table_id - a model-sourced report never has one.
+export async function setReportModelId(sourceId, reportId, modelId) {
+  const { rows } = await query(
+    `UPDATE tablespace_reports SET model_id = $3, table_id = NULL, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
+    [reportId, sourceId, modelId ?? null],
+  );
+  return rows[0] || null;
+}
+
 export async function deleteReport(sourceId, reportId) {
   const { rowCount } = await query(
     `DELETE FROM tablespace_reports WHERE id = $1 AND source_id = $2`,
@@ -555,15 +566,63 @@ const MODEL_COLUMNS = `
   base_table_id AS "baseTableId", joins, columns, filters,
   sql, sql_vars AS "sqlVars",
   collection_id AS "collectionId", is_favorite AS "isFavorite",
+  owner_report_id AS "ownerReportId",
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
 export async function listModels(sourceId) {
+  // Report-owned datasets (owner_report_id set) are an implementation
+  // detail of one report - never listed in the Models gallery.
   const { rows } = await query(
-    `SELECT ${MODEL_COLUMNS} FROM tablespace_models WHERE source_id = $1 ORDER BY created_at ASC`,
+    `SELECT ${MODEL_COLUMNS} FROM tablespace_models
+     WHERE source_id = $1 AND owner_report_id IS NULL
+     ORDER BY created_at ASC`,
     [sourceId],
   );
   return rows;
+}
+
+// The builder model a report owns (inline joins / calculated columns /
+// dataset filters shaped right in the report builder). Null if the report
+// has no inline dataset.
+export async function getOwnedModel(sourceId, reportId) {
+  const { rows } = await query(
+    `SELECT ${MODEL_COLUMNS} FROM tablespace_models WHERE source_id = $1 AND owner_report_id = $2`,
+    [sourceId, reportId],
+  );
+  return rows[0] || null;
+}
+
+// Create-or-replace a report's owned builder model. `spec` is
+// { baseTableId, joins, columns, filters }. Returns the model id.
+export async function upsertOwnedModel(sourceId, reportId, spec) {
+  const existing = await getOwnedModel(sourceId, reportId);
+  const baseTableId = spec.baseTableId ?? null;
+  const joins = toJson(spec.joins || []);
+  const columns = toJson(spec.columns || []);
+  const filters = toJson(spec.filters || []);
+  if (existing) {
+    await query(
+      `UPDATE tablespace_models
+       SET kind = 'builder', base_table_id = $3, joins = $4, columns = $5, filters = $6,
+           sql = NULL, sql_vars = '[]', updated_at = now()
+       WHERE id = $1 AND source_id = $2`,
+      [existing.id, sourceId, baseTableId, joins, columns, filters],
+    );
+    return existing.id;
+  }
+  const { rows } = await query(
+    `INSERT INTO tablespace_models
+       (source_id, name, kind, base_table_id, joins, columns, filters, sql, sql_vars, owner_report_id)
+     VALUES ($1, $2, 'builder', $3, $4, $5, $6, NULL, '[]', $7)
+     RETURNING id`,
+    [sourceId, `__report_dataset_${reportId}`, baseTableId, joins, columns, filters, reportId],
+  );
+  return rows[0].id;
+}
+
+export async function deleteOwnedModel(sourceId, reportId) {
+  await query(`DELETE FROM tablespace_models WHERE source_id = $1 AND owner_report_id = $2`, [sourceId, reportId]);
 }
 
 export async function getModel(sourceId, modelId) {

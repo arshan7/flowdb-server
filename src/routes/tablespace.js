@@ -197,6 +197,28 @@ const MAX_FORMULA_TOKENS = 61;
 // doesn't stop a very long non-cyclic chain from recursing deep).
 const MAX_EXPR_DEPTH = 6;
 
+// A report can carry a `dataset` = { baseTableId, joins, columns, filters }
+// - joins / calculated columns / cross-table filters shaped inline in the
+// report builder rather than in a separate Model. It's persisted as a
+// builder model the report OWNS: never listed in the Models gallery,
+// deleted with the report. Its columns/joins are soft references
+// validated at query time by resolveModelSql, same as a real Model's.
+function isDatasetSpec(d) {
+  return !!d && typeof d === "object" && !!d.baseTableId && Array.isArray(d.columns) && d.columns.length > 0;
+}
+async function syncOwnedDataset(sourceId, reportId, dataset) {
+  if (isDatasetSpec(dataset)) {
+    return store.upsertOwnedModel(sourceId, reportId, {
+      baseTableId: dataset.baseTableId,
+      joins: Array.isArray(dataset.joins) ? dataset.joins : [],
+      columns: dataset.columns,
+      filters: Array.isArray(dataset.filters) ? dataset.filters : [],
+    });
+  }
+  await store.deleteOwnedModel(sourceId, reportId);
+  return null;
+}
+
 export const tablespaceRouter = Router();
 
 // Wraps an async route handler so a rejected promise reaches Express's
@@ -1466,10 +1488,11 @@ tablespaceRouter.post(
       return;
     }
     const isSql = b.kind === "sql";
-    // Slice 4/5 - a semantic report needs a base table OR a model; a SQL
-    // report needs its SQL text instead.
-    if (!isSql && !b.tableId && !b.modelId) {
-      res.status(400).json({ error: "tableId or modelId is required." });
+    const hasDataset = isDatasetSpec(b.dataset);
+    // Slice 4/5 - a semantic report needs a base table, a Model, or an
+    // inline dataset; a SQL report needs its SQL text instead.
+    if (!isSql && !b.tableId && !b.modelId && !hasDataset) {
+      res.status(400).json({ error: "tableId, modelId, or a dataset is required." });
       return;
     }
     if (isSql && (!b.sql || typeof b.sql !== "string" || !b.sql.trim())) {
@@ -1480,7 +1503,7 @@ tablespaceRouter.post(
       const report = await store.createReport(req.params.sourceId, {
         name: b.name.trim(),
         kind: isSql ? "sql" : "semantic",
-        tableId: b.modelId ? null : b.tableId,
+        tableId: b.modelId || hasDataset ? null : b.tableId,
         modelId: b.modelId ?? null,
         joinTableIds: b.joinTableIds,
         dimensionIds: b.dimensionIds,
@@ -1495,6 +1518,13 @@ tablespaceRouter.post(
         sqlVars: b.sqlVars,
         collectionId: b.collectionId,
       });
+      // The owned dataset model needs the new report's id, so it's linked
+      // in a second step.
+      if (hasDataset) {
+        const ownedId = await syncOwnedDataset(req.params.sourceId, report.id, b.dataset);
+        res.status(201).json(await store.setReportModelId(req.params.sourceId, report.id, ownedId));
+        return;
+      }
       res.status(201).json(report);
     } catch (err) {
       if (err.code === "23505") {
@@ -1553,18 +1583,28 @@ tablespaceRouter.put(
   wrap(async (req, res) => {
     const b = req.body || {};
     const isSql = b.kind === "sql";
-    if (!isSql && !b.tableId && !b.modelId) {
-      res.status(400).json({ error: "tableId or modelId is required." });
+    const hasDataset = isDatasetSpec(b.dataset);
+    if (!isSql && !b.tableId && !b.modelId && !hasDataset) {
+      res.status(400).json({ error: "tableId, modelId, or a dataset is required." });
       return;
     }
     if (isSql && (!b.sql || typeof b.sql !== "string" || !b.sql.trim())) {
       res.status(400).json({ error: "sql is required for a SQL report." });
       return;
     }
+    // Confirm the report exists before touching its owned dataset - an
+    // owned model FK-references a real report id.
+    if (!(await store.getReport(req.params.sourceId, req.params.reportId))) {
+      res.status(404).json({ error: "Report not found." });
+      return;
+    }
+    // Resolve the inline dataset first so the report can point straight at
+    // the owned model (or have any stale owned model cleaned up).
+    const ownedModelId = await syncOwnedDataset(req.params.sourceId, req.params.reportId, b.dataset);
     const report = await store.updateReport(req.params.sourceId, req.params.reportId, {
       kind: isSql ? "sql" : "semantic",
-      tableId: b.modelId ? null : b.tableId,
-      modelId: b.modelId ?? null,
+      tableId: b.modelId || hasDataset ? null : b.tableId,
+      modelId: hasDataset ? ownedModelId : (b.modelId ?? null),
       joinTableIds: b.joinTableIds,
       dimensionIds: b.dimensionIds,
       measureIds: b.measureIds,
