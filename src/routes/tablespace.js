@@ -10,13 +10,14 @@ import {
   runNativeQuery,
   resolveNativeVars,
   paginateRows,
+  quoteTable,
   ALLOWED_PAGE_SIZES,
   DEFAULT_PAGE_SIZE,
   MAX_ROWS,
 } from "../lib/queryEngine.js";
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
 import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
-import { resolveJoins } from "../lib/joinResolve.js";
+import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../lib/joinResolve.js";
 import { compileModel, compileModelReport } from "../lib/modelEngine.js";
 
 // Reporting-parity slice 1 - `distinct` (COUNT DISTINCT) and `median`
@@ -77,6 +78,7 @@ function resolveModelSql(model, branch) {
     if (!joinNodes.some((n) => n.id === jn.id)) joinNodes.push(jn);
     joinClauses.push({
       tableName: jn.data.label,
+      tableSchema: jn.data.schema ?? null,
       fromTableName: base.data.label,
       baseColumn: bCol.name,
       joinColumn: jCol.name,
@@ -102,6 +104,8 @@ function resolveModelSql(model, branch) {
     const n = nodeFor(c.tableId);
     const col = (n?.data?.columns || []).find((x) => x.id === c.columnId);
     if (!n || !col) return { error: "This model references a column that no longer exists." };
+    // Only FROM/JOIN positions need a schema prefix; a column ref like
+    // "table"."col" binds to the range-table entry regardless of schema.
     columns.push({ tableName: n.data.label, columnName: col.name, alias: (c.alias || "").trim() || col.name });
   }
   if (columns.length === 0) return { error: "This model exposes no columns." };
@@ -115,7 +119,14 @@ function resolveModelSql(model, branch) {
   }
 
   try {
-    return compileModel({ kind: "builder", baseTableName: base.data.label, joinClauses, columns, filters });
+    return compileModel({
+      kind: "builder",
+      baseTableName: base.data.label,
+      baseTableSchema: base.data.schema ?? null,
+      joinClauses,
+      columns,
+      filters,
+    });
   } catch (err) {
     return { error: err.message };
   }
@@ -601,6 +612,11 @@ tablespaceRouter.post(
       return;
     }
     const { joinClauses, joinNodes } = jr;
+    // Forward (many-to-one) reachability graph from the base table - used
+    // by a calculated measure's multi-hop "value" term (resolveTerm ->
+    // chainTo below). Same helper resolveJoins builds internally; built
+    // once here so the term resolver can share it.
+    const forwardGraph = buildForwardJoinGraph(node, allTableNodes);
 
     // Dimensions/filters may reference the base table or any validated
     // join table; measures resolve against the base table ONLY (see
@@ -698,7 +714,16 @@ tablespaceRouter.post(
         } else {
           const path = findJoinPath(node, termNode);
           if (!path) return null;
-          chain = [{ tableName: termNode.data.label, baseColumn: path.baseColumn, joinColumn: path.joinColumn, fromTableId: node.id }];
+          chain = [
+            {
+              tableId: termNode.id,
+              tableName: termNode.data.label,
+              tableSchema: termNode.data.schema ?? null,
+              baseColumn: path.baseColumn,
+              joinColumn: path.joinColumn,
+              fromTableId: node.id,
+            },
+          ];
         }
       }
       // "value" on the base table itself needs no chain/join at all -
@@ -715,12 +740,13 @@ tablespaceRouter.post(
         filters.push({ columnName: col.name, operator: f.operator, value: f.value });
       }
 
+      const termSchema = termNode.data.schema ?? null;
       if (term.aggregation === "count") {
-        return { aggregation: "count", columnName: null, tableName: termNode.data.label, chain, filters };
+        return { aggregation: "count", columnName: null, tableName: termNode.data.label, tableSchema: termSchema, chain, filters };
       }
       const col = termColumnsById.get(term.columnId);
       return col
-        ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, chain, filters }
+        ? { aggregation: term.aggregation, columnName: col.name, tableName: termNode.data.label, tableSchema: termSchema, chain, filters }
         : null;
     };
 
@@ -886,6 +912,7 @@ tablespaceRouter.post(
     try {
       compiled = compileQuery({
         tableName: node.data.label,
+        tableSchema: node.data.schema ?? null,
         measures,
         dimensions,
         filters: resolvedFilters,
@@ -1011,7 +1038,8 @@ tablespaceRouter.post(
     }
     const size = Math.max(1, Math.min(Number(limit) || 50, 200));
     try {
-      const out = await runNativeQuery(secrets.connectionString, `SELECT * FROM "${String(node.data.label).replace(/"/g, '""')}"`, [], {
+      const from = quoteTable(node.data.schema ?? null, node.data.label);
+      const out = await runNativeQuery(secrets.connectionString, `SELECT * FROM ${from}`, [], {
         offset: 0,
         pageSize: size,
       });

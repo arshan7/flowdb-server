@@ -7,6 +7,7 @@
 import {
   quoteIdent,
   quoteQualified,
+  quoteTable,
   aggExpr,
   dimExpr,
   compileFilterCondition,
@@ -56,8 +57,11 @@ function compileScalarExpr(node, params) {
 //   `LIMIT 0` describe.
 // kind "builder": `spec` carries fully-resolved names (the route did the
 //   node lookup + join resolution via resolveJoins):
-//   { baseTableName, joinClauses:[{tableName,fromTableName,baseColumn,joinColumn}],
+//   { baseTableName, baseTableSchema,
+//     joinClauses:[{tableName,tableSchema,fromTableName,baseColumn,joinColumn}],
 //     columns:[{tableName,columnName,alias}], filters:[{tableName,columnName,operator,value}] }
+//   baseTableSchema / joinClause.tableSchema drive the FROM/JOIN schema
+//   prefix for a multi-schema source; null/"public" => bare name.
 //
 // Returns { sql, params, columns }. `sql` is NOT parenthesised - the
 // caller wraps it.
@@ -83,14 +87,14 @@ export function compileModel(spec) {
   );
   const joinParts = (spec.joinClauses || []).map(
     (j) =>
-      `JOIN ${quoteIdent(j.tableName)} ON ` +
+      `JOIN ${quoteTable(j.tableSchema, j.tableName)} ON ` +
       `${quoteQualified(j.fromTableName || spec.baseTableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
   );
   const whereParts = (spec.filters || []).map((f) =>
     compileFilterCondition(f.tableName, f.columnName, f.operator, f.value, params),
   );
 
-  let sql = `SELECT ${selectParts.join(", ")} FROM ${quoteIdent(spec.baseTableName)}`;
+  let sql = `SELECT ${selectParts.join(", ")} FROM ${quoteTable(spec.baseTableSchema, spec.baseTableName)}`;
   if (joinParts.length) sql += ` ${joinParts.join(" ")}`;
   if (whereParts.length) sql += ` WHERE ${whereParts.join(" AND ")}`;
 

@@ -32,6 +32,28 @@ test("compileModel sql - passed through, columns unknown", () => {
   assert.equal(out.columns, null);
 });
 
+test("compileModel builder - multi-schema: base + join tables are schema-qualified in FROM/JOIN", () => {
+  const { sql } = compileModel({
+    kind: "builder",
+    baseTableName: "orders",
+    baseTableSchema: "shop",
+    joinClauses: [
+      { tableName: "customers", tableSchema: "shop", fromTableName: "orders", baseColumn: "customer_id", joinColumn: "id" },
+      { tableName: "users", tableSchema: "public", fromTableName: "orders", baseColumn: "user_id", joinColumn: "id" },
+    ],
+    columns: [
+      { tableName: "orders", columnName: "status", alias: "status" },
+      { tableName: "customers", columnName: "name", alias: "customer" },
+    ],
+  });
+  assert.match(sql, /FROM "shop"\."orders"/);
+  assert.match(sql, /JOIN "shop"\."customers" ON "orders"\."customer_id" = "customers"\."id"/);
+  // public join table keeps the bare form.
+  assert.match(sql, /JOIN "users" ON "orders"\."user_id" = "users"\."id"/);
+  // column refs never carry the schema.
+  assert.match(sql, /"orders"\."status" AS "status"/);
+});
+
 test("compileModel builder - no columns throws", () => {
   assert.throws(() => compileModel({ kind: "builder", baseTableName: "orders", columns: [] }), /at least one column/);
 });

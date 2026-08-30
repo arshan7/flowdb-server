@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compileQuery, resolveNativeVars } from "./queryEngine.js";
+import { compileQuery, resolveNativeVars, quoteTable } from "./queryEngine.js";
 
 // Slice 1 (reporting parity) - date bucketing, sort, row limit, and the
 // distinct/median aggregations. compileQuery takes an already-resolved
@@ -131,6 +131,54 @@ test("resolveNativeVars - a missing value binds NULL, never interpolates text", 
 test("resolveNativeVars - whitespace inside the braces is tolerated", () => {
   const { sql } = resolveNativeVars("WHERE d > {{  start_date  }}", { start_date: "2026-01-01" });
   assert.equal(sql, "WHERE d > $1");
+});
+
+// Slice 2 (multi-schema sources) - a base/join table from a non-public
+// schema is schema-qualified in FROM / JOIN, but column refs stay bare
+// (they bind to the range-table entry the qualified FROM created).
+
+test("quoteTable - schema prefix only for a non-public, non-empty schema", () => {
+  assert.equal(quoteTable(null, "orders"), '"orders"');
+  assert.equal(quoteTable("public", "orders"), '"orders"');
+  assert.equal(quoteTable("shop", "orders"), '"shop"."orders"');
+  assert.equal(quoteTable("we ird", 'ta"ble'), '"we ird"."ta""ble"');
+});
+
+test("tableSchema - base table is schema-qualified in FROM, columns stay bare", () => {
+  const { sql } = compileQuery({
+    tableName: "orders",
+    tableSchema: "shop",
+    dimensions: [dim("d1", "status")],
+    measures: [measure("m1", "sum", "total")],
+  });
+  assert.match(sql, /FROM "shop"\."orders"/);
+  assert.match(sql, /"orders"\."status" AS "d1"/);
+  assert.match(sql, /SUM\("orders"\."total"\) AS "m1"/);
+  assert.match(sql, /GROUP BY "orders"\."status"/);
+});
+
+test("tableSchema - a public base table is unchanged (no prefix)", () => {
+  const { sql } = compileQuery({
+    tableName: "orders",
+    tableSchema: "public",
+    dimensions: [dim("d1", "status")],
+    measures: [measure("m1", "count")],
+  });
+  assert.match(sql, /FROM "orders"/);
+  assert.doesNotMatch(sql, /"public"\."orders"/);
+});
+
+test("join tableSchema - JOIN target is schema-qualified, ON columns are bare", () => {
+  const { sql } = compileQuery({
+    tableName: "orders",
+    tableSchema: "shop",
+    dimensions: [dim("d1", "status")],
+    measures: [measure("m1", "count")],
+    joins: [
+      { tableName: "customers", tableSchema: "shop", baseColumn: "customer_id", joinColumn: "id" },
+    ],
+  });
+  assert.match(sql, /FROM "shop"\."orders" JOIN "shop"\."customers" ON "orders"\."customer_id" = "customers"\."id"/);
 });
 
 test("bucket + sort + limit + distinct compose in one query", () => {

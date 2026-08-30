@@ -86,7 +86,15 @@ export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById) {
     if (!joinNode || joinNode.type !== "tableNode") return { error: `Table ${joinTableId} not found.` };
     const direct = findJoinPath(baseNode, joinNode);
     const chain = direct
-      ? [{ tableName: joinNode.data.label, baseColumn: direct.baseColumn, joinColumn: direct.joinColumn, fromTableId: baseNode.id }]
+      ? [
+          {
+            tableId: joinNode.id,
+            tableName: joinNode.data.label,
+            baseColumn: direct.baseColumn,
+            joinColumn: direct.joinColumn,
+            fromTableId: baseNode.id,
+          },
+        ]
       : chainTo(forwardGraph, nodesById, joinTableId);
     if (!chain) {
       return {
@@ -94,11 +102,21 @@ export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById) {
       };
     }
     for (const hop of chain) {
-      if (joinedTableNames.has(hop.tableName)) continue;
-      joinedTableNames.add(hop.tableName);
+      // Dedupe by table id, not label - two schemas in one source can hold
+      // a same-named table, and a by-label lookup would attach the wrong
+      // node (and its wrong schema) to the JOIN.
+      const hopNode = nodesById.get(hop.tableId) || allTableNodes.find((n) => n.data?.label === hop.tableName);
+      const hopKey = hop.tableId || hop.tableName;
+      if (joinedTableNames.has(hopKey)) continue;
+      joinedTableNames.add(hopKey);
       const fromTableName = hop.fromTableId === baseNode.id ? baseNode.data.label : nodesById.get(hop.fromTableId)?.data?.label;
-      joinClauses.push({ tableName: hop.tableName, fromTableName, baseColumn: hop.baseColumn, joinColumn: hop.joinColumn });
-      const hopNode = allTableNodes.find((n) => n.data?.label === hop.tableName);
+      joinClauses.push({
+        tableName: hop.tableName,
+        tableSchema: hopNode?.data?.schema ?? null,
+        fromTableName,
+        baseColumn: hop.baseColumn,
+        joinColumn: hop.joinColumn,
+      });
       if (hopNode) joinNodes.push(hopNode);
     }
   }
@@ -113,9 +131,17 @@ export function chainTo(graph, nodesById, targetId) {
   let cur = targetId;
   while (graph.parent.has(cur)) {
     const { fromTableId, baseColumn, joinColumn } = graph.parent.get(cur);
-    const tableName = nodesById.get(cur)?.data?.label;
+    const curNode = nodesById.get(cur);
+    const tableName = curNode?.data?.label;
     if (!tableName) return null;
-    hops.unshift({ tableName, baseColumn, joinColumn, fromTableId });
+    hops.unshift({
+      tableId: cur,
+      tableName,
+      tableSchema: curNode?.data?.schema ?? null,
+      baseColumn,
+      joinColumn,
+      fromTableId,
+    });
     cur = fromTableId;
   }
   return hops;

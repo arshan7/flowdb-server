@@ -59,6 +59,19 @@ export function quoteQualified(table, column) {
   return `${quoteIdent(table)}.${quoteIdent(column)}`;
 }
 
+// A table reference for the FROM / JOIN position. Schema-qualified only
+// when the table came from a non-public schema (a multi-schema source);
+// bare otherwise, so every SQL emitted for an existing single-schema
+// report is byte-for-byte unchanged. Column references elsewhere in the
+// query stay schema-less on purpose: `FROM "shop"."orders"` still names
+// its range-table entry `orders`, so `"orders"."col"` binds to it with no
+// prefix - only the FROM/JOIN slot ever needs the schema.
+export function quoteTable(schema, table) {
+  return schema && schema !== "public"
+    ? `${quoteIdent(schema)}.${quoteIdent(table)}`
+    : quoteIdent(table);
+}
+
 // A single aggregate expression - COUNT(*) or AGG("table"."column"). The
 // one building block both a simple measure and each leaf term of a
 // calculated measure (4.4b) reduce to. "value" (post-4.4b) compiles to
@@ -182,7 +195,7 @@ function compileTermExpr(term, baseTableName, crossSubqueries, params) {
     term.chain.forEach((hop, i) => {
       const hopAlias = `${alias}_${i}`;
       crossSubqueries.push(
-        `LEFT JOIN ${quoteIdent(hop.tableName)} AS ${quoteIdent(hopAlias)} ` +
+        `LEFT JOIN ${quoteTable(hop.tableSchema, hop.tableName)} AS ${quoteIdent(hopAlias)} ` +
           `ON ${quoteQualified(fromIdent, hop.baseColumn)} = ${quoteQualified(hopAlias, hop.joinColumn)}`,
       );
       fromIdent = hopAlias;
@@ -199,7 +212,7 @@ function compileTermExpr(term, baseTableName, crossSubqueries, params) {
   const whereClause = filterParts.length ? ` WHERE ${filterParts.join(" AND ")}` : "";
   crossSubqueries.push(
     `LEFT JOIN (SELECT ${fkCol} AS ${quoteIdent("_jk")}, ${innerExpr} AS ${quoteIdent("_v")} ` +
-      `FROM ${quoteIdent(term.tableName)}${whereClause} GROUP BY ${fkCol}) AS ${quoteIdent(alias)} ` +
+      `FROM ${quoteTable(term.tableSchema, term.tableName)}${whereClause} GROUP BY ${fkCol}) AS ${quoteIdent(alias)} ` +
       `ON ${quoteQualified(baseTableName, hop.baseColumn)} = ${quoteQualified(alias, "_jk")}`,
   );
   const outerAgg = OUTER_WRAP[term.aggregation];
@@ -250,6 +263,10 @@ function compileTermExpr(term, baseTableName, crossSubqueries, params) {
 // just recurses.
 export function compileQuery({
   tableName,
+  // Multi-schema source: the Postgres schema the base table lives in.
+  // null / "public" => bare table name in FROM (unchanged). Each join
+  // entry carries its own `tableSchema` the same way.
+  tableSchema = null,
   measures = [],
   dimensions = [],
   filters = [],
@@ -306,7 +323,7 @@ export function compileQuery({
   // `tableName` for every join built before that existed.
   const joinParts = joins.map(
     (j) =>
-      `JOIN ${quoteIdent(j.tableName)} ON ${quoteQualified(j.fromTableName || tableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
+      `JOIN ${quoteTable(j.tableSchema, j.tableName)} ON ${quoteQualified(j.fromTableName || tableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
   );
 
   // Dimensions-only -> DISTINCT (no aggregation happening, so GROUP BY
@@ -314,7 +331,7 @@ export function compileQuery({
   // GROUP BY the dimensions. Measures-only -> neither, a single aggregate
   // row regardless of any WHERE filter.
   const distinct = dimensions.length > 0 && measures.length === 0 ? "DISTINCT " : "";
-  let sql = `SELECT ${distinct}${selectParts.join(", ")} FROM ${quoteIdent(tableName)}`;
+  let sql = `SELECT ${distinct}${selectParts.join(", ")} FROM ${quoteTable(tableSchema, tableName)}`;
   if (joinParts.length) sql += ` ${joinParts.join(" ")}`;
   if (crossSubqueries.length) sql += ` ${crossSubqueries.join(" ")}`;
   if (whereParts.length) sql += ` WHERE ${whereParts.join(" AND ")}`;
