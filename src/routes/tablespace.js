@@ -1252,7 +1252,17 @@ tablespaceRouter.post(
 tablespaceRouter.post(
   "/sources/:sourceId/models/query",
   wrap(async (req, res) => {
-    const { model: bodyModel, modelId, limit = 50 } = req.body || {};
+    // `limit` is the report builder's tiny "describe columns" probe; the
+    // Model builder's live preview sends `pageSize` + `offset` + `orderBy`
+    // ({ ordinal, direction }) so it can page and sort like the Data grid.
+    const { model: bodyModel, modelId, limit, offset = 0, pageSize, orderBy = null } = req.body || {};
+    const size = ALLOWED_PAGE_SIZES.includes(pageSize)
+      ? pageSize
+      : Math.max(1, Math.min(Number(limit) || 50, 200));
+    if (!Number.isInteger(offset) || offset < 0 || offset + size > MAX_ROWS) {
+      res.status(400).json({ error: `offset must be a non-negative integer, and offset + pageSize can't exceed ${MAX_ROWS}.` });
+      return;
+    }
     const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
     if (!secrets) {
       res.status(400).json({ error: "This source isn't connected." });
@@ -1269,12 +1279,29 @@ tablespaceRouter.post(
       res.status(400).json({ error: compiled.error });
       return;
     }
-    const size = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+    // Sort by 1-based OUTPUT-column position, not name - a builder model
+    // can expose two columns with the same alias, and position is
+    // unambiguous. Validated against the compiled column count for a
+    // builder model; a SQL model's columns aren't known here, so Postgres
+    // rejects an out-of-range position itself.
+    let sql = compiled.sql;
+    if (orderBy && typeof orderBy === "object" && Number.isInteger(orderBy.ordinal) && orderBy.ordinal >= 1) {
+      const maxOrdinal = Array.isArray(compiled.columns) ? compiled.columns.length : null;
+      if (maxOrdinal && orderBy.ordinal > maxOrdinal) {
+        res.status(400).json({ error: "Can't sort by a column that isn't in this model." });
+        return;
+      }
+      sql = `SELECT * FROM (${compiled.sql}) AS _ms ORDER BY ${orderBy.ordinal} ${orderBy.direction === "desc" ? "DESC" : "ASC"}`;
+    }
+
     try {
-      const out = await runNativeQuery(secrets.connectionString, compiled.sql, compiled.params, { offset: 0, pageSize: size });
+      const out = await runNativeQuery(secrets.connectionString, sql, compiled.params, { offset, pageSize: size });
+      const { rows, hasMore } = paginateRows(out.rows, size);
       res.json({
         columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
-        rows: paginateRows(out.rows, size).rows,
+        rows,
+        hasMore,
         sql: compiled.sql,
         params: compiled.params,
       });
