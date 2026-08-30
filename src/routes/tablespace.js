@@ -489,6 +489,11 @@ tablespaceRouter.post(
       // against the table's own physical columns and compiled straight
       // against it (single table, no joins - joins are a Model's job).
       direct = false,
+      // An inline dataset shaped in the report builder (joins / calculated
+      // columns) but not yet persisted as an owned Model. Same
+      // { baseTableId, joins, columns, filters } shape a saved report
+      // carries; compiled and aggregated over exactly like a `modelId`.
+      dataset = null,
       dimensions: modelDimensions = [],
       measures: modelMeasures = [],
       joinTableIds = [],
@@ -504,8 +509,8 @@ tablespaceRouter.post(
       orderBy = null,
       rowLimit = null,
     } = req.body || {};
-    if (!tableId && !modelId) {
-      res.status(400).json({ error: "tableId or modelId is required." });
+    if (!tableId && !modelId && !dataset) {
+      res.status(400).json({ error: "tableId, modelId, or a dataset is required." });
       return;
     }
     if (rowLimit != null && (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > MAX_ROWS)) {
@@ -533,11 +538,29 @@ tablespaceRouter.post(
     // dims/measures aggregate over its OUTPUT columns (validated against
     // the compiled column list for a builder model; a SQL model's columns
     // aren't known here, so Postgres reports an unknown column itself).
-    if (modelId) {
-      const model = await store.getModel(req.params.sourceId, modelId);
-      if (!model) {
-        res.status(404).json({ error: "Model not found." });
-        return;
+    // `dataset` (an inline, not-yet-saved report dataset) takes the exact
+    // same path - it's just resolved from the request body instead of a
+    // stored row.
+    if (modelId || dataset) {
+      let model;
+      if (modelId) {
+        model = await store.getModel(req.params.sourceId, modelId);
+        if (!model) {
+          res.status(404).json({ error: "Model not found." });
+          return;
+        }
+      } else {
+        if (!isDatasetSpec(dataset)) {
+          res.status(400).json({ error: "A dataset needs a base table and at least one column." });
+          return;
+        }
+        model = {
+          kind: "builder",
+          baseTableId: dataset.baseTableId,
+          joins: Array.isArray(dataset.joins) ? dataset.joins : [],
+          columns: dataset.columns,
+          filters: Array.isArray(dataset.filters) ? dataset.filters : [],
+        };
       }
       const compiledModel = resolveModelSql(model, branch, secrets.schema ?? null);
       if (compiledModel.error) {
@@ -607,7 +630,11 @@ tablespaceRouter.post(
         return;
       }
       try {
-        const key = cacheKey(req.params.sourceId, `model:${modelId}:${mCompiled.sql}`, mCompiled.params);
+        const key = cacheKey(
+          req.params.sourceId,
+          `${modelId ? `model:${modelId}` : "dataset"}:${mCompiled.sql}`,
+          mCompiled.params,
+        );
         let rawRows = getCachedQuery(key)?.rows;
         const cached = !!rawRows;
         if (!rawRows) {
