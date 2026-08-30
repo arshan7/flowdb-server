@@ -76,7 +76,7 @@ export function buildForwardJoinGraph(baseNode, allNodes) {
 // /query route and the Model compiler so a report's joins and a builder
 // Model's joins resolve by the exact same rules. `joinedTableNames`
 // dedupes hops shared by more than one requested chain.
-export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById) {
+export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById, defaultSchema = null) {
   const forwardGraph = buildForwardJoinGraph(baseNode, allTableNodes);
   const joinNodes = [];
   const joinClauses = [];
@@ -112,7 +112,7 @@ export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById) {
       const fromTableName = hop.fromTableId === baseNode.id ? baseNode.data.label : nodesById.get(hop.fromTableId)?.data?.label;
       joinClauses.push({
         tableName: hop.tableName,
-        tableSchema: hopNode?.data?.schema ?? null,
+        tableSchema: hopNode?.data?.schema ?? defaultSchema,
         fromTableName,
         baseColumn: hop.baseColumn,
         joinColumn: hop.joinColumn,

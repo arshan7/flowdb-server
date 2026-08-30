@@ -110,7 +110,16 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
   for (const incoming of introspected.nodes) {
     const name = incoming.data?.label;
     const key = tableKey(incoming.data?.schema, name);
-    const existing = existingByKey.get(key);
+    let existing = existingByKey.get(key);
+    // A node synced before multi-schema existed is keyed by its bare name
+    // (tableKey(null, name) === name). If the qualified key missed, match
+    // that legacy node so a resync back-fills its schema rather than
+    // adding a duplicate - but only when it's genuinely schema-less, never
+    // a real public-tagged node (which must not absorb a "shop.x").
+    if (!existing && key !== name) {
+      const legacy = existingByKey.get(name);
+      if (legacy && legacy.data?.schema == null) existing = legacy;
+    }
 
     if (!existing) {
       if (ledgerTables.has(key)) continue; // synced before, user removed it - stays removed
@@ -137,6 +146,18 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
       // fresh ids, which is real enough complexity to earn its own pass
       // rather than risk getting subtly wrong here. New tables and
       // conflicts - what was actually asked for - are unaffected by this.)
+      //
+      // The ONE exception: back-fill data.schema on a node synced before
+      // multi-schema existed (schema-less). It's a single scalar, no id
+      // remapping, and without it every pre-existing connected source
+      // stays unqualified in FROM/JOIN forever (a `shop` table compiled as
+      // bare "orders" -> 42P01). A resync now heals it in place.
+      if (existing.data?.schema == null && incoming.data?.schema != null) {
+        const idx = nextNodes.indexOf(existing);
+        if (idx !== -1) {
+          nextNodes[idx] = { ...existing, data: { ...existing.data, schema: incoming.data.schema } };
+        }
+      }
       introspectedIdToFinalId.set(incoming.id, existing.id);
     } else {
       conflicts.push({ name: key, reason: `A manual table named "${key}" already exists.` });

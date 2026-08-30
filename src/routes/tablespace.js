@@ -45,7 +45,10 @@ const QUERY_SORT_DIRECTIONS = new Set(["asc", "desc"]);
 // route does for a table report). `columns` is the model's output column
 // names for a builder model, null for a SQL model (not knowable without
 // running it). Returns { error } on any dangling reference. Pure - no I/O.
-function resolveModelSql(model, branch) {
+// `defaultSchema` (the source's pinned connection_schema, or null for an
+// all-schemas source) is the FROM/JOIN schema fallback for any base/join
+// node that predates schema tagging - node.data.schema always wins.
+function resolveModelSql(model, branch, defaultSchema = null) {
   if (model.kind === "sql") {
     if (!model.sql || !model.sql.trim()) return { error: "This model has no SQL." };
     const defaults = {};
@@ -65,7 +68,7 @@ function resolveModelSql(model, branch) {
   const rawJoins = Array.isArray(model.joins) ? model.joins : [];
   const fkJoinIds = rawJoins.filter((j) => typeof j === "string");
   const manualJoins = rawJoins.filter((j) => j && typeof j === "object");
-  const jr = resolveJoins(base, fkJoinIds, allTableNodes, nodesById);
+  const jr = resolveJoins(base, fkJoinIds, allTableNodes, nodesById, defaultSchema);
   if (jr.error) return { error: jr.error };
   const joinClauses = [...jr.joinClauses];
   const joinNodes = [...jr.joinNodes];
@@ -78,7 +81,7 @@ function resolveModelSql(model, branch) {
     if (!joinNodes.some((n) => n.id === jn.id)) joinNodes.push(jn);
     joinClauses.push({
       tableName: jn.data.label,
-      tableSchema: jn.data.schema ?? null,
+      tableSchema: jn.data.schema ?? defaultSchema,
       fromTableName: base.data.label,
       baseColumn: bCol.name,
       joinColumn: jCol.name,
@@ -122,7 +125,7 @@ function resolveModelSql(model, branch) {
     return compileModel({
       kind: "builder",
       baseTableName: base.data.label,
-      baseTableSchema: base.data.schema ?? null,
+      baseTableSchema: base.data.schema ?? defaultSchema,
       joinClauses,
       columns,
       filters,
@@ -502,7 +505,7 @@ tablespaceRouter.post(
         res.status(404).json({ error: "Model not found." });
         return;
       }
-      const compiledModel = resolveModelSql(model, branch);
+      const compiledModel = resolveModelSql(model, branch, secrets.schema ?? null);
       if (compiledModel.error) {
         res.status(400).json({ error: compiledModel.error });
         return;
@@ -606,7 +609,11 @@ tablespaceRouter.post(
     // only ever claims a table id, never the join columns. Direct 1-hop
     // first, then a forward many-to-one chain.
     const allTableNodes = (branch?.nodes || []).filter((n) => n.type === "tableNode");
-    const jr = resolveJoins(node, joinTableIds, allTableNodes, nodesById);
+    // FROM/JOIN schema fallback for nodes that predate schema tagging:
+    // node.data.schema wins, else the source's pinned connection_schema
+    // (null for an all-schemas source). A resync back-fills the nodes.
+    const defaultSchema = secrets.schema ?? null;
+    const jr = resolveJoins(node, joinTableIds, allTableNodes, nodesById, defaultSchema);
     if (jr.error) {
       res.status(400).json({ error: jr.error });
       return;
@@ -711,6 +718,8 @@ tablespaceRouter.post(
         if (term.aggregation === "value") {
           chain = chainTo(forwardGraph, nodesById, term.tableId);
           if (!chain) return null;
+          // Back-fill schema on legacy (pre-tagging) hop nodes.
+          chain = chain.map((h) => ({ ...h, tableSchema: h.tableSchema ?? defaultSchema }));
         } else {
           const path = findJoinPath(node, termNode);
           if (!path) return null;
@@ -718,7 +727,7 @@ tablespaceRouter.post(
             {
               tableId: termNode.id,
               tableName: termNode.data.label,
-              tableSchema: termNode.data.schema ?? null,
+              tableSchema: termNode.data.schema ?? defaultSchema,
               baseColumn: path.baseColumn,
               joinColumn: path.joinColumn,
               fromTableId: node.id,
@@ -740,7 +749,7 @@ tablespaceRouter.post(
         filters.push({ columnName: col.name, operator: f.operator, value: f.value });
       }
 
-      const termSchema = termNode.data.schema ?? null;
+      const termSchema = termNode.data.schema ?? defaultSchema;
       if (term.aggregation === "count") {
         return { aggregation: "count", columnName: null, tableName: termNode.data.label, tableSchema: termSchema, chain, filters };
       }
@@ -912,7 +921,7 @@ tablespaceRouter.post(
     try {
       compiled = compileQuery({
         tableName: node.data.label,
-        tableSchema: node.data.schema ?? null,
+        tableSchema: node.data.schema ?? defaultSchema,
         measures,
         dimensions,
         filters: resolvedFilters,
@@ -1038,7 +1047,10 @@ tablespaceRouter.post(
     }
     const size = Math.max(1, Math.min(Number(limit) || 50, 200));
     try {
-      const from = quoteTable(node.data.schema ?? null, node.data.label);
+      // node.data.schema is authoritative; fall back to the source's pinned
+      // connection_schema for a single-schema source whose nodes predate
+      // schema tagging (a resync back-fills them - see reconcile.js).
+      const from = quoteTable(node.data.schema ?? secrets.schema ?? null, node.data.label);
       const out = await runNativeQuery(secrets.connectionString, `SELECT * FROM ${from}`, [], {
         offset: 0,
         pageSize: size,
@@ -1074,7 +1086,7 @@ tablespaceRouter.post(
       res.status(400).json({ error: "A model or modelId is required." });
       return;
     }
-    const compiled = resolveModelSql(model, branch);
+    const compiled = resolveModelSql(model, branch, secrets.schema ?? null);
     if (compiled.error) {
       res.status(400).json({ error: compiled.error });
       return;
