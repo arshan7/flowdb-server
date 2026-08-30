@@ -142,6 +142,12 @@ function resolveModelSql(model, branch, defaultSchema = null) {
   }
 }
 
+// Operators a model custom column may use: the four arithmetic ones a
+// calculated measure allows, plus `&` for text concatenation (row-level
+// only - a measure combining two aggregates with `&` is nonsense, so that
+// path keeps QUERY_CALC_OPERATORS).
+const MODEL_COLUMN_OPERATORS = new Set(["+", "-", "*", "/", "&"]);
+
 // Resolve a model custom column's flat token stream (value / op / paren,
 // the same shape a calculated measure's formula uses) into the nested tree
 // formulaExpr.parseFormula returns. Row-level: a "value" token is either a
@@ -155,7 +161,7 @@ function resolveColumnFormula(tokens, nodeFor) {
   for (const t of tokens) {
     if (!t || typeof t !== "object") return null;
     if (t.kind === "op") {
-      if (!QUERY_CALC_OPERATORS.has(t.value)) return null;
+      if (!MODEL_COLUMN_OPERATORS.has(t.value)) return null;
       resolved.push(t);
     } else if (t.kind === "paren") {
       if (t.value !== "(" && t.value !== ")") return null;
@@ -166,6 +172,11 @@ function resolveColumnFormula(tokens, nodeFor) {
         const n = Number(term.value);
         if (!Number.isFinite(n)) return null;
         resolved.push({ kind: "value", node: { constant: n } });
+      } else if (term.type === "text") {
+        // A fixed text literal (e.g. a space in a "first & last" name).
+        // Bound as a parameter by compileScalarExpr, never interpolated.
+        if (typeof term.value !== "string") return null;
+        resolved.push({ kind: "value", node: { text: term.value } });
       } else {
         const node = nodeFor(term.tableId);
         const col = (node?.data?.columns || []).find((x) => x.id === term.columnId);

@@ -102,6 +102,32 @@ test("compileModel builder - custom column division guards with NULLIF", () => {
   assert.match(sql, /\("orders"\."total" \/ NULLIF\("orders"\."qty", 0\)\) AS "unit_price"/);
 });
 
+test("compileModel builder - text concat custom column emits concat() with a bound literal", () => {
+  // first_name & " " & last_name  ->  concat(concat(first, $1), last)
+  const tree = {
+    kind: "calculated",
+    operator: "&",
+    termA: {
+      kind: "calculated",
+      operator: "&",
+      termA: { column: { tableName: "customers", columnName: "first_name" } },
+      termB: { text: " " },
+    },
+    termB: { column: { tableName: "customers", columnName: "last_name" } },
+  };
+  const { sql, params, columns } = compileModel({
+    kind: "builder",
+    baseTableName: "customers",
+    columns: [{ kind: "exprTree", tree, alias: "full_name" }],
+  });
+  assert.match(
+    sql,
+    /concat\(concat\("customers"\."first_name", \$1\), "customers"\."last_name"\) AS "full_name"/,
+  );
+  assert.deepEqual(params, [" "]);
+  assert.deepEqual(columns, ["full_name"]);
+});
+
 test("compileModelReport - subquery FROM, _tsm refs, modelParams ordered first", () => {
   const { sql, params } = compileModelReport({
     modelSql: 'SELECT status, total FROM "orders" WHERE status <> $1',

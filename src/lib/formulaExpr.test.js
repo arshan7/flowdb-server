@@ -52,6 +52,36 @@ test("parseFormula: explicit parens override precedence", () => {
   });
 });
 
+test("parseFormula: & (text concat) is the loosest precedence - A + B & C is (A + B) & C", () => {
+  const tree = parseFormula([val("A"), op("+"), val("B"), op("&"), val("C")]);
+  assert.deepEqual(tree, {
+    kind: "calculated",
+    operator: "&",
+    termA: { kind: "calculated", operator: "+", termA: { label: "A" }, termB: { label: "B" } },
+    termB: { label: "C" },
+  });
+});
+
+test("parseFormula: & chains left-associatively - A & B & C is (A & B) & C", () => {
+  const tree = parseFormula([val("A"), op("&"), val("B"), op("&"), val("C")]);
+  assert.deepEqual(tree, {
+    kind: "calculated",
+    operator: "&",
+    termA: { kind: "calculated", operator: "&", termA: { label: "A" }, termB: { label: "B" } },
+    termB: { label: "C" },
+  });
+});
+
+test("parseFormula: parens override & precedence - A & (B + C)", () => {
+  const tree = parseFormula([val("A"), op("&"), paren("("), val("B"), op("+"), val("C"), paren(")")]);
+  assert.deepEqual(tree, {
+    kind: "calculated",
+    operator: "&",
+    termA: { label: "A" },
+    termB: { kind: "calculated", operator: "+", termA: { label: "B" }, termB: { label: "C" } },
+  });
+});
+
 test("parseFormula: left-to-right chain of same-precedence operators is left-associative", () => {
   // A - B - C  ->  (A - B) - C, not A - (B - C)
   const tree = parseFormula([val("A"), op("-"), val("B"), op("-"), val("C")]);

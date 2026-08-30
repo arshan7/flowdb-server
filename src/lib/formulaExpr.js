@@ -37,13 +37,29 @@ export function legacyToTokens(measure) {
 // "value", node}` | `{kind:"op", value}` | `{kind:"paren", value}`, where
 // `node` is a queryEngine.js-compilable leaf - a raw client id never
 // reaches here) - standard grammar, standard precedence:
-//   expr    := product (('+'|'-') product)*
+//   expr    := sum (('&') sum)*        -- '&' = text concat, binds loosest
+//   sum     := product (('+'|'-') product)*
 //   product := factor (('*'|'/') factor)*
 //   factor  := VALUE | '(' expr ')'
+// '&' is the lowest-precedence level on purpose: `a + b & c + d` reads as
+// `(a+b) & (c+d)` - you're almost always concatenating whole computed
+// pieces, not weaving concat into the middle of an arithmetic chain.
 // `pos` is a single-element array used as a cursor shared across the
 // recursive calls - simplest way to thread "how far have we consumed"
 // through mutual recursion without a class.
 function parseExpr(tokens, pos) {
+  let node = parseSum(tokens, pos);
+  if (!node) return null;
+  while (tokens[pos[0]]?.kind === "op" && tokens[pos[0]].value === "&") {
+    pos[0]++;
+    const rhs = parseSum(tokens, pos);
+    if (!rhs) return null;
+    node = { kind: "calculated", operator: "&", termA: node, termB: rhs };
+  }
+  return node;
+}
+
+function parseSum(tokens, pos) {
   let node = parseProduct(tokens, pos);
   if (!node) return null;
   while (tokens[pos[0]]?.kind === "op" && (tokens[pos[0]].value === "+" || tokens[pos[0]].value === "-")) {
