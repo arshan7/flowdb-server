@@ -1,7 +1,12 @@
 import pg from "pg";
-import { resolveSsl } from "./pgIntrospect.js";
+import { splitSsl, isSslRefusedError, sslFallbackAllowed } from "./pgIntrospect.js";
 
 const AGGREGATIONS = { count: "COUNT", sum: "SUM", avg: "AVG", min: "MIN", max: "MAX" };
+// Reporting-parity slice 1 - `date_trunc` units a dimension can be grouped
+// by. Same fixed-map discipline as OPERATORS/CALC_OPERATORS: the client
+// sends a key, only a value from this map ever reaches the SQL string.
+export const BUCKETS = { day: "day", week: "week", month: "month", quarter: "quarter", year: "year" };
+export const SORT_DIRECTIONS = { asc: "ASC", desc: "DESC" };
 // "in" has no fixed symbol - it's special-cased in compileFilterCondition
 // as `= ANY($n)` (a single parameterized array, not string-built
 // `IN ($1,$2,$3)` for variable arity).
@@ -41,7 +46,7 @@ export const ALLOWED_PAGE_SIZES = [10, 50, 100, 500, 1000];
 export const DEFAULT_PAGE_SIZE = 100;
 export const MAX_ROWS = 5000;
 
-function quoteIdent(value) {
+export function quoteIdent(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
 }
 
@@ -50,7 +55,7 @@ function quoteIdent(value) {
 // necessary, so there's exactly one code path instead of two that could
 // silently drift apart. Harmless for the single-table case, required the
 // moment two tables in a join share a column name.
-function quoteQualified(table, column) {
+export function quoteQualified(table, column) {
   return `${quoteIdent(table)}.${quoteIdent(column)}`;
 }
 
@@ -59,17 +64,37 @@ function quoteQualified(table, column) {
 // calculated measure (4.4b) reduce to. "value" (post-4.4b) compiles to
 // MAX - see compileTermExpr's own comment for why that's correct, not
 // just convenient.
-function aggExpr(aggregation, columnName, tableName) {
+export function aggExpr(aggregation, columnName, tableName) {
   if (aggregation === "count") return "COUNT(*)";
+  const col = quoteQualified(tableName, columnName);
+  // Slice 1 - two more aggregations. Base-table-only by construction: the
+  // route never resolves either as a cross-table term (see
+  // QUERY_TERM_AGGREGATIONS in tablespace.js), so neither ever goes through
+  // compileTermExpr's pre-aggregate-then-LEFT-JOIN path where they wouldn't
+  // compose.
+  if (aggregation === "distinct") return `COUNT(DISTINCT ${col})`;
+  if (aggregation === "median") return `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${col})`;
   const fn = aggregation === "value" ? "max" : aggregation;
-  return `${AGGREGATIONS[fn]}(${quoteQualified(tableName, columnName)})`;
+  return `${AGGREGATIONS[fn]}(${col})`;
+}
+
+// A dimension's grouped expression - the raw qualified column, or
+// DATE_TRUNC('<unit>', col) when the report asked to bucket a
+// date/timestamp dimension by day/week/month/quarter/year. Used
+// identically in the SELECT list and the GROUP BY so they can never drift.
+export function dimExpr(dim) {
+  const col = quoteQualified(dim.tableName, dim.columnName);
+  if (!dim.bucket) return col;
+  const unit = BUCKETS[dim.bucket];
+  if (!unit) throw new Error(`Unsupported time grouping: ${dim.bucket}`);
+  return `DATE_TRUNC('${unit}', ${col})`;
 }
 
 // Shared by the main WHERE clause and a cross-table term's own subquery
 // WHERE clause - one place that decides how a filter condition becomes
 // SQL, so the two can't silently drift into different behavior for the
 // same operator.
-function compileFilterCondition(tableName, columnName, operator, value, params) {
+export function compileFilterCondition(tableName, columnName, operator, value, params) {
   const colExpr = quoteQualified(tableName, columnName);
   if (operator === "in") {
     params.push(value);
@@ -123,7 +148,22 @@ function compileFilterCondition(tableName, columnName, operator, value, params) 
 //
 // `crossSubqueries` collects one such LEFT JOIN (or LEFT JOIN chain) per
 // cross-table leaf term used across the whole query (mutated in place).
+//
+// Post-"relationships + formula builder" - a term can now also be `{kind:
+// "constant", value}` (a typed-in number, e.g. the "1" and "100" in
+// "1 - tax_amount/100") - just a parameterized literal, no table involved.
+// The route resolves an N-ary term list (as many terms as a formula
+// needs, each a column, a constant, or another measure) into a nested
+// binary tree of these same `{kind:"calculated", termA, termB, operator}`
+// nodes via a left-to-right reduce BEFORE it ever reaches here - see
+// tablespace.js's resolveCalculatedExpr - so this function's own
+// recursion never had to change shape to support N terms, only gained
+// this one new leaf kind.
 function compileTermExpr(term, baseTableName, crossSubqueries, params) {
+  if (term.kind === "constant") {
+    params.push(term.value);
+    return `$${params.length}`;
+  }
   if (term.kind === "calculated") {
     const a = compileTermExpr(term.termA, baseTableName, crossSubqueries, params);
     const b = compileTermExpr(term.termB, baseTableName, crossSubqueries, params);
@@ -216,6 +256,12 @@ export function compileQuery({
   joins = [],
   offset = 0,
   pageSize = DEFAULT_PAGE_SIZE,
+  // Slice 1 - `orderBy` is { field, direction }, where `field` is a
+  // resolved dimension/measure id (the route rejects anything else) and so
+  // is safe to emit as a SELECT-alias reference. `rowLimit` caps the total
+  // rows the report can ever return, independent of the paging window.
+  orderBy = null,
+  rowLimit = null,
 }) {
   if (measures.length === 0 && dimensions.length === 0) {
     throw new Error("Pick at least one dimension or measure.");
@@ -234,7 +280,7 @@ export function compileQuery({
   const params = [];
 
   const selectParts = [
-    ...dimensions.map((dim) => `${quoteQualified(dim.tableName, dim.columnName)} AS ${quoteIdent(dim.id)}`),
+    ...dimensions.map((dim) => `${dimExpr(dim)} AS ${quoteIdent(dim.id)}`),
     ...measures.map((measure) => {
       let expr;
       if (measure.kind === "calculated") {
@@ -273,18 +319,36 @@ export function compileQuery({
   if (crossSubqueries.length) sql += ` ${crossSubqueries.join(" ")}`;
   if (whereParts.length) sql += ` WHERE ${whereParts.join(" AND ")}`;
   if (dimensions.length > 0 && measures.length > 0) {
-    sql += ` GROUP BY ${dimensions.map((dim) => quoteQualified(dim.tableName, dim.columnName)).join(", ")}`;
+    sql += ` GROUP BY ${dimensions.map(dimExpr).join(", ")}`;
   }
-  // Requests one extra row past pageSize so paginateRows() below can tell
-  // "there's a next page" apart from "that was everything" without a
+
+  // Slice 1 - ORDER BY a single resolved field. `field` is a dimension or
+  // measure id already emitted as a quoted SELECT alias above (Postgres
+  // allows ORDER BY on an output-column alias, GROUP BY present or not);
+  // the route has verified it's one of this query's own ids, and direction
+  // comes from a fixed map - no client string reaches the SQL either way.
+  if (orderBy && orderBy.field) {
+    const dir = SORT_DIRECTIONS[orderBy.direction] || "ASC";
+    sql += ` ORDER BY ${quoteIdent(orderBy.field)} ${dir}`;
+  }
+
+  // Requests one extra row past the page window so paginateRows() below can
+  // tell "there's a next page" apart from "that was everything" without a
   // separate COUNT(*) (which can be its own expensive query on a large
-  // table) - trimmed back down to pageSize before ever reaching a client.
-  params.push(pageSize + 1);
+  // table) - trimmed back down before ever reaching a client. `rowLimit`
+  // (Slice 1) caps the total: the window can never reach past it, so a
+  // "top 12" report returns 12 and stops.
+  const windowSize = rowLimit != null ? Math.max(0, Math.min(pageSize, rowLimit - offset)) : pageSize;
+  params.push(windowSize + 1);
   sql += ` LIMIT $${params.length}`;
   params.push(offset);
   sql += ` OFFSET $${params.length}`;
 
-  return { sql, params };
+  // `windowSize` goes back to the route so paginateRows() trims the
+  // lookahead row against the SAME number this LIMIT used - important when
+  // rowLimit clamped the window below pageSize ("top 12" must return 12,
+  // not 12 + the one lookahead row).
+  return { sql, params, windowSize };
 }
 
 // Trims the one lookahead row compileQuery's LIMIT (pageSize + 1) always
@@ -298,33 +362,89 @@ export function paginateRows(rows, pageSize = DEFAULT_PAGE_SIZE) {
 // same "scoped to one request's lifetime" principle pgIntrospect.js's own
 // withClient already uses. max:1 (one query, not introspection's 8
 // concurrent ones), a tighter query_timeout (interactive, not a
-// background sync). Wrapped in an explicit READ ONLY transaction as a
-// second, DB-enforced guarantee independent of compileQuery only ever
-// emitting SELECT - defense in depth, not redundant with it.
-export async function runQuery(connectionString, sql, params) {
-  const pool = new pg.Pool({
-    connectionString,
-    ssl: resolveSsl(connectionString),
-    connectionTimeoutMillis: 10_000,
-    query_timeout: 15_000,
-    max: 1,
-  });
-  try {
-    const client = await pool.connect();
+// background sync). Wrapped in an explicit READ ONLY transaction - the
+// real, DB-enforced guarantee: for compileQuery it's defense in depth (it
+// only emits SELECT), for runNativeQuery (Slice 4, user-typed SQL) it's
+// the load-bearing guard - any INSERT/UPDATE/DELETE/DDL fails outright.
+// Returns the raw pg result (callers read `.rows` or `.fields`).
+async function runReadOnly(connectionString, sql, params) {
+  const { connectionString: cleanUrl, ssl: resolvedSsl } = splitSsl(connectionString);
+  const attempt = async (ssl) => {
+    const pool = new pg.Pool({
+      connectionString: cleanUrl,
+      ssl,
+      connectionTimeoutMillis: 10_000,
+      query_timeout: 15_000,
+      max: 1,
+    });
     try {
-      await client.query("BEGIN READ ONLY");
+      const client = await pool.connect();
       try {
-        const result = await client.query(sql, params);
-        await client.query("COMMIT");
-        return result.rows;
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
+        await client.query("BEGIN READ ONLY");
+        try {
+          const result = await client.query(sql, params);
+          await client.query("COMMIT");
+          return result;
+        } catch (err) {
+          await client.query("ROLLBACK");
+          throw err;
+        }
+      } finally {
+        client.release();
       }
     } finally {
-      client.release();
+      await pool.end();
     }
-  } finally {
-    await pool.end();
+  };
+
+  try {
+    return await attempt(resolvedSsl);
+  } catch (err) {
+    // Same SSL-refused plaintext fallback as pgIntrospect's withClient. The
+    // failure is at connect() - before BEGIN - so nothing was executed, let
+    // alone committed, on the dropped attempt. sslFallbackAllowed reads the
+    // original string (cleanUrl has had sslmode stripped).
+    if (!isSslRefusedError(err) || !sslFallbackAllowed(connectionString)) throw err;
+    return attempt(false);
   }
+}
+
+export async function runQuery(connectionString, sql, params) {
+  const result = await runReadOnly(connectionString, sql, params);
+  return result.rows;
+}
+
+// Slice 4 - native SQL reports. `userSql` is raw, user-typed SELECT text
+// (its {{vars}} already resolved to positional $N params by the route -
+// see resolveNativeVars there); `params` are those bound values. Safety is
+// three-layered: (1) the READ ONLY transaction in runReadOnly rejects any
+// write/DDL; (2) wrapping in `SELECT * FROM (<userSql>) sub` means only a
+// single SELECT-shaped statement parses at all - a trailing `;`, a second
+// statement, or a non-SELECT top-level all become syntax errors; (3) an
+// outer LIMIT/OFFSET the user can't remove caps the rows. Returns
+// `{ rows, fields, windowSize }` - `fields` names the result columns
+// (there's no semantic model to read them from).
+export async function runNativeQuery(connectionString, userSql, params = [], { offset = 0, pageSize = DEFAULT_PAGE_SIZE } = {}) {
+  const limitIdx = params.length + 1;
+  const offsetIdx = params.length + 2;
+  const wrapped = `SELECT * FROM (${userSql}) AS _tablespace_sub LIMIT $${limitIdx} OFFSET $${offsetIdx}`;
+  const result = await runReadOnly(connectionString, wrapped, [...params, pageSize + 1, offset]);
+  return { rows: result.rows, fields: result.fields || [], windowSize: pageSize };
+}
+
+// Turns `{{name}}` placeholders in user SQL into positional `$N` params,
+// values pulled from `values` (missing = NULL). A name used twice reuses
+// the same param. Nothing from `values` is ever interpolated into the SQL
+// string - only `$N`.
+export function resolveNativeVars(sql, values = {}) {
+  const params = [];
+  const indexByName = new Map();
+  const out = String(sql).replace(/\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g, (_, name) => {
+    if (!indexByName.has(name)) {
+      params.push(values[name] ?? null);
+      indexByName.set(name, params.length);
+    }
+    return `$${indexByName.get(name)}`;
+  });
+  return { sql: out, params };
 }

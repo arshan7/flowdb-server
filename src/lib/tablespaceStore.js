@@ -278,8 +278,17 @@ const REPORT_COLUMNS = `
   join_table_ids AS "joinTableIds",
   dimension_ids AS "dimensionIds", measure_ids AS "measureIds", filters,
   chart_type AS "chartType", page_size AS "pageSize",
+  dimension_buckets AS "dimensionBuckets", order_by AS "orderBy", row_limit AS "rowLimit",
+  kind, sql, sql_vars AS "sqlVars",
+  collection_id AS "collectionId", is_favorite AS "isFavorite", model_id AS "modelId",
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
+
+// Slice 1 - dimension_buckets is a map (default {}), order_by is a single
+// nullable object, row_limit a nullable int - so none of the three fit
+// toJson's "default to []" shape.
+const toBuckets = (value) => JSON.stringify(value && typeof value === "object" ? value : {});
+const toOrderBy = (value) => (value && value.field ? JSON.stringify(value) : null);
 
 export async function listReports(sourceId) {
   const { rows } = await query(
@@ -297,37 +306,38 @@ export async function getReport(sourceId, reportId) {
   return rows[0] || null;
 }
 
-export async function createReport(
-  sourceId,
-  { name, tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize },
-) {
+export async function createReport(sourceId, r) {
   const { rows } = await query(
     `INSERT INTO tablespace_reports
-       (source_id, name, table_id, join_table_ids, dimension_ids, measure_ids, filters, chart_type, page_size)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (source_id, name, table_id, join_table_ids, dimension_ids, measure_ids, filters, chart_type, page_size,
+        dimension_buckets, order_by, row_limit, kind, sql, sql_vars, collection_id, model_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      RETURNING ${REPORT_COLUMNS}`,
     [
       sourceId,
-      name,
-      tableId,
-      toJson(joinTableIds || []),
-      toJson(dimensionIds || []),
-      toJson(measureIds || []),
-      toJson(filters || []),
-      chartType || "table",
-      pageSize || 100,
+      r.name,
+      r.tableId ?? null,
+      toJson(r.joinTableIds || []),
+      toJson(r.dimensionIds || []),
+      toJson(r.measureIds || []),
+      toJson(r.filters || []),
+      r.chartType || "table",
+      r.pageSize || 100,
+      toBuckets(r.dimensionBuckets),
+      toOrderBy(r.orderBy),
+      r.rowLimit ?? null,
+      r.kind === "sql" ? "sql" : "semantic",
+      r.kind === "sql" ? (r.sql ?? "") : null,
+      toJson(r.sqlVars || []),
+      r.collectionId ?? null,
+      r.modelId ?? null,
     ],
   );
   return rows[0];
 }
 
-export async function renameReport(sourceId, reportId, name) {
-  const { rows } = await query(
-    `UPDATE tablespace_reports SET name = $3, updated_at = now()
-     WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
-    [reportId, sourceId, name],
-  );
-  return rows[0] || null;
+export function renameReport(sourceId, reportId, name) {
+  return updateReportMeta(sourceId, reportId, { name });
 }
 
 // IA redesign (post-4.4a) - the Report Builder now has a real edit
@@ -338,27 +348,50 @@ export async function renameReport(sourceId, reportId, name) {
 // deliberately NOT touched here - renaming stays the gallery's job
 // (renameReport above), same separation of concerns Metabase draws
 // between "Save" and "Rename."
-export async function updateReport(
-  sourceId,
-  reportId,
-  { tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize },
-) {
+export async function updateReport(sourceId, reportId, r) {
   const { rows } = await query(
     `UPDATE tablespace_reports
      SET table_id = $3, join_table_ids = $4, dimension_ids = $5, measure_ids = $6,
-         filters = $7, chart_type = $8, page_size = $9, updated_at = now()
+         filters = $7, chart_type = $8, page_size = $9,
+         dimension_buckets = $10, order_by = $11, row_limit = $12,
+         kind = $13, sql = $14, sql_vars = $15, model_id = $16, updated_at = now()
      WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
     [
       reportId,
       sourceId,
-      tableId,
-      toJson(joinTableIds || []),
-      toJson(dimensionIds || []),
-      toJson(measureIds || []),
-      toJson(filters || []),
-      chartType || "table",
-      pageSize || 100,
+      r.tableId ?? null,
+      toJson(r.joinTableIds || []),
+      toJson(r.dimensionIds || []),
+      toJson(r.measureIds || []),
+      toJson(r.filters || []),
+      r.chartType || "table",
+      r.pageSize || 100,
+      toBuckets(r.dimensionBuckets),
+      toOrderBy(r.orderBy),
+      r.rowLimit ?? null,
+      r.kind === "sql" ? "sql" : "semantic",
+      r.kind === "sql" ? (r.sql ?? "") : null,
+      toJson(r.sqlVars || []),
+      r.modelId ?? null,
     ],
+  );
+  return rows[0] || null;
+}
+
+// Slice 4 - the organisation fields (rename / move to a collection / star),
+// distinct from updateReport's full query-definition replace. Partial: a
+// key left undefined is untouched.
+export async function updateReportMeta(sourceId, reportId, { name, collectionId, isFavorite }) {
+  const sets = [];
+  const values = [reportId, sourceId];
+  if (name !== undefined) values.push(name), sets.push(`name = $${values.length}`);
+  if (collectionId !== undefined) values.push(collectionId), sets.push(`collection_id = $${values.length}`);
+  if (isFavorite !== undefined) values.push(!!isFavorite), sets.push(`is_favorite = $${values.length}`);
+  if (sets.length === 0) return getReport(sourceId, reportId);
+  const { rows } = await query(
+    `UPDATE tablespace_reports SET ${sets.join(", ")}, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
+    values,
   );
   return rows[0] || null;
 }
@@ -380,6 +413,8 @@ export async function deleteReport(sourceId, reportId) {
 // route per tile.
 const DASHBOARD_COLUMNS = `
   id, source_id AS "sourceId", name, report_ids AS "reportIds",
+  layout, text_tiles AS "textTiles", parameters,
+  collection_id AS "collectionId", is_favorite AS "isFavorite",
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
@@ -399,42 +434,209 @@ export async function getDashboard(sourceId, dashboardId) {
   return rows[0] || null;
 }
 
-export async function createDashboard(sourceId, { name, reportIds }) {
+export async function createDashboard(sourceId, { name, reportIds, layout, textTiles, parameters, collectionId }) {
   const { rows } = await query(
-    `INSERT INTO tablespace_dashboards (source_id, name, report_ids)
-     VALUES ($1, $2, $3)
+    `INSERT INTO tablespace_dashboards (source_id, name, report_ids, layout, text_tiles, parameters, collection_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING ${DASHBOARD_COLUMNS}`,
-    [sourceId, name, toJson(reportIds || [])],
+    [
+      sourceId,
+      name,
+      toJson(reportIds || []),
+      toJson(layout || []),
+      toJson(textTiles || []),
+      toJson(parameters || []),
+      collectionId ?? null,
+    ],
   );
   return rows[0];
 }
 
-export async function renameDashboard(sourceId, dashboardId, name) {
+// Slice 4 - rename / move to a collection / star, partial like
+// updateReportMeta. Kept separate from updateDashboard (which owns the
+// grid/membership JSONB fields).
+export async function updateDashboardMeta(sourceId, dashboardId, { name, collectionId, isFavorite }) {
+  const sets = [];
+  const values = [dashboardId, sourceId];
+  if (name !== undefined) values.push(name), sets.push(`name = $${values.length}`);
+  if (collectionId !== undefined) values.push(collectionId), sets.push(`collection_id = $${values.length}`);
+  if (isFavorite !== undefined) values.push(!!isFavorite), sets.push(`is_favorite = $${values.length}`);
+  if (sets.length === 0) return getDashboard(sourceId, dashboardId);
   const { rows } = await query(
-    `UPDATE tablespace_dashboards SET name = $3, updated_at = now()
+    `UPDATE tablespace_dashboards SET ${sets.join(", ")}, updated_at = now()
      WHERE id = $1 AND source_id = $2 RETURNING ${DASHBOARD_COLUMNS}`,
-    [dashboardId, sourceId, name],
+    values,
   );
   return rows[0] || null;
 }
 
-// The one mutation a dashboard's contents ever needs - the full ordered
-// report_ids array, replaced wholesale. Covers add/remove/reorder alike
-// (the client sends the complete next array each time) rather than
-// separate add/remove/move endpoints for what's really one operation.
-export async function updateDashboardReports(sourceId, dashboardId, reportIds) {
+export function renameDashboard(sourceId, dashboardId, name) {
+  return updateDashboardMeta(sourceId, dashboardId, { name });
+}
+
+// Reporting-parity slice 3 - a dashboard now has four mutable fields
+// (membership + grid layout + text tiles + filter params). A partial
+// update: only the keys actually passed are written, so "add a report"
+// (client sends reportIds) and "drag a tile" (client sends layout) don't
+// clobber each other. report_ids is still replaced wholesale when sent -
+// add/remove/reorder are all one operation (the client sends the full
+// next array), same as before.
+export async function updateDashboard(sourceId, dashboardId, patch = {}) {
+  const sets = [];
+  const values = [dashboardId, sourceId];
+  const col = (name, value) => {
+    values.push(toJson(value || []));
+    sets.push(`${name} = $${values.length}`);
+  };
+  if (patch.reportIds !== undefined) col("report_ids", patch.reportIds);
+  if (patch.layout !== undefined) col("layout", patch.layout);
+  if (patch.textTiles !== undefined) col("text_tiles", patch.textTiles);
+  if (patch.parameters !== undefined) col("parameters", patch.parameters);
+  if (sets.length === 0) return getDashboard(sourceId, dashboardId);
   const { rows } = await query(
-    `UPDATE tablespace_dashboards SET report_ids = $3, updated_at = now()
+    `UPDATE tablespace_dashboards SET ${sets.join(", ")}, updated_at = now()
      WHERE id = $1 AND source_id = $2 RETURNING ${DASHBOARD_COLUMNS}`,
-    [dashboardId, sourceId, toJson(reportIds || [])],
+    values,
   );
   return rows[0] || null;
+}
+
+// Back-compat wrapper - the "Add to dashboard" / remove / reorder paths
+// only ever touch membership.
+export async function updateDashboardReports(sourceId, dashboardId, reportIds) {
+  return updateDashboard(sourceId, dashboardId, { reportIds });
 }
 
 export async function deleteDashboard(sourceId, dashboardId) {
   const { rowCount } = await query(
     `DELETE FROM tablespace_dashboards WHERE id = $1 AND source_id = $2`,
     [dashboardId, sourceId],
+  );
+  return rowCount > 0;
+}
+
+// Slice 4 - collections: source-scoped folders for reports + dashboards.
+// parent_id self-ref (NULL = top level). Delete CASCADEs child folders and
+// SET NULLs the collection_id on any report/dashboard that was filed here
+// (contents survive, just unfiled - see the migration).
+const COLLECTION_COLUMNS = `
+  id, source_id AS "sourceId", parent_id AS "parentId", name,
+  created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function listCollections(sourceId) {
+  const { rows } = await query(
+    `SELECT ${COLLECTION_COLUMNS} FROM tablespace_collections WHERE source_id = $1 ORDER BY name ASC`,
+    [sourceId],
+  );
+  return rows;
+}
+
+export async function createCollection(sourceId, { name, parentId }) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_collections (source_id, name, parent_id)
+     VALUES ($1, $2, $3) RETURNING ${COLLECTION_COLUMNS}`,
+    [sourceId, name, parentId ?? null],
+  );
+  return rows[0];
+}
+
+export async function renameCollection(sourceId, collectionId, name) {
+  const { rows } = await query(
+    `UPDATE tablespace_collections SET name = $3, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${COLLECTION_COLUMNS}`,
+    [collectionId, sourceId, name],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteCollection(sourceId, collectionId) {
+  const { rowCount } = await query(
+    `DELETE FROM tablespace_collections WHERE id = $1 AND source_id = $2`,
+    [collectionId, sourceId],
+  );
+  return rowCount > 0;
+}
+
+// Slice 5 - Models: saved curated datasets a report is built on. Mirrors
+// the reports shape (source-scoped, soft refs into branch JSONB, same
+// create / full-update / partial-meta-update split).
+const MODEL_COLUMNS = `
+  id, source_id AS "sourceId", name, kind,
+  base_table_id AS "baseTableId", joins, columns, filters,
+  sql, sql_vars AS "sqlVars",
+  collection_id AS "collectionId", is_favorite AS "isFavorite",
+  created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function listModels(sourceId) {
+  const { rows } = await query(
+    `SELECT ${MODEL_COLUMNS} FROM tablespace_models WHERE source_id = $1 ORDER BY created_at ASC`,
+    [sourceId],
+  );
+  return rows;
+}
+
+export async function getModel(sourceId, modelId) {
+  const { rows } = await query(
+    `SELECT ${MODEL_COLUMNS} FROM tablespace_models WHERE id = $1 AND source_id = $2`,
+    [modelId, sourceId],
+  );
+  return rows[0] || null;
+}
+
+const modelValues = (m) => [
+  m.name,
+  m.kind === "sql" ? "sql" : "builder",
+  m.kind === "sql" ? null : (m.baseTableId ?? null),
+  toJson(m.joins || []),
+  toJson(m.columns || []),
+  toJson(m.filters || []),
+  m.kind === "sql" ? (m.sql ?? "") : null,
+  toJson(m.sqlVars || []),
+];
+
+export async function createModel(sourceId, m) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_models
+       (source_id, name, kind, base_table_id, joins, columns, filters, sql, sql_vars, collection_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     RETURNING ${MODEL_COLUMNS}`,
+    [sourceId, ...modelValues(m), m.collectionId ?? null],
+  );
+  return rows[0];
+}
+
+export async function updateModel(sourceId, modelId, m) {
+  const { rows } = await query(
+    `UPDATE tablespace_models
+     SET name = $3, kind = $4, base_table_id = $5, joins = $6, columns = $7, filters = $8,
+         sql = $9, sql_vars = $10, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${MODEL_COLUMNS}`,
+    [modelId, sourceId, ...modelValues(m)],
+  );
+  return rows[0] || null;
+}
+
+export async function updateModelMeta(sourceId, modelId, { name, collectionId, isFavorite }) {
+  const sets = [];
+  const values = [modelId, sourceId];
+  if (name !== undefined) values.push(name), sets.push(`name = $${values.length}`);
+  if (collectionId !== undefined) values.push(collectionId), sets.push(`collection_id = $${values.length}`);
+  if (isFavorite !== undefined) values.push(!!isFavorite), sets.push(`is_favorite = $${values.length}`);
+  if (sets.length === 0) return getModel(sourceId, modelId);
+  const { rows } = await query(
+    `UPDATE tablespace_models SET ${sets.join(", ")}, updated_at = now()
+     WHERE id = $1 AND source_id = $2 RETURNING ${MODEL_COLUMNS}`,
+    values,
+  );
+  return rows[0] || null;
+}
+
+export async function deleteModel(sourceId, modelId) {
+  const { rowCount } = await query(
+    `DELETE FROM tablespace_models WHERE id = $1 AND source_id = $2`,
+    [modelId, sourceId],
   );
   return rowCount > 0;
 }

@@ -1,4 +1,5 @@
 import pg from "pg";
+import { splitSsl } from "./pgIntrospect.js";
 
 // A single, long-lived pool created once at process startup and reused
 // across every request - contrast with pgIntrospect.js's withClient(),
@@ -14,8 +15,16 @@ if (!process.env.DATABASE_URL) {
   );
 }
 
+// splitSsl decides the ssl config from the URL's sslmode, then strips
+// sslmode out so pg's own connection-string parser can't override that
+// choice (it reads sslmode=require as full cert verification, which fails
+// against a private project CA like Aiven's even though the link is
+// TLS-encrypted). Same helper the introspection/query paths use.
+const { connectionString, ssl } = splitSsl(process.env.DATABASE_URL);
+
 export const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString,
+  ssl,
   max: 5,
   connectionTimeoutMillis: 10_000,
 });

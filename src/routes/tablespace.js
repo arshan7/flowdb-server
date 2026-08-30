@@ -7,127 +7,124 @@ import { describeIntrospectError } from "../lib/introspectErrors.js";
 import {
   compileQuery,
   runQuery,
+  runNativeQuery,
+  resolveNativeVars,
   paginateRows,
   ALLOWED_PAGE_SIZES,
   DEFAULT_PAGE_SIZE,
   MAX_ROWS,
 } from "../lib/queryEngine.js";
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
+import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
+import { resolveJoins } from "../lib/joinResolve.js";
+import { compileModel, compileModelReport } from "../lib/modelEngine.js";
 
-const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max"]);
+// Reporting-parity slice 1 - `distinct` (COUNT DISTINCT) and `median`
+// (PERCENTILE_CONT 0.5) join the simple-measure aggregations. They're
+// NOT in QUERY_TERM_AGGREGATIONS below: neither composes through
+// compileTermExpr's pre-aggregate-then-LEFT-JOIN machinery, so a formula
+// term can't pick them (a simple base-table measure, and a measure-ref
+// term pointing at one, still can - both stay on the base table).
+const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max", "distinct", "median"]);
 // Post-4.4b - "value" (a directly-related table's column, read as-is, not
-// really aggregated) is a term-only concept, deliberately NOT in this
-// set - it's checked separately in resolveTerm, where the join direction
-// can also be validated (see that function's own comment for why).
-const QUERY_TERM_AGGREGATIONS = new Set([...QUERY_AGGREGATIONS, "value"]);
+// really aggregated) is a term-only concept, deliberately NOT in
+// QUERY_AGGREGATIONS - it's checked separately in resolveTerm, where the
+// join direction can also be validated (see that function's own comment).
+const QUERY_TERM_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max", "value"]);
 const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains", "in"]);
+// Slice 1 - date/timestamp dimension bucketing units. Mirrors
+// queryEngine.js's own BUCKETS map (kept as a plain Set here, same as
+// ALLOWED_PAGE_SIZES appears in more than one place) - the route validates
+// against this, the engine re-derives the actual date_trunc unit.
+const QUERY_BUCKETS = new Set(["day", "week", "month", "quarter", "year"]);
+const QUERY_SORT_DIRECTIONS = new Set(["asc", "desc"]);
+
+// Slice 5 - resolve a stored Model row into { sql, params, columns } using
+// the branch's canvas nodes (same node/join/column resolution the /query
+// route does for a table report). `columns` is the model's output column
+// names for a builder model, null for a SQL model (not knowable without
+// running it). Returns { error } on any dangling reference. Pure - no I/O.
+function resolveModelSql(model, branch) {
+  if (model.kind === "sql") {
+    if (!model.sql || !model.sql.trim()) return { error: "This model has no SQL." };
+    const defaults = {};
+    for (const v of model.sqlVars || []) defaults[v.name] = v.defaultValue ?? "";
+    const { sql, params } = resolveNativeVars(model.sql, defaults);
+    return compileModel({ kind: "sql", sql, params });
+  }
+  const allTableNodes = (branch?.nodes || []).filter((n) => n.type === "tableNode");
+  const nodesById = new Map(allTableNodes.map((n) => [n.id, n]));
+  const base = nodesById.get(model.baseTableId);
+  if (!base) return { error: "This model's base table no longer exists." };
+
+  // `joins` entries are either a plain tableId string (FK-resolved, the
+  // common case) or an explicit spec { tableId, baseColumnId, joinColumnId }
+  // for a table with no defined relationship - the user picked the join
+  // keys themselves in the Model builder.
+  const rawJoins = Array.isArray(model.joins) ? model.joins : [];
+  const fkJoinIds = rawJoins.filter((j) => typeof j === "string");
+  const manualJoins = rawJoins.filter((j) => j && typeof j === "object");
+  const jr = resolveJoins(base, fkJoinIds, allTableNodes, nodesById);
+  if (jr.error) return { error: jr.error };
+  const joinClauses = [...jr.joinClauses];
+  const joinNodes = [...jr.joinNodes];
+  for (const mj of manualJoins) {
+    const jn = nodesById.get(mj.tableId);
+    if (!jn || jn.type !== "tableNode") return { error: "This model joins a table that no longer exists." };
+    const bCol = (base.data?.columns || []).find((c) => c.id === mj.baseColumnId);
+    const jCol = (jn.data?.columns || []).find((c) => c.id === mj.joinColumnId);
+    if (!bCol || !jCol) return { error: "This model's join references a column that no longer exists." };
+    if (!joinNodes.some((n) => n.id === jn.id)) joinNodes.push(jn);
+    joinClauses.push({
+      tableName: jn.data.label,
+      fromTableName: base.data.label,
+      baseColumn: bCol.name,
+      joinColumn: jCol.name,
+    });
+  }
+  const nodeFor = (tid) => (tid === base.id ? base : joinNodes.find((n) => n.id === tid));
+
+  const columns = [];
+  for (const c of model.columns || []) {
+    const n = nodeFor(c.tableId);
+    const col = (n?.data?.columns || []).find((x) => x.id === c.columnId);
+    if (!n || !col) return { error: "This model references a column that no longer exists." };
+    columns.push({ tableName: n.data.label, columnName: col.name, alias: (c.alias || "").trim() || col.name });
+  }
+  if (columns.length === 0) return { error: "This model exposes no columns." };
+
+  const filters = [];
+  for (const f of model.filters || []) {
+    const n = nodeFor(f.tableId);
+    const col = (n?.data?.columns || []).find((x) => x.id === f.columnId);
+    if (!n || !col || !QUERY_OPERATORS.has(f.operator)) return { error: "This model has an invalid filter." };
+    filters.push({ tableName: n.data.label, columnName: col.name, operator: f.operator, value: f.value });
+  }
+
+  try {
+    return compileModel({ kind: "builder", baseTableName: base.data.label, joinClauses, columns, filters });
+  } catch (err) {
+    return { error: err.message };
+  }
+}
 // Phase 4.4b - calculated measures' arithmetic operator.
 const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
-
-// Phase 4.4a - direct (1-hop) join resolution for /sources/:sourceId/query.
-// Reuses column.references (the same source of truth syncEdgeReference/
-// schemaStore.js already writes for the canvas's own relationship edges)
-// rather than re-deriving a join path from edge cardinality strings.
-// Checks both FK directions since either table could hold the foreign
-// key. If multiple FK paths exist between the same two tables, the first
-// one found wins - a known v1 simplification (no picker for which path).
-//
-// `direction` (post-4.4b) says WHICH side holds the FK - "base_to_join"
-// means the base table has the FK (so each base row matches AT MOST ONE
-// joined row - the safe direction for a "value" term to read a joined
-// column directly, no aggregation needed since there's only ever one
-// candidate value); "join_to_base" means the joined table has the FK (the
-// base table could match MANY joined rows - the original cross-table
-// case genuine aggregation, not a bare "value" read, exists for).
-function findJoinPath(baseNode, joinNode) {
-  const baseColumns = baseNode.data?.columns || [];
-  const joinColumns = joinNode.data?.columns || [];
-
-  for (const col of baseColumns) {
-    if (col.isForeignKey && col.references?.tableId === joinNode.id) {
-      const target = joinColumns.find((c) => c.id === col.references.columnId);
-      if (target) return { baseColumn: col.name, joinColumn: target.name, direction: "base_to_join" };
-    }
-  }
-  for (const col of joinColumns) {
-    if (col.isForeignKey && col.references?.tableId === baseNode.id) {
-      const target = baseColumns.find((c) => c.id === col.references.columnId);
-      if (target) return { baseColumn: target.name, joinColumn: col.name, direction: "join_to_base" };
-    }
-  }
-  return null;
-}
-
-// Post-4.4b - multi-hop join chains. Real BI tools (Power BI's snowflake
-// relationship chains, Cube.dev's Dijkstra-based cube-to-cube path
-// finding) walk the FULL relationship graph, not just direct neighbors -
-// confirmed against their actual docs rather than assumed, since this
-// changes what's actually safe to build. The safety property that makes
-// this OK: as long as every hop in a chain is "base_to_join" (many-to-one
-// - this table's FK points at the next one), each row of the ORIGINAL
-// base table still maps to at most one row at the far end of the chain,
-// transitively, no matter how many hops - the same guarantee a single
-// "value" hop already relies on. A chain through a "join_to_base" (many)
-// hop would break that guarantee, so this graph only ever follows
-// forward FK edges - it deliberately can't discover those tables at all
-// (they're the existing 1-hop-only aggregate case, unchanged, still
-// resolved by findJoinPath above).
-function getForwardNeighbors(node, allNodes) {
-  const neighbors = [];
-  for (const col of node.data?.columns || []) {
-    if (!col.isForeignKey || !col.references?.tableId) continue;
-    const target = allNodes.find((n) => n.id === col.references.tableId);
-    if (!target) continue;
-    const targetCol = (target.data?.columns || []).find((c) => c.id === col.references.columnId);
-    if (!targetCol) continue;
-    neighbors.push({ node: target, baseColumn: col.name, joinColumn: targetCol.name });
-  }
-  return neighbors;
-}
-
-// One BFS from `baseNode` over forward (many-to-one) edges only, reused
-// for every chain lookup against that base table in a single request -
-// BFS naturally finds the SHORTEST path to each reachable table, which
-// is also how Cube.dev resolves ambiguity when more than one path could
-// exist (Dijkstra, which BFS is the unweighted special case of) rather
-// than picking arbitrarily. `visited` doubles as cycle protection - a
-// schema can have a relationship cycle (A -> B -> C -> A), this stops
-// there instead of looping forever.
-function buildForwardJoinGraph(baseNode, allNodes) {
-  const parent = new Map(); // tableId -> { fromTableId, baseColumn, joinColumn }
-  const order = []; // tableIds in BFS-discovery (= dependency-safe) order
-  const visited = new Set([baseNode.id]);
-  const queue = [baseNode];
-  while (queue.length) {
-    const current = queue.shift();
-    for (const { node: neighborNode, baseColumn, joinColumn } of getForwardNeighbors(current, allNodes)) {
-      if (visited.has(neighborNode.id)) continue;
-      visited.add(neighborNode.id);
-      parent.set(neighborNode.id, { fromTableId: current.id, baseColumn, joinColumn });
-      order.push(neighborNode.id);
-      queue.push(neighborNode);
-    }
-  }
-  return { parent, order };
-}
-
-// Walks `graph.parent` back from `targetId` to the base table, returning
-// the chain in base-to-target order. null if targetId is unreachable via
-// an all-forward path (including: not related at all, or only reachable
-// through a "many" hop this graph deliberately never follows).
-function chainTo(graph, nodesById, targetId) {
-  if (!graph.parent.has(targetId)) return null;
-  const hops = [];
-  let cur = targetId;
-  while (graph.parent.has(cur)) {
-    const { fromTableId, baseColumn, joinColumn } = graph.parent.get(cur);
-    const tableName = nodesById.get(cur)?.data?.label;
-    if (!tableName) return null;
-    hops.unshift({ tableName, baseColumn, joinColumn, fromTableId });
-    cur = fromTableId;
-  }
-  return hops;
-}
+// Bigger formulas - a calculated measure's formula is a flat token stream
+// (value/op/paren, read left to right like a real formula bar), bounded -
+// a sane defensive cap, not a client-configurable one, same spirit as
+// MAX_ROWS/ALLOWED_PAGE_SIZES. Mirrors MetricFieldDrawer.jsx/measureExpr.js's
+// own MAX_FORMULA_TOKENS so the UI self-limits before a formula could ever
+// reach this, but this is the real, server-enforced bound - independent
+// of what the UI offers, since these routes never trust client-shaped
+// structure.
+const MAX_FORMULA_TOKENS = 61;
+// A "measure" value token references another measure, resolved
+// recursively (resolveMeasureAsTerm) - `depth` counts how many such
+// reference-hops a resolution has gone through, capped here regardless of
+// how long a chain of distinct real measures a payload references
+// (bounded in practice by the visiting-set cycle check, but that alone
+// doesn't stop a very long non-cyclic chain from recursing deep).
+const MAX_EXPR_DEPTH = 6;
 
 export const tablespaceRouter = Router();
 
@@ -383,15 +380,32 @@ tablespaceRouter.post(
   wrap(async (req, res) => {
     const {
       tableId,
+      // Slice 5 - a report reads from a table OR a Model. When `modelId`
+      // is set, `dimensions`/`measures` are the model-column shape
+      // ([{id, column, bucket?}] / [{id, aggregation, column}]) and
+      // `filters` reference `column` by name - no semantic model exists.
+      modelId,
+      dimensions: modelDimensions = [],
+      measures: modelMeasures = [],
       joinTableIds = [],
       measureIds = [],
       dimensionIds = [],
       filters = [],
       offset = 0,
       pageSize = DEFAULT_PAGE_SIZE,
+      // Slice 1 - per-report view options. dimensionBuckets:
+      // { <dimensionId>: "day"|"week"|"month"|"quarter"|"year" };
+      // orderBy: { field, direction } or null; rowLimit: int or null.
+      dimensionBuckets = {},
+      orderBy = null,
+      rowLimit = null,
     } = req.body || {};
-    if (!tableId) {
-      res.status(400).json({ error: "tableId is required." });
+    if (!tableId && !modelId) {
+      res.status(400).json({ error: "tableId or modelId is required." });
+      return;
+    }
+    if (rowLimit != null && (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > MAX_ROWS)) {
+      res.status(400).json({ error: `rowLimit must be an integer between 1 and ${MAX_ROWS}.` });
       return;
     }
     if (!ALLOWED_PAGE_SIZES.includes(pageSize)) {
@@ -410,6 +424,109 @@ tablespaceRouter.post(
     }
 
     const branch = await store.getMainBranch(req.params.sourceId);
+
+    // Slice 5 - model-sourced report. The model compiles to a subquery;
+    // dims/measures aggregate over its OUTPUT columns (validated against
+    // the compiled column list for a builder model; a SQL model's columns
+    // aren't known here, so Postgres reports an unknown column itself).
+    if (modelId) {
+      const model = await store.getModel(req.params.sourceId, modelId);
+      if (!model) {
+        res.status(404).json({ error: "Model not found." });
+        return;
+      }
+      const compiledModel = resolveModelSql(model, branch);
+      if (compiledModel.error) {
+        res.status(400).json({ error: compiledModel.error });
+        return;
+      }
+      const known = compiledModel.columns ? new Set(compiledModel.columns) : null;
+      const checkCol = (col) => !known || known.has(col);
+
+      const rDims = [];
+      for (const d of modelDimensions) {
+        if (!d || typeof d.column !== "string" || !checkCol(d.column)) {
+          res.status(400).json({ error: `Unknown model column "${d?.column}".` });
+          return;
+        }
+        if (d.bucket && !QUERY_BUCKETS.has(d.bucket)) {
+          res.status(400).json({ error: `Unsupported time grouping "${d.bucket}".` });
+          return;
+        }
+        rDims.push({ id: d.id, column: d.column, bucket: d.bucket || null, label: d.label });
+      }
+      const rMeasures = [];
+      for (const m of modelMeasures) {
+        if (!m || !QUERY_AGGREGATIONS.has(m.aggregation)) {
+          res.status(400).json({ error: `Invalid aggregation "${m?.aggregation}".` });
+          return;
+        }
+        if (m.aggregation !== "count" && (typeof m.column !== "string" || !checkCol(m.column))) {
+          res.status(400).json({ error: `Unknown model column "${m?.column}".` });
+          return;
+        }
+        rMeasures.push({ id: m.id, aggregation: m.aggregation, column: m.aggregation === "count" ? null : m.column, label: m.label });
+      }
+      const rFilters = [];
+      for (const f of filters) {
+        if (!f || !QUERY_OPERATORS.has(f.operator) || typeof f.column !== "string" || !checkCol(f.column)) {
+          res.status(400).json({ error: "Invalid filter." });
+          return;
+        }
+        rFilters.push({ column: f.column, operator: f.operator, value: f.value });
+      }
+      let resolvedOrderBy = null;
+      if (orderBy && orderBy.field) {
+        const sortable = new Set([...rDims, ...rMeasures].map((c) => c.id));
+        if (!sortable.has(orderBy.field)) {
+          res.status(400).json({ error: "Can't sort by a field that isn't in the report." });
+          return;
+        }
+        resolvedOrderBy = { field: orderBy.field, direction: QUERY_SORT_DIRECTIONS.has(orderBy.direction) ? orderBy.direction : "asc" };
+      }
+
+      let mCompiled;
+      try {
+        mCompiled = compileModelReport({
+          modelSql: compiledModel.sql,
+          modelParams: compiledModel.params,
+          dimensions: rDims,
+          measures: rMeasures,
+          filters: rFilters,
+          orderBy: resolvedOrderBy,
+          rowLimit,
+          offset,
+          pageSize,
+        });
+      } catch (err) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      try {
+        const key = cacheKey(req.params.sourceId, `model:${modelId}:${mCompiled.sql}`, mCompiled.params);
+        let rawRows = getCachedQuery(key)?.rows;
+        const cached = !!rawRows;
+        if (!rawRows) {
+          rawRows = await runQuery(secrets.connectionString, mCompiled.sql, mCompiled.params);
+          setCachedQuery(key, rawRows);
+        }
+        const { rows, hasMore } = paginateRows(rawRows, mCompiled.windowSize);
+        res.json({
+          columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation })),
+          rows,
+          hasMore,
+          sql: mCompiled.sql,
+          params: mCompiled.params,
+          cached,
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[sources] model query failed:", err.code || err.message);
+        res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+      }
+      return;
+    }
+
     const nodesById = new Map((branch?.nodes || []).map((n) => [n.id, n]));
     const node = nodesById.get(tableId);
     if (!node || node.type !== "tableNode") {
@@ -417,48 +534,17 @@ tablespaceRouter.post(
       return;
     }
 
-    // Every joinTableId is verified against a REAL relationship to the
-    // base table - the client only ever claims a table id, never the
-    // join columns themselves. Direct (1-hop, either direction) is tried
-    // first - unchanged from before, so every join that already worked
-    // still resolves exactly the same way. Only if that fails does a
-    // requested table fall back to the multi-hop forward (many-to-one)
-    // chain - see buildForwardJoinGraph's own comment for why that's
-    // safe and how it mirrors Power BI/Cube.dev. `joinedTableNames`
-    // dedupes hops shared by more than one requested join's chain (or a
-    // chain that happens to pass through another explicitly-requested
-    // table) so the same table is never joined into the FROM clause
-    // twice.
+    // Every joinTableId is verified against a REAL relationship to the base
+    // table (resolveJoins, shared with the Model compiler) - the client
+    // only ever claims a table id, never the join columns. Direct 1-hop
+    // first, then a forward many-to-one chain.
     const allTableNodes = (branch?.nodes || []).filter((n) => n.type === "tableNode");
-    const forwardGraph = buildForwardJoinGraph(node, allTableNodes);
-    const joinNodes = [];
-    const joinClauses = [];
-    const joinedTableNames = new Set();
-    for (const joinTableId of joinTableIds) {
-      const joinNode = nodesById.get(joinTableId);
-      if (!joinNode || joinNode.type !== "tableNode") {
-        res.status(400).json({ error: `Table ${joinTableId} not found.` });
-        return;
-      }
-      const direct = findJoinPath(node, joinNode);
-      const chain = direct
-        ? [{ tableName: joinNode.data.label, baseColumn: direct.baseColumn, joinColumn: direct.joinColumn, fromTableId: node.id }]
-        : chainTo(forwardGraph, nodesById, joinTableId);
-      if (!chain) {
-        res.status(400).json({
-          error: `"${joinNode.data?.label}" isn't reachable from "${node.data?.label}" through a direct or many-to-one relationship.`,
-        });
-        return;
-      }
-      for (const hop of chain) {
-        if (joinedTableNames.has(hop.tableName)) continue;
-        joinedTableNames.add(hop.tableName);
-        const fromTableName = hop.fromTableId === node.id ? node.data.label : nodesById.get(hop.fromTableId)?.data?.label;
-        joinClauses.push({ tableName: hop.tableName, fromTableName, baseColumn: hop.baseColumn, joinColumn: hop.joinColumn });
-        const hopNode = allTableNodes.find((n) => n.data?.label === hop.tableName);
-        if (hopNode) joinNodes.push(hopNode);
-      }
+    const jr = resolveJoins(node, joinTableIds, allTableNodes, nodesById);
+    if (jr.error) {
+      res.status(400).json({ error: jr.error });
+      return;
     }
+    const { joinClauses, joinNodes } = jr;
 
     // Dimensions/filters may reference the base table or any validated
     // join table; measures resolve against the base table ONLY (see
@@ -472,7 +558,7 @@ tablespaceRouter.post(
         if (!dim) continue;
         const col = (src.data?.columns || []).find((c) => c.id === dim.columnId);
         if (!col) continue;
-        return { id: dim.id, label: dim.label || col.name, columnName: col.name, tableName: src.data.label };
+        return { id: dim.id, label: dim.label || col.name, columnName: col.name, columnType: col.type, tableName: src.data.label };
       }
       return null;
     };
@@ -499,14 +585,15 @@ tablespaceRouter.post(
     //    either way. Omitted/equal to the base table id keeps today's
     //    exact behavior for every calculated measure saved before this
     //    existed.
-    // 2. `aggregation: "value"` (read a related column directly, no real
-    //    aggregation) is only valid when the forward graph can reach the
-    //    term's table at all - since that graph only ever follows
-    //    many-to-one edges, reachability there already IS the safety
-    //    check (no separate direction check needed - a `join_to_base`
-    //    first hop, or ANY "many" hop further along a chain, simply isn't
-    //    in this graph, so chainTo returns null and the term is rejected
-    //    the same way an unrelated table would be).
+    // 2. `aggregation: "value"` (read a column directly, no real
+    //    aggregation) is safe unconditionally on the base table itself
+    //    (it's the same row) and, cross-table, whenever the forward graph
+    //    can reach the term's table at all - since that graph only ever
+    //    follows many-to-one edges, reachability there already IS the
+    //    safety check (no separate direction check needed - a
+    //    `join_to_base` first hop, or ANY "many" hop further along a
+    //    chain, simply isn't in this graph, so chainTo returns null and
+    //    the term is rejected the same way an unrelated table would be).
     // 3. Every OTHER cross-table aggregation (count/sum/avg/min/max)
     //    stays exactly 1-hop, either direction, via findJoinPath -
     //    unchanged from before. Multi-hop AGGREGATION (as opposed to a
@@ -521,9 +608,27 @@ tablespaceRouter.post(
     // `tableName`/`chain`/`filters` on the resolved term are what
     // queryEngine.js's compileTermExpr() uses to decide whether it needs
     // the pre-aggregate-then-LEFT-JOIN treatment - see its own comment.
-    const resolveTerm = (term, visiting) => {
+    //
+    // Relationships + formula builder - a term now carries an explicit
+    // `type` ("column" | "constant" | "measure"); older stored terms
+    // (saved before this existed) never had one, so it's inferred the
+    // same way this route always distinguished a measure reference
+    // (`term.measureId !== undefined`) from a column term - identical
+    // behavior for every measure saved before this, no data migration.
+    // "constant" is new: a typed-in number, no table/column involved at
+    // all - just validated as finite and handed straight to
+    // compileTermExpr as a parameterized literal.
+    const resolveTerm = (term, visiting, depth) => {
       if (!term) return null;
-      if (term.measureId) return resolveMeasureAsTerm(term.measureId, visiting);
+      const type = term.type || (term.measureId !== undefined ? "measure" : "column");
+
+      if (type === "constant") {
+        return typeof term.value === "number" && Number.isFinite(term.value) ? { kind: "constant", value: term.value } : null;
+      }
+      if (type === "measure") {
+        return term.measureId ? resolveMeasureAsTerm(term.measureId, visiting, depth + 1) : null;
+      }
+
       if (!QUERY_TERM_AGGREGATIONS.has(term.aggregation)) return null;
 
       let termNode = node;
@@ -539,11 +644,9 @@ tablespaceRouter.post(
           if (!path) return null;
           chain = [{ tableName: termNode.data.label, baseColumn: path.baseColumn, joinColumn: path.joinColumn, fromTableId: node.id }];
         }
-      } else if (term.aggregation === "value") {
-        // "value" only means anything cross-table - a same-table term
-        // already reads the base table's own column directly.
-        return null;
       }
+      // "value" on the base table itself needs no chain/join at all -
+      // it's already that row's own column (see aggExpr/compileTermExpr).
 
       const termColumnsById =
         termNode === node ? baseColumnsById : new Map((termNode.data?.columns || []).map((c) => [c.id, c]));
@@ -565,6 +668,45 @@ tablespaceRouter.post(
         : null;
     };
 
+    // Bigger formulas - resolves a formula's flat token stream (value/op/
+    // paren, read left to right like a real formula bar) into the nested
+    // `{kind:"calculated", termA, termB, operator}` tree queryEngine.js
+    // already compiles - real operator precedence and real parentheses
+    // instead of the old flat left-to-right-only chain, via formulaExpr.js's
+    // parseFormula (kept separate so that pure parsing logic has its own
+    // unit tests, same as schemaDiff.js/schemaMerge.js). Every value token
+    // is resolved through resolveTerm FIRST, here, before parseFormula ever
+    // sees it - the only place a raw client id turns into a real
+    // column/table name - so the parser itself only ever sees already-
+    // validated nodes plus a fixed vocabulary of operator/paren symbols;
+    // there is still no path from client-supplied text to the SQL string.
+    // Shared by both a top-level calculated measure and one referenced AS a
+    // term (resolveMeasureAsTerm below).
+    const resolveFormula = (rawTokens, visiting, depth) => {
+      if (depth > MAX_EXPR_DEPTH) return null;
+      if (!Array.isArray(rawTokens) || rawTokens.length === 0 || rawTokens.length > MAX_FORMULA_TOKENS) return null;
+
+      const resolved = [];
+      for (const t of rawTokens) {
+        if (!t || typeof t !== "object") return null;
+        if (t.kind === "op") {
+          if (!QUERY_CALC_OPERATORS.has(t.value)) return null;
+          resolved.push(t);
+        } else if (t.kind === "paren") {
+          if (t.value !== "(" && t.value !== ")") return null;
+          resolved.push(t);
+        } else if (t.kind === "value") {
+          const valueNode = resolveTerm(t.term, visiting, depth);
+          if (!valueNode) return null;
+          resolved.push({ kind: "value", node: valueNode });
+        } else {
+          return null;
+        }
+      }
+
+      return parseFormula(resolved);
+    };
+
     // Post-4.4b - a calculated measure's term can reference ANOTHER
     // measure on this same table instead of aggregating a column
     // directly (e.g. "net earnings" built from "gross earnings", itself
@@ -576,17 +718,15 @@ tablespaceRouter.post(
     // resolution path - a measure appearing twice on its own path means
     // a cycle (A -> B -> A), rejected outright rather than infinitely
     // recursing or silently picking one expansion.
-    const resolveMeasureAsTerm = (measureId, visiting) => {
+    const resolveMeasureAsTerm = (measureId, visiting, depth) => {
+      if (depth > MAX_EXPR_DEPTH) return null;
       if (visiting.has(measureId)) return null;
       const measure = (baseSemanticModel.measures || []).find((m) => m.id === measureId);
       if (!measure) return null;
       const nextVisiting = new Set(visiting).add(measureId);
 
       if (measure.kind === "calculated") {
-        if (!QUERY_CALC_OPERATORS.has(measure.operator)) return null;
-        const termA = resolveTerm(measure.termA, nextVisiting);
-        const termB = resolveTerm(measure.termB, nextVisiting);
-        return termA && termB ? { kind: "calculated", operator: measure.operator, termA, termB } : null;
+        return resolveFormula(measure.tokens || legacyToTokens(measure), nextVisiting, depth);
       }
       if (!QUERY_AGGREGATIONS.has(measure.aggregation)) return null;
       if (measure.aggregation === "count") {
@@ -606,25 +746,17 @@ tablespaceRouter.post(
       }
 
       if (measure.kind === "calculated") {
-        if (!QUERY_CALC_OPERATORS.has(measure.operator)) {
-          unknown.push(id);
-          return null;
-        }
         const visiting = new Set([measure.id]);
-        const termA = resolveTerm(measure.termA, visiting);
-        const termB = resolveTerm(measure.termB, visiting);
-        if (!termA || !termB) {
+        const expr = resolveFormula(measure.tokens || legacyToTokens(measure), visiting, 0);
+        if (!expr) {
           unknown.push(id);
           return null;
         }
-        return {
-          id: measure.id,
-          label: measure.label || "Calculated",
-          kind: "calculated",
-          operator: measure.operator,
-          termA,
-          termB,
-        };
+        // expr is always a `{kind:"calculated", operator, termA, termB}`
+        // node (resolveFormula never returns a bare leaf - see its own
+        // comment) - queryEngine.js reads those three fields directly off
+        // the measure object, unchanged from before this existed.
+        return { id: measure.id, label: measure.label || "Calculated", ...expr };
       }
 
       if (!QUERY_AGGREGATIONS.has(measure.aggregation)) {
@@ -657,6 +789,43 @@ tablespaceRouter.post(
       return;
     }
 
+    // Slice 1 - apply a bucket to any resolved dimension the report asked
+    // to group by a time unit. Only valid on a date/timestamp column and
+    // only from the fixed unit set; anything else is a 400 rather than a
+    // silently-ignored option.
+    for (const [dimId, unit] of Object.entries(dimensionBuckets || {})) {
+      if (!unit) continue;
+      const dim = dimensions.find((d) => d && d.id === dimId);
+      if (!dim) {
+        res.status(400).json({ error: `Can't bucket unknown dimension "${dimId}".` });
+        return;
+      }
+      if (!QUERY_BUCKETS.has(unit)) {
+        res.status(400).json({ error: `Unsupported time grouping "${unit}".` });
+        return;
+      }
+      if (dim.columnType !== "date" && dim.columnType !== "timestamp") {
+        res.status(400).json({ error: `"${dim.label}" isn't a date column, so it can't be grouped by ${unit}.` });
+        return;
+      }
+      dim.bucket = unit;
+    }
+
+    // Slice 1 - a single sort key. `field` must be one of THIS query's own
+    // resolved dimension/measure ids (each is a real SELECT alias), so
+    // compileQuery can emit `ORDER BY "<alias>"` with no client string in
+    // the SQL. direction comes from a fixed set.
+    let resolvedOrderBy = null;
+    if (orderBy && orderBy.field) {
+      const sortableIds = new Set([...dimensions, ...measures].filter(Boolean).map((c) => c.id));
+      if (!sortableIds.has(orderBy.field)) {
+        res.status(400).json({ error: "Can't sort by a field that isn't in the report." });
+        return;
+      }
+      const direction = QUERY_SORT_DIRECTIONS.has(orderBy.direction) ? orderBy.direction : "asc";
+      resolvedOrderBy = { field: orderBy.field, direction };
+    }
+
     let compiled;
     try {
       compiled = compileQuery({
@@ -667,6 +836,8 @@ tablespaceRouter.post(
         joins: joinClauses,
         offset,
         pageSize,
+        orderBy: resolvedOrderBy,
+        rowLimit,
       });
     } catch (err) {
       res.status(400).json({ error: err.message });
@@ -685,7 +856,7 @@ tablespaceRouter.post(
         rawRows = await runQuery(secrets.connectionString, compiled.sql, compiled.params);
         setCachedQuery(key, rawRows);
       }
-      const { rows, hasMore } = paginateRows(rawRows, pageSize);
+      const { rows, hasMore } = paginateRows(rawRows, compiled.windowSize);
       res.json({
         columns: [...dimensions, ...measures].map((c) => ({ id: c.id, label: c.label })),
         rows,
@@ -699,6 +870,264 @@ tablespaceRouter.post(
       console.error("[sources] query failed:", err.code || err.message);
       res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
     }
+  }),
+);
+
+// Slice 4 - native SQL. No semantic-model resolution: the client sends raw
+// SELECT text with {{vars}}, resolveNativeVars turns those into bound $N
+// params, and runNativeQuery runs it inside a READ ONLY transaction
+// wrapped in `SELECT * FROM (<sql>) LIMIT/OFFSET` (see its comment for the
+// three safety layers). Same source-scoping and 30s result cache as the
+// semantic route.
+tablespaceRouter.post(
+  "/sources/:sourceId/query/native",
+  wrap(async (req, res) => {
+    const { sql, vars = {}, offset = 0, pageSize = DEFAULT_PAGE_SIZE } = req.body || {};
+    if (!sql || typeof sql !== "string" || !sql.trim()) {
+      res.status(400).json({ error: "sql is required." });
+      return;
+    }
+    if (!ALLOWED_PAGE_SIZES.includes(pageSize)) {
+      res.status(400).json({ error: `pageSize must be one of ${ALLOWED_PAGE_SIZES.join(", ")}.` });
+      return;
+    }
+    if (!Number.isInteger(offset) || offset < 0 || offset + pageSize > MAX_ROWS) {
+      res.status(400).json({ error: `offset must be a non-negative integer, and offset + pageSize can't exceed ${MAX_ROWS}.` });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+
+    const { sql: boundSql, params } = resolveNativeVars(sql, vars && typeof vars === "object" ? vars : {});
+    try {
+      const key = cacheKey(req.params.sourceId, `native:${boundSql}:${offset}:${pageSize}`, params);
+      let raw = getCachedQuery(key);
+      const cached = !!raw;
+      if (!raw) {
+        const out = await runNativeQuery(secrets.connectionString, boundSql, params, { offset, pageSize });
+        raw = { rows: out.rows, fields: out.fields.map((f) => f.name) };
+        setCachedQuery(key, raw);
+      }
+      const { rows, hasMore } = paginateRows(raw.rows, pageSize);
+      res.json({
+        columns: (raw.fields || []).map((name) => ({ id: name, label: name })),
+        rows,
+        hasMore,
+        sql: boundSql,
+        params,
+        cached,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] native query failed:", err.code || err.message);
+      // A user SQL mistake (syntax, unknown column, write in a read-only
+      // txn) is a 400 with the DB's own message - that's the feedback they
+      // need; it never contains the connection string.
+      res.status(400).json({ error: err.message || "Query failed." });
+    }
+  }),
+);
+
+// Slice 5 - preview a physical table's rows (the "Data" browse layer).
+// Read-only, hard row cap; just `SELECT * FROM "<table>"` wrapped by
+// runNativeQuery's own LIMIT/OFFSET.
+tablespaceRouter.post(
+  "/sources/:sourceId/preview",
+  wrap(async (req, res) => {
+    const { tableId, limit = 50 } = req.body || {};
+    if (!tableId) {
+      res.status(400).json({ error: "tableId is required." });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const node = (branch?.nodes || []).find((n) => n.id === tableId && n.type === "tableNode");
+    if (!node) {
+      res.status(404).json({ error: "Table not found." });
+      return;
+    }
+    const size = Math.max(1, Math.min(Number(limit) || 50, 200));
+    try {
+      const out = await runNativeQuery(secrets.connectionString, `SELECT * FROM "${String(node.data.label).replace(/"/g, '""')}"`, [], {
+        offset: 0,
+        pageSize: size,
+      });
+      res.json({
+        columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
+        rows: paginateRows(out.rows, size).rows,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] preview failed:", err.code || err.message);
+      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+    }
+  }),
+);
+
+// Slice 5 - run a Model and return its rows: the Model builder's live
+// preview (body carries the unsaved `model` shape) and the report
+// builder's "what columns does this model expose" describe (body carries
+// `modelId` + a small `limit`).
+tablespaceRouter.post(
+  "/sources/:sourceId/models/query",
+  wrap(async (req, res) => {
+    const { model: bodyModel, modelId, limit = 50 } = req.body || {};
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const model = modelId ? await store.getModel(req.params.sourceId, modelId) : bodyModel;
+    if (!model) {
+      res.status(400).json({ error: "A model or modelId is required." });
+      return;
+    }
+    const compiled = resolveModelSql(model, branch);
+    if (compiled.error) {
+      res.status(400).json({ error: compiled.error });
+      return;
+    }
+    const size = Math.max(1, Math.min(Number(limit) || 50, 200));
+    try {
+      const out = await runNativeQuery(secrets.connectionString, compiled.sql, compiled.params, { offset: 0, pageSize: size });
+      res.json({
+        columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
+        rows: paginateRows(out.rows, size).rows,
+        sql: compiled.sql,
+        params: compiled.params,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] model preview failed:", err.code || err.message);
+      res.status(400).json({ error: err.message || "Model query failed." });
+    }
+  }),
+);
+
+// --- Models (slice 5): saved curated datasets. Same source-scoped shape
+// as reports (create / full PUT / partial PATCH-meta / delete).
+tablespaceRouter.get(
+  "/sources/:sourceId/models",
+  wrap(async (req, res) => {
+    res.json(await store.listModels(req.params.sourceId));
+  }),
+);
+
+tablespaceRouter.get(
+  "/sources/:sourceId/models/:modelId",
+  wrap(async (req, res) => {
+    const model = await store.getModel(req.params.sourceId, req.params.modelId);
+    if (!model) {
+      res.status(404).json({ error: "Model not found." });
+      return;
+    }
+    res.json(model);
+  }),
+);
+
+function validateModelBody(b) {
+  if (!b.name || typeof b.name !== "string" || !b.name.trim()) return "name is required.";
+  if (b.kind === "sql") {
+    if (!b.sql || typeof b.sql !== "string" || !b.sql.trim()) return "sql is required for a SQL model.";
+  } else {
+    if (!b.baseTableId) return "A builder model needs a base table.";
+    if (!Array.isArray(b.columns) || b.columns.length === 0) return "A builder model needs at least one column.";
+  }
+  return null;
+}
+
+tablespaceRouter.post(
+  "/sources/:sourceId/models",
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const bad = validateModelBody(b);
+    if (bad) {
+      res.status(400).json({ error: bad });
+      return;
+    }
+    try {
+      const model = await store.createModel(req.params.sourceId, { ...b, name: b.name.trim() });
+      res.status(201).json(model);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A model named "${b.name.trim()}" already exists for this source.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.put(
+  "/sources/:sourceId/models/:modelId",
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const bad = validateModelBody(b);
+    if (bad) {
+      res.status(400).json({ error: bad });
+      return;
+    }
+    const model = await store.updateModel(req.params.sourceId, req.params.modelId, { ...b, name: b.name.trim() });
+    if (!model) {
+      res.status(404).json({ error: "Model not found." });
+      return;
+    }
+    res.json(model);
+  }),
+);
+
+tablespaceRouter.patch(
+  "/sources/:sourceId/models/:modelId",
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const patch = {};
+    if (b.name !== undefined) {
+      if (typeof b.name !== "string" || !b.name.trim()) {
+        res.status(400).json({ error: "name must be a non-empty string." });
+        return;
+      }
+      patch.name = b.name.trim();
+    }
+    if (b.collectionId !== undefined) patch.collectionId = b.collectionId === null ? null : Number(b.collectionId);
+    if (b.isFavorite !== undefined) patch.isFavorite = !!b.isFavorite;
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json({ error: "Nothing to update - send name, collectionId, and/or isFavorite." });
+      return;
+    }
+    try {
+      const model = await store.updateModelMeta(req.params.sourceId, req.params.modelId, patch);
+      if (!model) {
+        res.status(404).json({ error: "Model not found." });
+        return;
+      }
+      res.json(model);
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({ error: `A model named "${patch.name}" already exists for this source.` });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
+
+tablespaceRouter.delete(
+  "/sources/:sourceId/models/:modelId",
+  wrap(async (req, res) => {
+    const deleted = await store.deleteModel(req.params.sourceId, req.params.modelId);
+    if (!deleted) {
+      res.status(404).json({ error: "Model not found." });
+      return;
+    }
+    res.json({ success: true });
   }),
 );
 
@@ -730,30 +1159,45 @@ tablespaceRouter.get(
 tablespaceRouter.post(
   "/sources/:sourceId/reports",
   wrap(async (req, res) => {
-    const { name, tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize } = req.body || {};
-    if (!name || typeof name !== "string" || !name.trim()) {
+    const b = req.body || {};
+    if (!b.name || typeof b.name !== "string" || !b.name.trim()) {
       res.status(400).json({ error: "name is required." });
       return;
     }
-    if (!tableId) {
-      res.status(400).json({ error: "tableId is required." });
+    const isSql = b.kind === "sql";
+    // Slice 4/5 - a semantic report needs a base table OR a model; a SQL
+    // report needs its SQL text instead.
+    if (!isSql && !b.tableId && !b.modelId) {
+      res.status(400).json({ error: "tableId or modelId is required." });
+      return;
+    }
+    if (isSql && (!b.sql || typeof b.sql !== "string" || !b.sql.trim())) {
+      res.status(400).json({ error: "sql is required for a SQL report." });
       return;
     }
     try {
       const report = await store.createReport(req.params.sourceId, {
-        name: name.trim(),
-        tableId,
-        joinTableIds,
-        dimensionIds,
-        measureIds,
-        filters,
-        chartType,
-        pageSize,
+        name: b.name.trim(),
+        kind: isSql ? "sql" : "semantic",
+        tableId: b.modelId ? null : b.tableId,
+        modelId: b.modelId ?? null,
+        joinTableIds: b.joinTableIds,
+        dimensionIds: b.dimensionIds,
+        measureIds: b.measureIds,
+        filters: b.filters,
+        chartType: b.chartType,
+        pageSize: b.pageSize,
+        dimensionBuckets: b.dimensionBuckets,
+        orderBy: b.orderBy,
+        rowLimit: b.rowLimit,
+        sql: b.sql,
+        sqlVars: b.sqlVars,
+        collectionId: b.collectionId,
       });
       res.status(201).json(report);
     } catch (err) {
       if (err.code === "23505") {
-        res.status(409).json({ error: `A report named "${name.trim()}" already exists for this source.` });
+        res.status(409).json({ error: `A report named "${b.name.trim()}" already exists for this source.` });
         return;
       }
       throw err;
@@ -761,16 +1205,29 @@ tablespaceRouter.post(
   }),
 );
 
+// Slice 4 - the "organisation" mutation: rename, move to a collection
+// (collectionId, null = unfiled), and/or star. Any subset; distinct from
+// PUT's full query-definition replace.
 tablespaceRouter.patch(
   "/sources/:sourceId/reports/:reportId",
   wrap(async (req, res) => {
-    const { name } = req.body || {};
-    if (!name || typeof name !== "string" || !name.trim()) {
-      res.status(400).json({ error: "name is required." });
+    const b = req.body || {};
+    const patch = {};
+    if (b.name !== undefined) {
+      if (typeof b.name !== "string" || !b.name.trim()) {
+        res.status(400).json({ error: "name must be a non-empty string." });
+        return;
+      }
+      patch.name = b.name.trim();
+    }
+    if (b.collectionId !== undefined) patch.collectionId = b.collectionId === null ? null : Number(b.collectionId);
+    if (b.isFavorite !== undefined) patch.isFavorite = !!b.isFavorite;
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json({ error: "Nothing to update - send name, collectionId, and/or isFavorite." });
       return;
     }
     try {
-      const report = await store.renameReport(req.params.sourceId, req.params.reportId, name.trim());
+      const report = await store.updateReportMeta(req.params.sourceId, req.params.reportId, patch);
       if (!report) {
         res.status(404).json({ error: "Report not found." });
         return;
@@ -778,7 +1235,7 @@ tablespaceRouter.patch(
       res.json(report);
     } catch (err) {
       if (err.code === "23505") {
-        res.status(409).json({ error: `A report named "${name.trim()}" already exists for this source.` });
+        res.status(409).json({ error: `A report named "${patch.name}" already exists for this source.` });
         return;
       }
       throw err;
@@ -793,19 +1250,31 @@ tablespaceRouter.patch(
 tablespaceRouter.put(
   "/sources/:sourceId/reports/:reportId",
   wrap(async (req, res) => {
-    const { tableId, joinTableIds, dimensionIds, measureIds, filters, chartType, pageSize } = req.body || {};
-    if (!tableId) {
-      res.status(400).json({ error: "tableId is required." });
+    const b = req.body || {};
+    const isSql = b.kind === "sql";
+    if (!isSql && !b.tableId && !b.modelId) {
+      res.status(400).json({ error: "tableId or modelId is required." });
+      return;
+    }
+    if (isSql && (!b.sql || typeof b.sql !== "string" || !b.sql.trim())) {
+      res.status(400).json({ error: "sql is required for a SQL report." });
       return;
     }
     const report = await store.updateReport(req.params.sourceId, req.params.reportId, {
-      tableId,
-      joinTableIds,
-      dimensionIds,
-      measureIds,
-      filters,
-      chartType,
-      pageSize,
+      kind: isSql ? "sql" : "semantic",
+      tableId: b.modelId ? null : b.tableId,
+      modelId: b.modelId ?? null,
+      joinTableIds: b.joinTableIds,
+      dimensionIds: b.dimensionIds,
+      measureIds: b.measureIds,
+      filters: b.filters,
+      chartType: b.chartType,
+      pageSize: b.pageSize,
+      dimensionBuckets: b.dimensionBuckets,
+      orderBy: b.orderBy,
+      rowLimit: b.rowLimit,
+      sql: b.sql,
+      sqlVars: b.sqlVars,
     });
     if (!report) {
       res.status(404).json({ error: "Report not found." });
@@ -856,13 +1325,20 @@ tablespaceRouter.get(
 tablespaceRouter.post(
   "/sources/:sourceId/dashboards",
   wrap(async (req, res) => {
-    const { name, reportIds } = req.body || {};
+    const { name, reportIds, layout, textTiles, parameters, collectionId } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       res.status(400).json({ error: "name is required." });
       return;
     }
     try {
-      const dashboard = await store.createDashboard(req.params.sourceId, { name: name.trim(), reportIds });
+      const dashboard = await store.createDashboard(req.params.sourceId, {
+        name: name.trim(),
+        reportIds,
+        layout,
+        textTiles,
+        parameters,
+        collectionId,
+      });
       res.status(201).json(dashboard);
     } catch (err) {
       if (err.code === "23505") {
@@ -874,16 +1350,28 @@ tablespaceRouter.post(
   }),
 );
 
+// Slice 4 - rename / move to a collection / star (any subset), same shape
+// as the reports PATCH.
 tablespaceRouter.patch(
   "/sources/:sourceId/dashboards/:dashboardId",
   wrap(async (req, res) => {
-    const { name } = req.body || {};
-    if (!name || typeof name !== "string" || !name.trim()) {
-      res.status(400).json({ error: "name is required." });
+    const b = req.body || {};
+    const patch = {};
+    if (b.name !== undefined) {
+      if (typeof b.name !== "string" || !b.name.trim()) {
+        res.status(400).json({ error: "name must be a non-empty string." });
+        return;
+      }
+      patch.name = b.name.trim();
+    }
+    if (b.collectionId !== undefined) patch.collectionId = b.collectionId === null ? null : Number(b.collectionId);
+    if (b.isFavorite !== undefined) patch.isFavorite = !!b.isFavorite;
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json({ error: "Nothing to update - send name, collectionId, and/or isFavorite." });
       return;
     }
     try {
-      const dashboard = await store.renameDashboard(req.params.sourceId, req.params.dashboardId, name.trim());
+      const dashboard = await store.updateDashboardMeta(req.params.sourceId, req.params.dashboardId, patch);
       if (!dashboard) {
         res.status(404).json({ error: "Dashboard not found." });
         return;
@@ -891,7 +1379,7 @@ tablespaceRouter.patch(
       res.json(dashboard);
     } catch (err) {
       if (err.code === "23505") {
-        res.status(409).json({ error: `A dashboard named "${name.trim()}" already exists for this source.` });
+        res.status(409).json({ error: `A dashboard named "${patch.name}" already exists for this source.` });
         return;
       }
       throw err;
@@ -899,15 +1387,79 @@ tablespaceRouter.patch(
   }),
 );
 
+// --- Collections (slice 4): source-scoped folders for reports + dashboards.
+tablespaceRouter.get(
+  "/sources/:sourceId/collections",
+  wrap(async (req, res) => {
+    res.json(await store.listCollections(req.params.sourceId));
+  }),
+);
+
+tablespaceRouter.post(
+  "/sources/:sourceId/collections",
+  wrap(async (req, res) => {
+    const { name, parentId } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    const collection = await store.createCollection(req.params.sourceId, {
+      name: name.trim(),
+      parentId: parentId ?? null,
+    });
+    res.status(201).json(collection);
+  }),
+);
+
+tablespaceRouter.patch(
+  "/sources/:sourceId/collections/:collectionId",
+  wrap(async (req, res) => {
+    const { name } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name is required." });
+      return;
+    }
+    const collection = await store.renameCollection(req.params.sourceId, req.params.collectionId, name.trim());
+    if (!collection) {
+      res.status(404).json({ error: "Collection not found." });
+      return;
+    }
+    res.json(collection);
+  }),
+);
+
+tablespaceRouter.delete(
+  "/sources/:sourceId/collections/:collectionId",
+  wrap(async (req, res) => {
+    const deleted = await store.deleteCollection(req.params.sourceId, req.params.collectionId);
+    if (!deleted) {
+      res.status(404).json({ error: "Collection not found." });
+      return;
+    }
+    res.json({ success: true });
+  }),
+);
+
 tablespaceRouter.put(
   "/sources/:sourceId/dashboards/:dashboardId",
   wrap(async (req, res) => {
-    const { reportIds } = req.body || {};
-    if (!Array.isArray(reportIds)) {
-      res.status(400).json({ error: "reportIds must be an array." });
+    // Slice 3 - partial: any subset of membership / grid layout / text
+    // tiles / filter params. Each, if present, must be an array.
+    const body = req.body || {};
+    const patch = {};
+    for (const key of ["reportIds", "layout", "textTiles", "parameters"]) {
+      if (body[key] === undefined) continue;
+      if (!Array.isArray(body[key])) {
+        res.status(400).json({ error: `${key} must be an array.` });
+        return;
+      }
+      patch[key] = body[key];
+    }
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json({ error: "Nothing to update - send reportIds, layout, textTiles, and/or parameters." });
       return;
     }
-    const dashboard = await store.updateDashboardReports(req.params.sourceId, req.params.dashboardId, reportIds);
+    const dashboard = await store.updateDashboard(req.params.sourceId, req.params.dashboardId, patch);
     if (!dashboard) {
       res.status(404).json({ error: "Dashboard not found." });
       return;

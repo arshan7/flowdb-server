@@ -22,7 +22,7 @@ export function describeIntrospectError(err) {
     return "Connection timed out - the host may be unreachable from this server (check security groups/firewall rules if this is a cloud database).";
   }
   if (CERT_ERROR_CODES.has(err.code)) {
-    return "TLS certificate verification failed unexpectedly - this shouldn't happen with the current SSL handling. Please report this.";
+    return "Couldn't verify the database's TLS certificate against a trusted CA. If it uses a private or self-signed certificate (Aiven, AWS RDS, self-hosted), use ?sslmode=require - that keeps the connection encrypted without requiring a publicly-trusted CA.";
   }
   if (/does not support SSL/i.test(err.message || "")) {
     return "That server doesn't support SSL connections - add ?sslmode=disable to the connection string if this is a local/trusted database.";

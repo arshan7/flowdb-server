@@ -29,6 +29,50 @@ export function resolveSsl(connectionString) {
   return { rejectUnauthorized: false };
 }
 
+// resolveSsl decides the ssl config, but handing pg a connection string
+// that STILL carries `sslmode=` undoes that: pg-connection-string parses the
+// string's own sslmode into an ssl object and Object.assigns it OVER the
+// `ssl` option (pg's ConnectionParameters), and it reads require/verify-ca
+// as full verify-full - so `?sslmode=require` against a private-CA host
+// (Aiven, AWS RDS) throws SELF_SIGNED_CERT_IN_CHAIN even though resolveSsl
+// asked for {rejectUnauthorized:false}. Strip sslmode from the string and
+// pass the ssl config separately so the one resolveSsl chose is the one that
+// takes effect. Keyword-form strings ("host=... sslmode=...") aren't URLs
+// and aren't subject to that override, so leave them untouched.
+export function splitSsl(connectionString) {
+  const ssl = resolveSsl(connectionString);
+  try {
+    const u = new URL(connectionString);
+    u.searchParams.delete("sslmode");
+    return { connectionString: u.toString(), ssl };
+  } catch {
+    return { connectionString, ssl };
+  }
+}
+
+// node-postgres has no equivalent of libpq's default sslmode=prefer - try
+// SSL, then quietly fall back to a plaintext connection if the server
+// refuses it. It just errors instead. This is the one pg error that means
+// exactly "server refused SSL outright" (a bare Error with no .code, unlike
+// the SQLSTATE-carrying auth/permission errors or the tagged cert errors),
+// so it's the one case where retrying without SSL is the right move rather
+// than a surprise. Public/LAN Postgres (the EBI RNAcentral demo DB, plain
+// `postgres` containers, dev boxes) commonly has SSL off entirely.
+export function isSslRefusedError(err) {
+  return !err?.code && /does not support SSL/i.test(err?.message || "");
+}
+
+// ...but only fall back when the connection string didn't explicitly demand
+// encryption. Mirrors libpq: no sslmode (the default) and prefer/allow fall
+// back to plaintext; require/verify-ca/verify-full mean "encryption is
+// mandatory", so a refusal there has to stay a hard error rather than be
+// silently downgraded.
+export function sslFallbackAllowed(connectionString) {
+  const m = connectionString.match(/[?&]sslmode=([^&]+)/i);
+  const mode = m ? decodeURIComponent(m[1]).toLowerCase() : null;
+  return mode === null || mode === "prefer" || mode === "allow";
+}
+
 // Scoped to the lifetime of one request, then torn down - never reused
 // across requests, so this isn't the kind of persistent credential-holding
 // pool the "no pooling" principle is actually about. A single pg.Client
@@ -43,17 +87,30 @@ export function resolveSsl(connectionString) {
 // like on paper - see COLUMNS/FOREIGN_KEYS below for the bigger remaining
 // win).
 async function withClient(connectionString, fn) {
-  const pool = new pg.Pool({
-    connectionString,
-    ssl: resolveSsl(connectionString),
-    connectionTimeoutMillis: 10_000,
-    query_timeout: 20_000,
-    max: 8,
-  });
+  const { connectionString: cleanUrl, ssl } = splitSsl(connectionString);
+  const open = (sslConfig) =>
+    new pg.Pool({
+      connectionString: cleanUrl,
+      ssl: sslConfig,
+      connectionTimeoutMillis: 10_000,
+      query_timeout: 20_000,
+      max: 8,
+    });
+  const run = async (pool) => {
+    try {
+      return await fn(pool);
+    } finally {
+      await pool.end();
+    }
+  };
+
   try {
-    return await fn(pool);
-  } finally {
-    await pool.end();
+    return await run(open(ssl));
+  } catch (err) {
+    // sslFallbackAllowed reads the ORIGINAL string - cleanUrl no longer has
+    // sslmode to check.
+    if (!isSslRefusedError(err) || !sslFallbackAllowed(connectionString)) throw err;
+    return run(open(false));
   }
 }
 
@@ -218,7 +275,18 @@ const ENUMS_QUERY = `
 // separate concern, see toTablespaceSchema.js.
 export async function introspectPostgres(connectionString, schema = "public") {
   return withClient(connectionString, async (client) => {
-    const [tables, columns, primaryKeys, foreignKeys, uniqueConstraints, checkConstraints, indexes, enums] =
+    // pg_catalog is world-readable on a stock Postgres, but some hardened
+    // shared/public instances (e.g. EBI's RNAcentral) revoke SELECT on
+    // pg_enum from unprivileged roles. Enums are the most skippable part of
+    // a schema import, so a permission wall on this one query shouldn't sink
+    // the whole introspection - treat it as "no enums" and carry on. Only
+    // 42501 (insufficient_privilege); anything else still means the
+    // connection is compromised and must propagate.
+    const enums = client.query(ENUMS_QUERY, [schema]).catch((err) => {
+      if (err.code === "42501") return { rows: [] };
+      throw err;
+    });
+    const [tables, columns, primaryKeys, foreignKeys, uniqueConstraints, checkConstraints, indexes, enumsResult] =
       await Promise.all([
         client.query(TABLES_QUERY, [schema, ...MIGRATION_TOOL_TABLES]),
         client.query(COLUMNS_QUERY, [schema]),
@@ -227,7 +295,7 @@ export async function introspectPostgres(connectionString, schema = "public") {
         client.query(UNIQUE_CONSTRAINTS_QUERY, [schema]),
         client.query(CHECK_CONSTRAINTS_QUERY, [schema]),
         client.query(INDEXES_QUERY, [schema]),
-        client.query(ENUMS_QUERY, [schema]),
+        enums,
       ]);
 
     return {
@@ -238,7 +306,7 @@ export async function introspectPostgres(connectionString, schema = "public") {
       uniqueConstraints: uniqueConstraints.rows,
       checkConstraints: checkConstraints.rows,
       indexes: indexes.rows,
-      enums: enums.rows,
+      enums: enumsResult.rows,
     };
   });
 }
