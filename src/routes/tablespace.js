@@ -1080,7 +1080,27 @@ tablespaceRouter.post(
         : null;
     };
 
-    const measures = measureIds.map((id) => {
+    // A measure entry is a bare id string, OR { id, filters:[{dimensionId,
+    // operator, value}] } - a per-measure "only where …" condition,
+    // compiled as an aggregate FILTER by queryEngine.js. Each condition
+    // resolves against a real dimension the same way a report filter does
+    // (findDimension), so a joined table's column is allowed and a raw
+    // client string never reaches the SQL. Ignored for a calculated
+    // measure (FILTER can't wrap an arbitrary two-aggregate expression).
+    const resolveMeasureFilters = (rawList) => {
+      const out = [];
+      for (const f of rawList || []) {
+        const dim = findDimension(f?.dimensionId);
+        if (!dim || !QUERY_OPERATORS.has(f.operator)) return null;
+        out.push({ columnName: dim.columnName, tableName: dim.tableName, operator: f.operator, value: f.value });
+      }
+      return out;
+    };
+
+    let badMeasureFilter = false;
+    const measures = measureIds.map((entry) => {
+      const id = typeof entry === "string" ? entry : entry?.id;
+      const rawMFilters = entry && typeof entry === "object" && Array.isArray(entry.filters) ? entry.filters : [];
       const measure = (baseSemanticModel.measures || []).find((m) => m.id === id);
       if (!measure) {
         unknown.push(id);
@@ -1105,16 +1125,31 @@ tablespaceRouter.post(
         unknown.push(id);
         return null;
       }
+      const mFilters = resolveMeasureFilters(rawMFilters);
+      if (mFilters === null) {
+        badMeasureFilter = true;
+        return null;
+      }
       if (measure.aggregation === "count") {
-        return { id: measure.id, label: measure.label || "Count", aggregation: "count", columnName: null };
+        return { id: measure.id, label: measure.label || "Count", aggregation: "count", columnName: null, filters: mFilters };
       }
       const col = baseColumnsById.get(measure.columnId);
       if (!col) {
         unknown.push(id);
         return null;
       }
-      return { id: measure.id, label: measure.label || col.name, aggregation: measure.aggregation, columnName: col.name };
+      return {
+        id: measure.id,
+        label: measure.label || col.name,
+        aggregation: measure.aggregation,
+        columnName: col.name,
+        filters: mFilters,
+      };
     });
+    if (badMeasureFilter) {
+      res.status(400).json({ error: "Invalid measure condition." });
+      return;
+    }
 
     const resolvedFilters = [];
     for (const f of filters) {

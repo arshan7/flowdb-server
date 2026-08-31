@@ -21,6 +21,31 @@ test("raw dimension - no bucket, grouped on the plain column", () => {
   assert.doesNotMatch(sql, /DATE_TRUNC/);
 });
 
+test("per-measure conditions compile to an aggregate FILTER, honouring a joined table", () => {
+  const { sql, params } = compileQuery({
+    tableName: "orders",
+    dimensions: [dim("d1", "status")],
+    measures: [
+      { id: "m1", aggregation: "sum", columnName: "total" },
+      {
+        id: "m2",
+        aggregation: "sum",
+        columnName: "total",
+        filters: [
+          { columnName: "status", operator: "eq", value: "paid" },
+          { tableName: "customers", columnName: "country", operator: "in", value: ["US", "CA"] },
+        ],
+      },
+    ],
+  });
+  assert.match(sql, /SUM\("orders"\."total"\) AS "m1"/);
+  assert.match(
+    sql,
+    /SUM\("orders"\."total"\) FILTER \(WHERE "orders"\."status" = \$1 AND "customers"\."country"::text = ANY\(\$2\)\) AS "m2"/,
+  );
+  assert.deepEqual(params.slice(0, 2), ["paid", ["US", "CA"]]);
+});
+
 test("month bucket - DATE_TRUNC in both SELECT and GROUP BY, same expression", () => {
   const { sql } = compileQuery({
     tableName: "orders",

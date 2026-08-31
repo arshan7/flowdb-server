@@ -325,9 +325,12 @@ export function compileQuery({
         // filter path uses; values are bound params. Pushed here while
         // selectParts is still building - fine, since each $N is computed
         // right after its own push (the cross-table term filters above
-        // already rely on the same ordering).
+        // already rely on the same ordering). A condition on the semantic
+        // path can name a JOINED table's column, so honour its own
+        // `tableName`; the model/direct paths don't set one and fall back
+        // to the query's single base table.
         const mfParts = (measure.filters || []).map((f) =>
-          compileFilterCondition(tableName, f.columnName, f.operator, f.value, params),
+          compileFilterCondition(f.tableName || tableName, f.columnName, f.operator, f.value, params),
         );
         if (mfParts.length) expr += ` FILTER (WHERE ${mfParts.join(" AND ")})`;
       }
