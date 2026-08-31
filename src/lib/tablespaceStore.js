@@ -627,23 +627,28 @@ export async function getOwnedModel(sourceId, reportId) {
   return rows[0] || null;
 }
 
-// Create-or-replace the Model a report shaped inline. `spec` is
-// { baseTableId, joins, columns, filters }; `reportName` names it on
-// CREATE only (an existing one keeps whatever it was renamed to in the
-// gallery). Returns the model id.
+// Create-or-replace the Model a report shaped inline. `spec` is a builder
+// shape { baseTableId, joins, columns, filters } or a SQL shape
+// { kind:"sql", sql, sqlVars }. `reportName` names it on CREATE only (an
+// existing one keeps whatever it was renamed to in the gallery). Returns
+// the model id.
 export async function upsertOwnedModel(sourceId, reportId, spec, reportName) {
   const existing = await getOwnedModel(sourceId, reportId);
-  const baseTableId = spec.baseTableId ?? null;
-  const joins = toJson(spec.joins || []);
-  const columns = toJson(spec.columns || []);
-  const filters = toJson(spec.filters || []);
+  const isSql = spec.kind === "sql";
+  const kind = isSql ? "sql" : "builder";
+  const baseTableId = isSql ? null : (spec.baseTableId ?? null);
+  const joins = toJson(isSql ? [] : spec.joins || []);
+  const columns = toJson(isSql ? [] : spec.columns || []);
+  const filters = toJson(isSql ? [] : spec.filters || []);
+  const sql = isSql ? (spec.sql ?? "") : null;
+  const sqlVars = toJson(isSql ? spec.sqlVars || [] : []);
   if (existing) {
     await query(
       `UPDATE tablespace_models
-       SET kind = 'builder', base_table_id = $3, joins = $4, columns = $5, filters = $6,
-           sql = NULL, sql_vars = '[]', updated_at = now()
+       SET kind = $3, base_table_id = $4, joins = $5, columns = $6, filters = $7,
+           sql = $8, sql_vars = $9, updated_at = now()
        WHERE id = $1 AND source_id = $2`,
-      [existing.id, sourceId, baseTableId, joins, columns, filters],
+      [existing.id, sourceId, kind, baseTableId, joins, columns, filters, sql, sqlVars],
     );
     return existing.id;
   }
@@ -651,9 +656,9 @@ export async function upsertOwnedModel(sourceId, reportId, spec, reportName) {
   const { rows } = await query(
     `INSERT INTO tablespace_models
        (source_id, name, kind, base_table_id, joins, columns, filters, sql, sql_vars, owner_report_id)
-     VALUES ($1, $2, 'builder', $3, $4, $5, $6, NULL, '[]', $7)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING id`,
-    [sourceId, name, baseTableId, joins, columns, filters, reportId],
+    [sourceId, name, kind, baseTableId, joins, columns, filters, sql, sqlVars, reportId],
   );
   return rows[0].id;
 }

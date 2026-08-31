@@ -215,21 +215,22 @@ const MAX_EXPR_DEPTH = 6;
 // report, and outlives it. Its columns/joins are soft references validated
 // at query time by resolveModelSql, same as any Model's.
 function isDatasetSpec(d) {
-  return !!d && typeof d === "object" && !!d.baseTableId && Array.isArray(d.columns) && d.columns.length > 0;
+  if (!d || typeof d !== "object") return false;
+  if (d.kind === "sql") return typeof d.sql === "string" && d.sql.trim().length > 0;
+  return !!d.baseTableId && Array.isArray(d.columns) && d.columns.length > 0;
 }
 async function syncOwnedDataset(sourceId, reportId, dataset, reportName) {
   if (isDatasetSpec(dataset)) {
-    return store.upsertOwnedModel(
-      sourceId,
-      reportId,
-      {
-        baseTableId: dataset.baseTableId,
-        joins: Array.isArray(dataset.joins) ? dataset.joins : [],
-        columns: dataset.columns,
-        filters: Array.isArray(dataset.filters) ? dataset.filters : [],
-      },
-      reportName,
-    );
+    const spec =
+      dataset.kind === "sql"
+        ? { kind: "sql", sql: dataset.sql, sqlVars: Array.isArray(dataset.sqlVars) ? dataset.sqlVars : [] }
+        : {
+            baseTableId: dataset.baseTableId,
+            joins: Array.isArray(dataset.joins) ? dataset.joins : [],
+            columns: dataset.columns,
+            filters: Array.isArray(dataset.filters) ? dataset.filters : [],
+          };
+    return store.upsertOwnedModel(sourceId, reportId, spec, reportName);
   }
   await store.releaseOwnedModel(sourceId, reportId);
   return null;
@@ -567,16 +568,23 @@ tablespaceRouter.post(
         }
       } else {
         if (!isDatasetSpec(dataset)) {
-          res.status(400).json({ error: "A dataset needs a base table and at least one column." });
+          res.status(400).json({ error: "A dataset needs a base table and a column, or some SQL." });
           return;
         }
-        model = {
-          kind: "builder",
-          baseTableId: dataset.baseTableId,
-          joins: Array.isArray(dataset.joins) ? dataset.joins : [],
-          columns: dataset.columns,
-          filters: Array.isArray(dataset.filters) ? dataset.filters : [],
-        };
+        model =
+          dataset.kind === "sql"
+            ? {
+                kind: "sql",
+                sql: dataset.sql,
+                sqlVars: Array.isArray(dataset.sqlVars) ? dataset.sqlVars : [],
+              }
+            : {
+                kind: "builder",
+                baseTableId: dataset.baseTableId,
+                joins: Array.isArray(dataset.joins) ? dataset.joins : [],
+                columns: dataset.columns,
+                filters: Array.isArray(dataset.filters) ? dataset.filters : [],
+              };
       }
       const compiledModel = resolveModelSql(model, branch, secrets.schema ?? null);
       if (compiledModel.error) {
