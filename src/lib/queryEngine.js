@@ -117,8 +117,12 @@ export function compileFilterCondition(tableName, columnName, operator, value, p
   if (operator === "isnull") return `${colExpr} IS NULL`;
   if (operator === "notnull") return `${colExpr} IS NOT NULL`;
   if (operator === "in") {
-    params.push(value);
-    return `${colExpr} = ANY($${params.length})`;
+    // "is any of" - set membership, one parameterized array. Compared as
+    // text on both sides so a mixed list ("7, 14, 18" against an int
+    // column, or codes against an enum) just works without the caller
+    // having to know the column's type; `7::text = ANY(ARRAY['7'])` holds.
+    params.push((Array.isArray(value) ? value : [value]).map((v) => String(v)));
+    return `${colExpr}::text = ANY($${params.length})`;
   }
   params.push(operator === "contains" ? `%${value}%` : value);
   return `${colExpr} ${OPERATORS[operator]} $${params.length}`;

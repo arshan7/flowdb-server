@@ -198,6 +198,17 @@ test("compileFilterCondition - value operators still bind $N in order", () => {
   assert.deepEqual(params, ["paid", "%ann%"]);
 });
 
+test("compileFilterCondition - 'in' binds one stringified array, compared as text", () => {
+  const params = [];
+  assert.equal(
+    compileFilterCondition("orders", "status", "in", ["paid", "shipped"], params),
+    '"orders"."status"::text = ANY($1)',
+  );
+  // a bare scalar and numeric codes both normalise to a string array
+  assert.equal(compileFilterCondition("bookings", "state", "in", 7, params), '"bookings"."state"::text = ANY($2)');
+  assert.deepEqual(params, [["paid", "shipped"], ["7"]]);
+});
+
 test("bucket + sort + limit + distinct compose in one query", () => {
   const { sql, windowSize } = compileQuery({
     tableName: "orders",
