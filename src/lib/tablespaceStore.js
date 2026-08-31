@@ -270,7 +270,7 @@ const REPORT_COLUMNS = `
   dimension_buckets AS "dimensionBuckets", order_by AS "orderBy", row_limit AS "rowLimit",
   kind, sql, sql_vars AS "sqlVars",
   collection_id AS "collectionId", is_favorite AS "isFavorite", model_id AS "modelId",
-  viz,
+  viz, segments,
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
@@ -303,8 +303,8 @@ export async function createReport(sourceId, r) {
   const { rows } = await query(
     `INSERT INTO tablespace_reports
        (source_id, name, table_id, join_table_ids, dimension_ids, measure_ids, filters, chart_type, page_size,
-        dimension_buckets, order_by, row_limit, kind, sql, sql_vars, collection_id, model_id, viz)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        dimension_buckets, order_by, row_limit, kind, sql, sql_vars, collection_id, model_id, viz, segments)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
      RETURNING ${REPORT_COLUMNS}`,
     [
       sourceId,
@@ -325,6 +325,7 @@ export async function createReport(sourceId, r) {
       r.collectionId ?? null,
       r.modelId ?? null,
       toViz(r.viz),
+      toJson(r.segments || []),
     ],
   );
   return rows[0];
@@ -348,7 +349,7 @@ export async function updateReport(sourceId, reportId, r) {
      SET table_id = $3, join_table_ids = $4, dimension_ids = $5, measure_ids = $6,
          filters = $7, chart_type = $8, page_size = $9,
          dimension_buckets = $10, order_by = $11, row_limit = $12,
-         kind = $13, sql = $14, sql_vars = $15, model_id = $16, viz = $17, updated_at = now()
+         kind = $13, sql = $14, sql_vars = $15, model_id = $16, viz = $17, segments = $18, updated_at = now()
      WHERE id = $1 AND source_id = $2 RETURNING ${REPORT_COLUMNS}`,
     [
       reportId,
@@ -368,6 +369,7 @@ export async function updateReport(sourceId, reportId, r) {
       toJson(r.sqlVars || []),
       r.modelId ?? null,
       toViz(r.viz),
+      toJson(r.segments || []),
     ],
   );
   return rows[0] || null;

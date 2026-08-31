@@ -95,11 +95,16 @@ export function compileModel(spec) {
       ? `${compileScalarExpr(c.tree, params)} AS ${quoteIdent(c.alias)}`
       : `${quoteQualified(c.tableName, c.columnName)} AS ${quoteIdent(c.alias)}`,
   );
-  const joinParts = (spec.joinClauses || []).map(
-    (j) =>
-      `JOIN ${quoteTable(j.tableSchema, j.tableName)} ON ` +
-      `${quoteQualified(j.fromTableName || spec.baseTableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
-  );
+  const joinParts = (spec.joinClauses || []).map((j) => {
+    const from = j.fromTableName || spec.baseTableName;
+    // `pairs` (a composite/multi-key join) AND-s several column equalities;
+    // a plain FK join carries a single baseColumn/joinColumn instead.
+    const onPairs = Array.isArray(j.pairs) && j.pairs.length ? j.pairs : [{ baseColumn: j.baseColumn, joinColumn: j.joinColumn }];
+    const on = onPairs
+      .map((p) => `${quoteQualified(from, p.baseColumn)} = ${quoteQualified(j.tableName, p.joinColumn)}`)
+      .join(" AND ");
+    return `JOIN ${quoteTable(j.tableSchema, j.tableName)} ON ${on}`;
+  });
   const whereParts = (spec.filters || []).map((f) =>
     compileFilterCondition(f.tableName, f.columnName, f.operator, f.value, params),
   );

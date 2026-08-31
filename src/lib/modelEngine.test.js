@@ -25,6 +25,29 @@ test("compileModel builder - aliased SELECT + JOIN + WHERE, no aggregation", () 
   assert.deepEqual(columns, ["status", "total", "customer"]);
 });
 
+test("compileModel builder - multi-key join AND-s every column pair", () => {
+  const { sql } = compileModel({
+    kind: "builder",
+    baseTableName: "package_movement",
+    joinClauses: [
+      {
+        tableName: "pms",
+        fromTableName: "package_movement",
+        pairs: [
+          { baseColumn: "package_id", joinColumn: "package_id" },
+          { baseColumn: "member_pt_id", joinColumn: "member_pt_id" },
+        ],
+      },
+    ],
+    columns: [{ tableName: "pms", columnName: "rate", alias: "rate" }],
+    filters: [],
+  });
+  assert.match(
+    sql,
+    /JOIN "pms" ON "package_movement"\."package_id" = "pms"\."package_id" AND "package_movement"\."member_pt_id" = "pms"\."member_pt_id"/,
+  );
+});
+
 test("compileModel sql - passed through, columns unknown", () => {
   const out = compileModel({ kind: "sql", sql: "SELECT a, b FROM t WHERE a = $1", params: [7] });
   assert.equal(out.sql, "SELECT a, b FROM t WHERE a = $1");

@@ -82,16 +82,25 @@ function resolveModelSql(model, branch, defaultSchema = null) {
   for (const mj of manualJoins) {
     const jn = nodesById.get(mj.tableId);
     if (!jn || jn.type !== "tableNode") return { error: "This model joins a table that no longer exists." };
-    const bCol = (base.data?.columns || []).find((c) => c.id === mj.baseColumnId);
-    const jCol = (jn.data?.columns || []).find((c) => c.id === mj.joinColumnId);
-    if (!bCol || !jCol) return { error: "This model's join references a column that no longer exists." };
+    // A multi-key join carries `pairs`; an older single-key save has a
+    // flat baseColumnId/joinColumnId - resolve either into a `pairs` list
+    // of real column names, AND-ed together in compileModel.
+    const rawPairs =
+      Array.isArray(mj.pairs) && mj.pairs.length ? mj.pairs : [{ baseColumnId: mj.baseColumnId, joinColumnId: mj.joinColumnId }];
+    const pairs = [];
+    for (const p of rawPairs) {
+      const bCol = (base.data?.columns || []).find((c) => c.id === p.baseColumnId);
+      const jCol = (jn.data?.columns || []).find((c) => c.id === p.joinColumnId);
+      if (!bCol || !jCol) return { error: "This model's join references a column that no longer exists." };
+      pairs.push({ baseColumn: bCol.name, joinColumn: jCol.name });
+    }
+    if (!pairs.length) return { error: "This model's join has no matching columns." };
     if (!joinNodes.some((n) => n.id === jn.id)) joinNodes.push(jn);
     joinClauses.push({
       tableName: jn.data.label,
       tableSchema: jn.data.schema ?? defaultSchema,
       fromTableName: base.data.label,
-      baseColumn: bCol.name,
-      joinColumn: jCol.name,
+      pairs,
     });
   }
   const nodeFor = (tid) => (tid === base.id ? base : joinNodes.find((n) => n.id === tid));
@@ -1605,6 +1614,10 @@ tablespaceRouter.post(
         // Opaque chart-customization blob - passed straight through, never
         // parsed or used to build SQL. See tablespaceStore.toViz.
         viz: b.viz,
+        // Opaque too - reusable named condition sets. The client expands
+        // each { segmentId } reference into real conditions before a query
+        // ever reaches the server; this is just persistence.
+        segments: b.segments,
       });
       // The owned dataset model needs the new report's id, so it's linked
       // in a second step. It's named after the report.
@@ -1711,6 +1724,7 @@ tablespaceRouter.put(
       sql: b.sql,
       sqlVars: b.sqlVars,
       viz: b.viz,
+      segments: b.segments,
     });
     if (!report) {
       res.status(404).json({ error: "Report not found." });
