@@ -616,7 +616,24 @@ tablespaceRouter.post(
           res.status(400).json({ error: `Unknown model column "${m?.column}".` });
           return;
         }
-        rMeasures.push({ id: m.id, aggregation: m.aggregation, column: m.aggregation === "count" ? null : m.column, label: m.label });
+        // Optional per-measure "only where …" conditions - same column /
+        // operator validation the report-level filters get, against the
+        // model's own compiled output columns.
+        const mFilters = [];
+        for (const f of m.filters || []) {
+          if (!f || !QUERY_OPERATORS.has(f.operator) || typeof f.column !== "string" || !checkCol(f.column)) {
+            res.status(400).json({ error: "Invalid measure condition." });
+            return;
+          }
+          mFilters.push({ column: f.column, operator: f.operator, value: f.value });
+        }
+        rMeasures.push({
+          id: m.id,
+          aggregation: m.aggregation,
+          column: m.aggregation === "count" ? null : m.column,
+          label: m.label,
+          filters: mFilters,
+        });
       }
       const rFilters = [];
       for (const f of filters) {
@@ -731,8 +748,19 @@ tablespaceRouter.post(
           res.status(400).json({ error: `Invalid aggregation "${m?.aggregation}".` });
           return;
         }
+        // Optional per-measure "only where …" conditions, against this
+        // table's own physical columns.
+        const mFilters = [];
+        for (const f of m.filters || []) {
+          const fcol = f && typeof f.column === "string" ? colsByName.get(f.column) : null;
+          if (!fcol || !QUERY_OPERATORS.has(f.operator)) {
+            res.status(400).json({ error: "Invalid measure condition." });
+            return;
+          }
+          mFilters.push({ columnName: fcol.name, operator: f.operator, value: f.value });
+        }
         if (m.aggregation === "count") {
-          rMeasures.push({ id: m.id, label: m.label || "Count", aggregation: "count", columnName: null });
+          rMeasures.push({ id: m.id, label: m.label || "Count", aggregation: "count", columnName: null, filters: mFilters });
           continue;
         }
         const col = typeof m.column === "string" ? colsByName.get(m.column) : null;
@@ -740,7 +768,13 @@ tablespaceRouter.post(
           res.status(400).json({ error: `Unknown column "${m?.column}".` });
           return;
         }
-        rMeasures.push({ id: m.id, label: m.label || `${m.aggregation} of ${col.name}`, aggregation: m.aggregation, columnName: col.name });
+        rMeasures.push({
+          id: m.id,
+          label: m.label || `${m.aggregation} of ${col.name}`,
+          aggregation: m.aggregation,
+          columnName: col.name,
+          filters: mFilters,
+        });
       }
 
       if (rDims.length === 0 && rMeasures.length === 0) {

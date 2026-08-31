@@ -139,7 +139,19 @@ export function compileModelReport({
   const dimSql = (d) => dimExpr({ tableName: MODEL_ALIAS, columnName: d.column, bucket: d.bucket });
   const selectParts = [
     ...dimensions.map((d) => `${dimSql(d)} AS ${quoteIdent(d.id)}`),
-    ...measures.map((m) => `${aggExpr(m.aggregation, m.column, MODEL_ALIAS)} AS ${quoteIdent(m.id)}`),
+    ...measures.map((m) => {
+      let expr = aggExpr(m.aggregation, m.column, MODEL_ALIAS);
+      // Post-parity - an "only where …" condition on a single measure,
+      // compiled as an aggregate FILTER over the model's own output
+      // columns. Params push here, ahead of the WHERE clause's - order
+      // stays internally consistent (every $N computed right after its
+      // push), same as compileQuery's own measure filters.
+      const mfParts = (m.filters || []).map((f) =>
+        compileFilterCondition(MODEL_ALIAS, f.column, f.operator, f.value, params),
+      );
+      if (mfParts.length) expr += ` FILTER (WHERE ${mfParts.join(" AND ")})`;
+      return `${expr} AS ${quoteIdent(m.id)}`;
+    }),
   ];
   const whereParts = filters.map((f) => compileFilterCondition(MODEL_ALIAS, f.column, f.operator, f.value, params));
 

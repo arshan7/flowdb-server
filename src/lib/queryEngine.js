@@ -314,6 +314,18 @@ export function compileQuery({
         expr = op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
       } else {
         expr = aggExpr(measure.aggregation, measure.columnName, tableName);
+        // Post-parity - a plain measure can carry its own row-level
+        // conditions ("sum amount, only where status = 'paid'"), compiled
+        // as an aggregate FILTER so it narrows just this one column, not
+        // the whole report. Same fixed-operator discipline every other
+        // filter path uses; values are bound params. Pushed here while
+        // selectParts is still building - fine, since each $N is computed
+        // right after its own push (the cross-table term filters above
+        // already rely on the same ordering).
+        const mfParts = (measure.filters || []).map((f) =>
+          compileFilterCondition(tableName, f.columnName, f.operator, f.value, params),
+        );
+        if (mfParts.length) expr += ` FILTER (WHERE ${mfParts.join(" AND ")})`;
       }
       return `${expr} AS ${quoteIdent(measure.id)}`;
     }),
