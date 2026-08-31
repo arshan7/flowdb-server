@@ -211,22 +211,27 @@ const MAX_EXPR_DEPTH = 6;
 // A report can carry a `dataset` = { baseTableId, joins, columns, filters }
 // - joins / calculated columns / cross-table filters shaped inline in the
 // report builder rather than in a separate Model. It's persisted as a
-// builder model the report OWNS: never listed in the Models gallery,
-// deleted with the report. Its columns/joins are soft references
-// validated at query time by resolveModelSql, same as a real Model's.
+// real builder Model: it shows in the Models gallery, named after the
+// report, and outlives it. Its columns/joins are soft references validated
+// at query time by resolveModelSql, same as any Model's.
 function isDatasetSpec(d) {
   return !!d && typeof d === "object" && !!d.baseTableId && Array.isArray(d.columns) && d.columns.length > 0;
 }
-async function syncOwnedDataset(sourceId, reportId, dataset) {
+async function syncOwnedDataset(sourceId, reportId, dataset, reportName) {
   if (isDatasetSpec(dataset)) {
-    return store.upsertOwnedModel(sourceId, reportId, {
-      baseTableId: dataset.baseTableId,
-      joins: Array.isArray(dataset.joins) ? dataset.joins : [],
-      columns: dataset.columns,
-      filters: Array.isArray(dataset.filters) ? dataset.filters : [],
-    });
+    return store.upsertOwnedModel(
+      sourceId,
+      reportId,
+      {
+        baseTableId: dataset.baseTableId,
+        joins: Array.isArray(dataset.joins) ? dataset.joins : [],
+        columns: dataset.columns,
+        filters: Array.isArray(dataset.filters) ? dataset.filters : [],
+      },
+      reportName,
+    );
   }
-  await store.deleteOwnedModel(sourceId, reportId);
+  await store.releaseOwnedModel(sourceId, reportId);
   return null;
 }
 
@@ -1560,9 +1565,9 @@ tablespaceRouter.post(
         viz: b.viz,
       });
       // The owned dataset model needs the new report's id, so it's linked
-      // in a second step.
+      // in a second step. It's named after the report.
       if (hasDataset) {
-        const ownedId = await syncOwnedDataset(req.params.sourceId, report.id, b.dataset);
+        const ownedId = await syncOwnedDataset(req.params.sourceId, report.id, b.dataset, report.name);
         res.status(201).json(await store.setReportModelId(req.params.sourceId, report.id, ownedId));
         return;
       }
@@ -1634,14 +1639,20 @@ tablespaceRouter.put(
       return;
     }
     // Confirm the report exists before touching its owned dataset - an
-    // owned model FK-references a real report id.
-    if (!(await store.getReport(req.params.sourceId, req.params.reportId))) {
+    // owned model FK-references a real report id, and names itself after it.
+    const existingReport = await store.getReport(req.params.sourceId, req.params.reportId);
+    if (!existingReport) {
       res.status(404).json({ error: "Report not found." });
       return;
     }
     // Resolve the inline dataset first so the report can point straight at
     // the owned model (or have any stale owned model cleaned up).
-    const ownedModelId = await syncOwnedDataset(req.params.sourceId, req.params.reportId, b.dataset);
+    const ownedModelId = await syncOwnedDataset(
+      req.params.sourceId,
+      req.params.reportId,
+      b.dataset,
+      existingReport.name,
+    );
     const report = await store.updateReport(req.params.sourceId, req.params.reportId, {
       kind: isSql ? "sql" : "semantic",
       tableId: b.modelId || hasDataset ? null : b.tableId,
