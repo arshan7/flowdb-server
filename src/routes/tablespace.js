@@ -1555,6 +1555,9 @@ tablespaceRouter.post(
         sql: b.sql,
         sqlVars: b.sqlVars,
         collectionId: b.collectionId,
+        // Opaque chart-customization blob - passed straight through, never
+        // parsed or used to build SQL. See tablespaceStore.toViz.
+        viz: b.viz,
       });
       // The owned dataset model needs the new report's id, so it's linked
       // in a second step.
@@ -1654,6 +1657,7 @@ tablespaceRouter.put(
       rowLimit: b.rowLimit,
       sql: b.sql,
       sqlVars: b.sqlVars,
+      viz: b.viz,
     });
     if (!report) {
       res.status(404).json({ error: "Report not found." });
