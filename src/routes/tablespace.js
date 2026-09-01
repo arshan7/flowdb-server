@@ -42,10 +42,26 @@ const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contain
 const QUERY_BUCKETS = new Set(["day", "week", "month", "quarter", "year"]);
 const QUERY_SORT_DIRECTIONS = new Set(["asc", "desc"]);
 // Data-browse /preview row filters - plain-language operators ("is", "is
-// not", "contains", "greater than"..., "is empty", "is not empty") map to
-// these keys, then through the shared compileFilterCondition.
-// "isnull"/"notnull" bind no value.
-const PREVIEW_OPERATORS = new Set(["eq", "neq", "contains", "gt", "gte", "lt", "lte", "isnull", "notnull"]);
+// not", "contains", "greater than"..., "is empty", "is not empty", "is any
+// of") map to these keys, then through the shared compileFilterCondition.
+// "isnull"/"notnull" bind no value; "in" binds one array (its value must
+// be a non-empty array - the route checks that before compiling).
+const PREVIEW_OPERATORS = new Set(["eq", "neq", "contains", "gt", "gte", "lt", "lte", "isnull", "notnull", "in"]);
+
+// Shared by /preview and /column-summary: validate one plain-language row
+// filter against a table's real column names, then compile it to a
+// parameterized WHERE fragment. Returns an error string, or null on
+// success (having pushed onto whereParts/params).
+function pushPreviewFilter(f, columnNames, label, whereParts, params) {
+  if (!f || typeof f.column !== "string" || !columnNames.has(f.column) || !PREVIEW_OPERATORS.has(f.operator)) {
+    return "Invalid filter.";
+  }
+  if (f.operator === "in" && (!Array.isArray(f.value) || f.value.length === 0)) {
+    return 'An "is any of" filter needs a non-empty list of values.';
+  }
+  whereParts.push(compileFilterCondition(label, f.column, f.operator, f.value, params));
+  return null;
+}
 
 // Slice 5 - resolve a stored Model row into { sql, params, columns } using
 // the branch's canvas nodes (same node/join/column resolution the /query
@@ -1321,7 +1337,7 @@ tablespaceRouter.post(
 tablespaceRouter.post(
   "/sources/:sourceId/preview",
   wrap(async (req, res) => {
-    const { tableId, offset = 0, pageSize = 50, orderBy = null, filters = [] } = req.body || {};
+    const { tableId, offset = 0, pageSize = 50, orderBy = null, filters = [], withCount = false } = req.body || {};
     if (!tableId) {
       res.status(400).json({ error: "tableId is required." });
       return;
@@ -1359,11 +1375,11 @@ tablespaceRouter.post(
     const params = [];
     const whereParts = [];
     for (const f of filters) {
-      if (!f || typeof f.column !== "string" || !columnNames.has(f.column) || !PREVIEW_OPERATORS.has(f.operator)) {
-        res.status(400).json({ error: "Invalid filter." });
+      const err = pushPreviewFilter(f, columnNames, label, whereParts, params);
+      if (err) {
+        res.status(400).json({ error: err });
         return;
       }
-      whereParts.push(compileFilterCondition(label, f.column, f.operator, f.value, params));
     }
 
     let orderClause = "";
@@ -1380,17 +1396,182 @@ tablespaceRouter.post(
       // connection_schema for a single-schema source whose nodes predate
       // schema tagging (a resync back-fills them - see reconcile.js).
       const from = quoteTable(node.data.schema ?? secrets.schema ?? null, label);
-      const inner = `SELECT * FROM ${from}${whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : ""}${orderClause}`;
+      const whereClause = whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : "";
+      const inner = `SELECT * FROM ${from}${whereClause}${orderClause}`;
       const out = await runNativeQuery(secrets.connectionString, inner, params, { offset, pageSize });
       const { rows, hasMore } = paginateRows(out.rows, pageSize);
+
+      // Opt-in exact total for the "showing 1-50 of N" pager. A COUNT(*) can
+      // be its own expensive query on a big table, so it's off by default
+      // and its failure (statement timeout, etc.) is swallowed to null -
+      // the UI just falls back to "of many".
+      let total = null;
+      if (withCount) {
+        try {
+          const countRes = await runNativeQuery(
+            secrets.connectionString,
+            `SELECT count(*)::bigint AS n FROM ${from}${whereClause}`,
+            params,
+            { offset: 0, pageSize: 1 },
+          );
+          const n = countRes.rows?.[0]?.n;
+          total = n == null ? null : Number(n);
+        } catch {
+          total = null;
+        }
+      }
+
       res.json({
         columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
         rows,
         hasMore,
+        total,
       });
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error("[sources] preview failed:", err.code || err.message);
+      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+    }
+  }),
+);
+
+// Data browse - approximate row count for every table in a connected
+// source, from one cheap system-catalog read (pg_class.reltuples is the
+// planner's own estimate; no table scan). Keyed by modeled node id, for
+// the "12k rows" hint on the table index. A never-analyzed table reads as
+// a negative reltuples in pg_class; that comes back as null (unknown),
+// never a misleading 0.
+tablespaceRouter.get(
+  "/sources/:sourceId/table-counts",
+  wrap(async (req, res) => {
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const nodes = (branch?.nodes || []).filter((n) => n.type === "tableNode");
+    if (nodes.length === 0) {
+      res.json({ counts: {} });
+      return;
+    }
+    try {
+      const out = await runNativeQuery(
+        secrets.connectionString,
+        `SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS est
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p', 'm', 'f')
+            AND n.nspname NOT IN ('pg_catalog', 'information_schema')`,
+        [],
+        { offset: 0, pageSize: 20000 },
+      );
+      const byKey = new Map();
+      for (const r of out.rows || []) byKey.set(`${r.schema}.${r.name}`, r.est == null ? null : Number(r.est));
+      const fallbackSchema = secrets.schema ?? null;
+      const counts = {};
+      for (const nd of nodes) {
+        const key = `${nd.data?.schema ?? fallbackSchema}.${nd.data?.label}`;
+        const est = byKey.has(key) ? byKey.get(key) : null;
+        counts[nd.id] = est != null && est >= 0 ? est : null;
+      }
+      res.json({ counts });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] table-counts failed:", err.code || err.message);
+      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+    }
+  }),
+);
+
+// Data browse - one column's shape, for the "value summary" popover.
+// Same column-name revalidation and plain-language filter set as /preview,
+// and it honours the section's current filters so the summary matches
+// what's on screen. Returns { total, filled, empty, distinct, low, high,
+// top: [{ value, count }] } - `low`/`high` are the column min/max (only
+// computed for number/date columns; the UI hides them otherwise), `top`
+// the eight commonest non-null values.
+tablespaceRouter.post(
+  "/sources/:sourceId/column-summary",
+  wrap(async (req, res) => {
+    const { tableId, column, filters = [] } = req.body || {};
+    if (!tableId || typeof column !== "string") {
+      res.status(400).json({ error: "tableId and column are required." });
+      return;
+    }
+    if (!Array.isArray(filters)) {
+      res.status(400).json({ error: "filters must be an array." });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const node = (branch?.nodes || []).find((n) => n.id === tableId && n.type === "tableNode");
+    if (!node) {
+      res.status(404).json({ error: "Table not found." });
+      return;
+    }
+    const modeledCols = node.data?.columns || [];
+    const columnNames = new Set(modeledCols.map((c) => c.name));
+    if (!columnNames.has(column)) {
+      res.status(400).json({ error: `"${column}" isn't a column of this table.` });
+      return;
+    }
+    const label = node.data.label;
+    const params = [];
+    const whereParts = [];
+    for (const f of filters) {
+      const err = pushPreviewFilter(f, columnNames, label, whereParts, params);
+      if (err) {
+        res.status(400).json({ error: err });
+        return;
+      }
+    }
+    const where = whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : "";
+    const col = quoteIdent(column);
+    const colType = String(modeledCols.find((c) => c.name === column)?.type || "").toLowerCase();
+    const rangeable = /int|numeric|decimal|real|double|float|money|serial|date|time/.test(colType);
+    const minMax = rangeable
+      ? `min(${col})::text AS low, max(${col})::text AS high`
+      : `NULL::text AS low, NULL::text AS high`;
+
+    try {
+      const from = quoteTable(node.data.schema ?? secrets.schema ?? null, label);
+      const [aggRes, topRes] = await Promise.all([
+        runNativeQuery(
+          secrets.connectionString,
+          `SELECT count(*)::bigint AS total, count(${col})::bigint AS filled, ` +
+            `count(DISTINCT ${col})::bigint AS distinct_count, ${minMax} FROM ${from}${where}`,
+          params,
+          { offset: 0, pageSize: 1 },
+        ),
+        runNativeQuery(
+          secrets.connectionString,
+          `SELECT ${col}::text AS value, count(*)::bigint AS count FROM ${from}` +
+            `${where}${where ? " AND" : " WHERE"} ${col} IS NOT NULL ` +
+            `GROUP BY ${col} ORDER BY count(*) DESC LIMIT 8`,
+          params,
+          { offset: 0, pageSize: 8 },
+        ),
+      ]);
+      const a = aggRes.rows?.[0] || {};
+      const total = Number(a.total || 0);
+      const filled = Number(a.filled || 0);
+      res.json({
+        total,
+        filled,
+        empty: total - filled,
+        distinct: Number(a.distinct_count || 0),
+        low: a.low ?? null,
+        high: a.high ?? null,
+        top: (topRes.rows || []).map((r) => ({ value: r.value, count: Number(r.count) })),
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[sources] column-summary failed:", err.code || err.message);
       res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
     }
   }),
