@@ -1,6 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compileQuery, resolveNativeVars, quoteTable, compileFilterCondition } from "./queryEngine.js";
+import {
+  compileQuery,
+  resolveNativeVars,
+  quoteTable,
+  compileFilterCondition,
+  compileFilterGroup,
+} from "./queryEngine.js";
+
+// A leaf compiler like the /preview route's - qualifies against one table.
+const leafOf = (t) => (leaf, params) =>
+  compileFilterCondition(t, leaf.column, leaf.operator, leaf.value, params);
 
 // Slice 1 (reporting parity) - date bucketing, sort, row limit, and the
 // distinct/median aggregations. compileQuery takes an already-resolved
@@ -232,6 +242,88 @@ test("compileFilterCondition - 'in' binds one stringified array, compared as tex
   // a bare scalar and numeric codes both normalise to a string array
   assert.equal(compileFilterCondition("bookings", "state", "in", 7, params), '"bookings"."state"::text = ANY($2)');
   assert.deepEqual(params, [["paid", "shipped"], ["7"]]);
+});
+
+test("compileFilterGroup - a bare leaf (no conj) is just its own fragment", () => {
+  const params = [];
+  const sql = compileFilterGroup({ column: "status", operator: "eq", value: "paid" }, leafOf("orders"), params);
+  assert.equal(sql, '"orders"."status" = $1');
+  assert.deepEqual(params, ["paid"]);
+});
+
+test("compileFilterGroup - OR at the top level, params bound in order", () => {
+  const params = [];
+  const sql = compileFilterGroup(
+    {
+      conj: "or",
+      conditions: [
+        { column: "status", operator: "eq", value: "paid" },
+        { column: "total", operator: "gt", value: 100 },
+      ],
+    },
+    leafOf("orders"),
+    params,
+  );
+  assert.equal(sql, '("orders"."status" = $1 OR "orders"."total" > $2)');
+  assert.deepEqual(params, ["paid", 100]);
+});
+
+test("compileFilterGroup - nested (a AND (b OR c))", () => {
+  const params = [];
+  const sql = compileFilterGroup(
+    {
+      conj: "and",
+      conditions: [
+        { column: "status", operator: "eq", value: "shipped" },
+        {
+          conj: "or",
+          conditions: [
+            { column: "total", operator: "gt", value: 100 },
+            { column: "total", operator: "lt", value: 10 },
+          ],
+        },
+      ],
+    },
+    leafOf("orders"),
+    params,
+  );
+  assert.equal(sql, '("orders"."status" = $1 AND ("orders"."total" > $2 OR "orders"."total" < $3))');
+});
+
+test("compileFilterGroup - an empty group compiles to '', a one-child group drops the parens", () => {
+  assert.equal(compileFilterGroup({ conj: "and", conditions: [] }, leafOf("orders"), []), "");
+  assert.equal(
+    compileFilterGroup(
+      { conj: "or", conditions: [{ column: "id", operator: "eq", value: 1 }] },
+      leafOf("orders"),
+      [],
+    ),
+    '"orders"."id" = $1',
+  );
+  // an empty nested group falls out, leaving the siblings
+  const params = [];
+  assert.equal(
+    compileFilterGroup(
+      {
+        conj: "and",
+        conditions: [
+          { column: "a", operator: "eq", value: 1 },
+          { conj: "or", conditions: [] },
+          { column: "b", operator: "eq", value: 2 },
+        ],
+      },
+      leafOf("t"),
+      params,
+    ),
+    '("t"."a" = $1 AND "t"."b" = $2)',
+  );
+});
+
+test("compileFilterGroup - a bad conjunction and over-deep nesting both throw", () => {
+  assert.throws(() => compileFilterGroup({ conj: "nand", conditions: [] }, leafOf("t"), []), /AND or OR/);
+  let deep = { column: "a", operator: "eq", value: 1 };
+  for (let i = 0; i < 6; i++) deep = { conj: "and", conditions: [deep] };
+  assert.throws(() => compileFilterGroup(deep, leafOf("t"), []), /nested too deeply/);
 });
 
 test("bucket + sort + limit + distinct compose in one query", () => {

@@ -13,6 +13,7 @@ import {
   quoteTable,
   quoteIdent,
   compileFilterCondition,
+  compileFilterGroup,
   ALLOWED_PAGE_SIZES,
   DEFAULT_PAGE_SIZE,
   MAX_ROWS,
@@ -48,19 +49,54 @@ const QUERY_SORT_DIRECTIONS = new Set(["asc", "desc"]);
 // be a non-empty array - the route checks that before compiling).
 const PREVIEW_OPERATORS = new Set(["eq", "neq", "contains", "gt", "gte", "lt", "lte", "isnull", "notnull", "in"]);
 
-// Shared by /preview and /column-summary: validate one plain-language row
-// filter against a table's real column names, then compile it to a
-// parameterized WHERE fragment. Returns an error string, or null on
-// success (having pushed onto whereParts/params).
-function pushPreviewFilter(f, columnNames, label, whereParts, params) {
+// Shared by /preview and /column-summary: validate ONE plain-language row
+// filter (a leaf) against a table's real column names, then compile it to
+// a parameterized WHERE fragment. Returns `{ sql }` or `{ error }`.
+function compilePreviewLeaf(f, columnNames, label, params) {
   if (!f || typeof f.column !== "string" || !columnNames.has(f.column) || !PREVIEW_OPERATORS.has(f.operator)) {
-    return "Invalid filter.";
+    return { error: "Invalid filter." };
   }
   if (f.operator === "in" && (!Array.isArray(f.value) || f.value.length === 0)) {
-    return 'An "is any of" filter needs a non-empty list of values.';
+    return { error: 'An "is any of" filter needs a non-empty list of values.' };
   }
-  whereParts.push(compileFilterCondition(label, f.column, f.operator, f.value, params));
+  return { sql: compileFilterCondition(label, f.column, f.operator, f.value, params) };
+}
+
+// Thin wrapper for the flat `filters: []` callers (implicit AND). Returns
+// an error string, or null on success (having pushed onto whereParts).
+function pushPreviewFilter(f, columnNames, label, whereParts, params) {
+  const r = compilePreviewLeaf(f, columnNames, label, params);
+  if (r.error) return r.error;
+  whereParts.push(r.sql);
   return null;
+}
+
+// Build the ` WHERE ...` clause for /preview and /column-summary from
+// EITHER a `filterGroup` AND/OR tree or the legacy flat `filters` array
+// (implicit AND). Returns `{ clause }` (may be "") or `{ error }`.
+function previewWhereClause(filterGroup, filters, columnNames, label, params) {
+  if (filterGroup && typeof filterGroup === "object") {
+    try {
+      const frag = compileFilterGroup(
+        filterGroup,
+        (leaf, p) => {
+          const r = compilePreviewLeaf(leaf, columnNames, label, p);
+          if (r.error) throw new Error(r.error);
+          return r.sql;
+        },
+        params,
+      );
+      return { clause: frag ? ` WHERE ${frag}` : "" };
+    } catch (e) {
+      return { error: e.message || "Invalid filter." };
+    }
+  }
+  const whereParts = [];
+  for (const f of filters || []) {
+    const err = pushPreviewFilter(f, columnNames, label, whereParts, params);
+    if (err) return { error: err };
+  }
+  return { clause: whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : "" };
 }
 
 // Slice 5 - resolve a stored Model row into { sql, params, columns } using
@@ -1337,7 +1373,15 @@ tablespaceRouter.post(
 tablespaceRouter.post(
   "/sources/:sourceId/preview",
   wrap(async (req, res) => {
-    const { tableId, offset = 0, pageSize = 50, orderBy = null, filters = [], withCount = false } = req.body || {};
+    const {
+      tableId,
+      offset = 0,
+      pageSize = 50,
+      orderBy = null,
+      filters = [],
+      filterGroup = null,
+      withCount = false,
+    } = req.body || {};
     if (!tableId) {
       res.status(400).json({ error: "tableId is required." });
       return;
@@ -1373,13 +1417,10 @@ tablespaceRouter.post(
     const columnNames = new Set((node.data?.columns || []).map((c) => c.name));
     const label = node.data.label;
     const params = [];
-    const whereParts = [];
-    for (const f of filters) {
-      const err = pushPreviewFilter(f, columnNames, label, whereParts, params);
-      if (err) {
-        res.status(400).json({ error: err });
-        return;
-      }
+    const wc = previewWhereClause(filterGroup, filters, columnNames, label, params);
+    if (wc.error) {
+      res.status(400).json({ error: wc.error });
+      return;
     }
 
     let orderClause = "";
@@ -1396,7 +1437,7 @@ tablespaceRouter.post(
       // connection_schema for a single-schema source whose nodes predate
       // schema tagging (a resync back-fills them - see reconcile.js).
       const from = quoteTable(node.data.schema ?? secrets.schema ?? null, label);
-      const whereClause = whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : "";
+      const whereClause = wc.clause;
       const inner = `SELECT * FROM ${from}${whereClause}${orderClause}`;
       const out = await runNativeQuery(secrets.connectionString, inner, params, { offset, pageSize });
       const { rows, hasMore } = paginateRows(out.rows, pageSize);
@@ -1494,7 +1535,7 @@ tablespaceRouter.get(
 tablespaceRouter.post(
   "/sources/:sourceId/column-summary",
   wrap(async (req, res) => {
-    const { tableId, column, filters = [] } = req.body || {};
+    const { tableId, column, filters = [], filterGroup = null } = req.body || {};
     if (!tableId || typeof column !== "string") {
       res.status(400).json({ error: "tableId and column are required." });
       return;
@@ -1522,15 +1563,12 @@ tablespaceRouter.post(
     }
     const label = node.data.label;
     const params = [];
-    const whereParts = [];
-    for (const f of filters) {
-      const err = pushPreviewFilter(f, columnNames, label, whereParts, params);
-      if (err) {
-        res.status(400).json({ error: err });
-        return;
-      }
+    const wc = previewWhereClause(filterGroup, filters, columnNames, label, params);
+    if (wc.error) {
+      res.status(400).json({ error: wc.error });
+      return;
     }
-    const where = whereParts.length ? ` WHERE ${whereParts.join(" AND ")}` : "";
+    const where = wc.clause;
     const col = quoteIdent(column);
     const colType = String(modeledCols.find((c) => c.name === column)?.type || "").toLowerCase();
     const rangeable = /int|numeric|decimal|real|double|float|money|serial|date|time/.test(colType);

@@ -128,6 +128,34 @@ export function compileFilterCondition(tableName, columnName, operator, value, p
   return `${colExpr} ${OPERATORS[operator]} $${params.length}`;
 }
 
+// A nested AND/OR filter tree. A node is either a LEAF - compiled by the
+// caller's `compileLeaf(leaf, params)`, which keeps that route's own
+// column-name validation and just returns a parameterized SQL fragment (or
+// throws) - or a GROUP `{ conj: "and"|"or", conditions: [node, ...] }`.
+// Same fixed-symbol discipline as OPERATORS: only "AND" / "OR" ever reach
+// the SQL string, by exact map lookup. An empty group contributes nothing;
+// a one-child group is just that child (no needless parens). Depth and
+// total node count are capped so a pathological tree can't blow the query
+// up - the caller turns the throw into a 400.
+const GROUP_CONJ = { and: "AND", or: "OR" };
+const MAX_FILTER_DEPTH = 5;
+const MAX_FILTER_NODES = 100;
+
+export function compileFilterGroup(node, compileLeaf, params, depth = 0, counter = { n: 0 }) {
+  if (++counter.n > MAX_FILTER_NODES) throw new Error("This filter has too many conditions.");
+  if (!node || typeof node !== "object") throw new Error("Invalid filter.");
+  if (typeof node.conj !== "string") return compileLeaf(node, params); // leaf
+  if (depth >= MAX_FILTER_DEPTH) throw new Error("This filter is nested too deeply.");
+  const glue = GROUP_CONJ[node.conj];
+  if (!glue) throw new Error("A filter group must be AND or OR.");
+  const parts = (Array.isArray(node.conditions) ? node.conditions : [])
+    .map((child) => compileFilterGroup(child, compileLeaf, params, depth + 1, counter))
+    .filter(Boolean);
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0];
+  return `(${parts.join(` ${glue} `)})`;
+}
+
 // Compiles one calculated-measure term - RECURSIVE, since post-4.4b a
 // term can itself be another calculated expression (a measure referencing
 // another measure, inlined here rather than as a separate query layer -
