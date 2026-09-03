@@ -7,9 +7,16 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: API_KEY
         sync: false
       - key: ALLOWED_ORIGIN
         sync: false
       - key: DATABASE_URL
+        sync: false
+      # 32-byte base64 key that encrypts Connected sources' connection
+      # strings at rest (src/lib/crypto.js). Set in the Render dashboard;
+      # losing it makes every stored connection string undecryptable.
+      - key: CONNECTION_ENCRYPTION_KEY
         sync: false
