@@ -3,8 +3,10 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
+import { clerkMiddleware, requireAuth } from "@clerk/express";
 import { introspectRouter } from "./routes/introspect.js";
 import { tablespaceRouter } from "./routes/tablespace.js";
+import { clerkWebhookHandler } from "./routes/clerkWebhook.js";
 import { requireApiKey } from "./middleware/apiKey.js";
 import { startSyncScheduler } from "./lib/syncScheduler.js";
 import { startQueryCacheSweeper } from "./lib/queryCache.js";
@@ -42,6 +44,12 @@ app.use(
   }),
 );
 
+// Clerk -> our DB user sync. Registered BEFORE express.json(): Svix signs
+// the exact request bytes, so verification needs the raw, unparsed body.
+// Deliberately outside the /api chain - no x-api-key, no requireAuth; the
+// Svix signature is the authentication (see routes/clerkWebhook.js).
+app.post("/webhooks/clerk", express.raw({ type: "*/*", limit: "1mb" }), clerkWebhookHandler);
+
 app.use(express.json({ limit: "1mb" }));
 
 // A broad ceiling on every route, and a much tighter one on /introspect -
@@ -74,20 +82,31 @@ app.use(
   cors({
     origin: process.env.ALLOWED_ORIGIN || "*",
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+    // Authorization carries the Clerk session token the frontend now sends
+    // on every call alongside the existing x-api-key.
+    allowedHeaders: ["Content-Type", "x-api-key", "Authorization"],
   }),
 );
 
 // Unauthenticated on purpose - Render (and any uptime monitor) needs to reach
 // this without a secret, and it reveals nothing about the service beyond
-// "it's running".
+// "it's running". Kept above clerkMiddleware so it never depends on Clerk
+// being configured.
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// Populates req.auth for every route below from the Clerk session token
+// (reads CLERK_SECRET_KEY from the environment). Does not itself reject
+// anonymous requests - requireAuth() on the routers does that.
+app.use(clerkMiddleware());
+
 app.use("/api", apiLimiter);
 app.use("/api/introspect", introspectLimiter);
-app.use("/api", requireApiKey, introspectRouter);
-app.use("/api", requireApiKey, tablespaceRouter);
+// Two gates, in order: the shared x-api-key (a coarse origin filter that
+// predates auth) then a valid Clerk session (per-user identity).
+app.use("/api", requireApiKey, requireAuth(), introspectRouter);
+app.use("/api", requireApiKey, requireAuth(), tablespaceRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: "Not found." });
