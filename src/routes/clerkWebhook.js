@@ -27,11 +27,15 @@ export async function clerkWebhookHandler(req, res) {
   let evt;
   try {
     const payload = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
-    evt = new Webhook(secret).verify(payload, {
+    // svix >= 2 verify() only asserts (throws on a bad signature) and
+    // returns nothing - it does NOT parse the body for us, so parse it
+    // ourselves once the signature has checked out.
+    new Webhook(secret).verify(payload, {
       "svix-id": req.get("svix-id") || "",
       "svix-timestamp": req.get("svix-timestamp") || "",
       "svix-signature": req.get("svix-signature") || "",
     });
+    evt = JSON.parse(payload);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error("[clerk-webhook] signature verification failed:", err.message);
@@ -64,7 +68,7 @@ export async function clerkWebhookHandler(req, res) {
     }
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error(`[clerk-webhook] handling ${evt.type} failed:`, err.stack || err.message);
+    console.error(`[clerk-webhook] handling ${evt?.type} failed:`, err.stack || err.message);
     res.status(500).json({ error: "Failed to process event." });
     return;
   }
