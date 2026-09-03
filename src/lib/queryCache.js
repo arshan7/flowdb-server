@@ -13,6 +13,10 @@
 // exists, this cache MUST be scoped by org/team too, or one tenant could
 // read another's cached rows for a source they don't have access to.
 const TTL_MS = 30_000;
+// Hard ceiling so a burst of distinct queries can't grow the Map without
+// bound between sweeps (each entry holds a full result page). Map keeps
+// insertion order, so the first key is the oldest - evict that.
+const MAX_ENTRIES = 500;
 const store = new Map();
 
 export function cacheKey(sourceId, sql, params) {
@@ -30,6 +34,11 @@ export function getCachedQuery(key) {
 }
 
 export function setCachedQuery(key, rows) {
+  // Refresh position on rewrite so a hot key isn't the one evicted.
+  store.delete(key);
+  if (store.size >= MAX_ENTRIES) {
+    store.delete(store.keys().next().value);
+  }
   store.set(key, { rows, cachedAt: Date.now() });
 }
 
