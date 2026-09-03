@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getAuth } from "@clerk/express";
 import * as store from "../lib/tablespaceStore.js";
 import { diffSchemas } from "../lib/schemaDiff.js";
 import { mergeSchemas } from "../lib/schemaMerge.js";
@@ -320,10 +321,64 @@ function sendQueryError(res, tag, err) {
   res.status(status).json({ error });
 }
 
+// The signed-in Clerk user id, guaranteed present: every /api route is
+// behind requireAuth() (see index.js), so getAuth(req).userId is always a
+// real "user_..." string by the time any handler here runs.
+const uid = (req) => getAuth(req).userId;
+
+// --- Legacy-project claim. Registered BEFORE the "/projects/:id"
+// ownership guard below so ":id" can't swallow "unclaimed" /
+// "claim-legacy". Projects that predate authentication have owner_user_id
+// NULL and are invisible to every scoped query; the first signed-in user
+// to claim adopts all of them (a one-time "import your existing projects"
+// action in the Dashboard).
+tablespaceRouter.get(
+  "/projects/unclaimed",
+  wrap(async (req, res) => {
+    res.json({ count: await store.countUnclaimedProjects() });
+  }),
+);
+
+tablespaceRouter.post(
+  "/projects/claim-legacy",
+  wrap(async (req, res) => {
+    await store.ensureUser({ clerkUserId: uid(req) });
+    const claimed = await store.claimLegacyProjects(uid(req));
+    res.json({ claimed });
+  }),
+);
+
+// --- Ownership boundary. Every route under /projects/:id (its sources,
+// branches, models, reports, dashboards, checkpoints, collections) and
+// every route under /sources/:sourceId funnels through one of these
+// first. A missing row, someone else's row, or an unclaimed legacy row
+// all return 404 - never 403, which would confirm the project exists to
+// someone who has no business knowing.
+async function assertProjectOwner(req, res, next) {
+  const owner = await store.getProjectOwnerId(req.params.id);
+  if (!owner || owner.ownerUserId == null || owner.ownerUserId !== uid(req)) {
+    res.status(404).json({ error: "Project not found." });
+    return;
+  }
+  next();
+}
+
+async function assertSourceOwner(req, res, next) {
+  const owner = await store.getSourceOwnerId(req.params.sourceId);
+  if (!owner || owner.ownerUserId == null || owner.ownerUserId !== uid(req)) {
+    res.status(404).json({ error: "Source not found." });
+    return;
+  }
+  next();
+}
+
+tablespaceRouter.use("/projects/:id", wrap(assertProjectOwner));
+tablespaceRouter.use("/sources/:sourceId", wrap(assertSourceOwner));
+
 tablespaceRouter.get(
   "/projects",
   wrap(async (req, res) => {
-    res.json(await store.listProjects());
+    res.json(await store.listProjects(uid(req)));
   }),
 );
 
@@ -336,7 +391,8 @@ tablespaceRouter.post(
       return;
     }
     try {
-      const project = await store.createProject({ name: name.trim(), createdAt });
+      await store.ensureUser({ clerkUserId: uid(req) });
+      const project = await store.createProject({ name: name.trim(), createdAt, ownerUserId: uid(req) });
       res.status(201).json(project);
     } catch (err) {
       if (err.code === "23505") {
@@ -351,7 +407,7 @@ tablespaceRouter.post(
 tablespaceRouter.get(
   "/projects/:id",
   wrap(async (req, res) => {
-    const project = await store.getProject(req.params.id);
+    const project = await store.getProject(req.params.id, uid(req));
     if (!project) {
       res.status(404).json({ error: "Project not found." });
       return;
@@ -363,7 +419,7 @@ tablespaceRouter.get(
 tablespaceRouter.patch(
   "/projects/:id",
   wrap(async (req, res) => {
-    const project = await store.updateProject(req.params.id, req.body || {});
+    const project = await store.updateProject(req.params.id, req.body || {}, uid(req));
     if (!project) {
       res.status(404).json({ error: "Project not found." });
       return;
@@ -375,7 +431,7 @@ tablespaceRouter.patch(
 tablespaceRouter.delete(
   "/projects/:id",
   wrap(async (req, res) => {
-    const deleted = await store.deleteProject(req.params.id);
+    const deleted = await store.deleteProject(req.params.id, uid(req));
     if (!deleted) {
       res.status(404).json({ error: "Project not found." });
       return;

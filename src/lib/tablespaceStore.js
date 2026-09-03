@@ -20,13 +20,52 @@ const PROJECT_COLUMNS = `
   created_at AS "createdAt", updated_at AS "modifiedAt"
 `;
 
-export async function listProjects() {
-  const { rows } = await query(`SELECT ${PROJECT_COLUMNS} FROM tablespace_projects ORDER BY updated_at DESC`);
+// Every project belongs to exactly one Clerk user (tablespace_projects
+// .owner_user_id - a plain string of the Clerk user id, see the
+// flowdb-migrations model). All five of these are scoped to that owner so
+// one user can never list, read, rename, favourite or delete another's
+// project. The route layer ALSO enforces this at the /projects/:id
+// boundary (assertProjectOwner) - the WHERE clauses here are the second
+// line of defence, and the thing that makes update/delete return "not
+// found" rather than silently touching zero rows.
+export async function listProjects(ownerUserId) {
+  const { rows } = await query(
+    `SELECT ${PROJECT_COLUMNS} FROM tablespace_projects WHERE owner_user_id = $1 ORDER BY updated_at DESC`,
+    [ownerUserId],
+  );
   return rows;
 }
 
-export async function getProject(id) {
-  const { rows } = await query(`SELECT ${PROJECT_COLUMNS} FROM tablespace_projects WHERE id = $1`, [id]);
+export async function getProject(id, ownerUserId) {
+  const { rows } = await query(
+    `SELECT ${PROJECT_COLUMNS} FROM tablespace_projects WHERE id = $1 AND owner_user_id = $2`,
+    [id, ownerUserId],
+  );
+  return rows[0] || null;
+}
+
+// Just the owner id for a project - used by the route-layer ownership
+// guard. Returns null when no such project row exists, or
+// { ownerUserId: null } for a project that predates authentication and
+// hasn't been claimed yet.
+export async function getProjectOwnerId(id) {
+  const { rows } = await query(
+    `SELECT owner_user_id AS "ownerUserId" FROM tablespace_projects WHERE id = $1`,
+    [id],
+  );
+  return rows[0] || null;
+}
+
+// Same, resolved through the source -> project join, for the routes that
+// are scoped by sourceId alone (/sources/:sourceId/...).
+export async function getSourceOwnerId(sourceId) {
+  const { rows } = await query(
+    `SELECT p.owner_user_id AS "ownerUserId"
+       FROM tablespace_sources s
+       JOIN tablespace_projects p ON p.id = s.project_id
+      WHERE s.id = $1`,
+    [sourceId],
+  );
   return rows[0] || null;
 }
 
@@ -34,17 +73,17 @@ export async function getProject(id) {
 // explicitly from the Sources screen (each connects a real database or
 // starts from a template/blank canvas). A project with zero sources is a
 // designed-for state, not an invalid one (see deleteSource's own note).
-export async function createProject({ name, createdAt }) {
+export async function createProject({ name, createdAt, ownerUserId }) {
   const { rows } = await query(
-    `INSERT INTO tablespace_projects (name, created_at, updated_at)
-     VALUES ($1, COALESCE($2, now()), COALESCE($2, now()))
+    `INSERT INTO tablespace_projects (name, owner_user_id, created_at, updated_at)
+     VALUES ($1, $2, COALESCE($3, now()), COALESCE($3, now()))
      RETURNING id, name, status, is_favorite AS "isFavorite", created_at AS "createdAt", updated_at AS "modifiedAt"`,
-    [name, createdAt || null],
+    [name, ownerUserId, createdAt || null],
   );
   return rows[0];
 }
 
-export async function updateProject(id, changes) {
+export async function updateProject(id, changes, ownerUserId) {
   const sets = [];
   const values = [];
   let i = 1;
@@ -60,19 +99,86 @@ export async function updateProject(id, changes) {
     sets.push(`is_favorite = $${i++}`);
     values.push(changes.isFavorite);
   }
-  if (sets.length === 0) return getProject(id);
+  if (sets.length === 0) return getProject(id, ownerUserId);
   sets.push(`updated_at = now()`);
   values.push(id);
+  values.push(ownerUserId);
   const { rows } = await query(
-    `UPDATE tablespace_projects SET ${sets.join(", ")} WHERE id = $${i} RETURNING ${PROJECT_COLUMNS}`,
+    `UPDATE tablespace_projects SET ${sets.join(", ")}
+      WHERE id = $${i++} AND owner_user_id = $${i} RETURNING ${PROJECT_COLUMNS}`,
     values,
   );
   return rows[0] || null;
 }
 
-export async function deleteProject(id) {
-  const { rowCount } = await query(`DELETE FROM tablespace_projects WHERE id = $1`, [id]);
+export async function deleteProject(id, ownerUserId) {
+  const { rowCount } = await query(
+    `DELETE FROM tablespace_projects WHERE id = $1 AND owner_user_id = $2`,
+    [id, ownerUserId],
+  );
   return rowCount > 0; // ON DELETE CASCADE takes every source (and their branches/checkpoints) with it
+}
+
+// One-time migration path for the projects that existed before auth: their
+// owner_user_id is NULL and they're invisible to every scoped query above.
+// The first signed-in user to call POST /api/projects/claim-legacy adopts
+// all of them. countUnclaimedProjects backs the "you have N projects from
+// before you signed in" banner.
+export async function countUnclaimedProjects() {
+  const { rows } = await query(`SELECT count(*)::int AS n FROM tablespace_projects WHERE owner_user_id IS NULL`);
+  return rows[0].n;
+}
+
+export async function claimLegacyProjects(ownerUserId) {
+  // Leaves updated_at untouched so a claimed project keeps its place in the
+  // "recently modified" ordering.
+  const { rowCount } = await query(
+    `UPDATE tablespace_projects SET owner_user_id = $1 WHERE owner_user_id IS NULL`,
+    [ownerUserId],
+  );
+  return rowCount;
+}
+
+// --- Users: a local mirror of Clerk's user records, kept in sync by the
+// POST /webhooks/clerk handler. Clerk owns identity/auth; this table only
+// carries app-specific data (email for display, org, role) and is what
+// project ownership keys off. ensureUser is a lightweight fallback for the
+// window before the webhook is wired up (local dev) - a user row appears
+// the first time they create a project.
+const USER_COLUMNS = `
+  id, clerk_user_id AS "clerkUserId", email, org_id AS "orgId", role,
+  created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function upsertUser({ clerkUserId, email, orgId }) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_users (clerk_user_id, email, org_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (clerk_user_id)
+     DO UPDATE SET email = EXCLUDED.email, org_id = EXCLUDED.org_id, updated_at = now()
+     RETURNING ${USER_COLUMNS}`,
+    [clerkUserId, email ?? null, orgId ?? null],
+  );
+  return rows[0];
+}
+
+// Insert-if-absent only: never overwrites an email/org the webhook already
+// mirrored, and does nothing once the row exists.
+export async function ensureUser({ clerkUserId, email, orgId }) {
+  if (!clerkUserId) return null;
+  const { rows } = await query(
+    `INSERT INTO tablespace_users (clerk_user_id, email, org_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (clerk_user_id) DO NOTHING
+     RETURNING ${USER_COLUMNS}`,
+    [clerkUserId, email ?? null, orgId ?? null],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteUser(clerkUserId) {
+  const { rowCount } = await query(`DELETE FROM tablespace_users WHERE clerk_user_id = $1`, [clerkUserId]);
+  return rowCount > 0;
 }
 
 // One connected source inside a project (ROADMAP.md Phase 3) - a Neon
