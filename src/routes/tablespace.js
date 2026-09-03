@@ -3,7 +3,7 @@ import * as store from "../lib/tablespaceStore.js";
 import { diffSchemas } from "../lib/schemaDiff.js";
 import { mergeSchemas } from "../lib/schemaMerge.js";
 import { syncSource } from "../lib/syncSource.js";
-import { describeIntrospectError } from "../lib/introspectErrors.js";
+import { describeIntrospectError, describeQueryError } from "../lib/introspectErrors.js";
 import {
   compileQuery,
   runQuery,
@@ -303,6 +303,22 @@ export const tablespaceRouter = Router();
 // error-handling middleware below instead of becoming an unhandled
 // rejection - Express 4 (this app's version) doesn't do this itself.
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
+
+// Every route that RUNS a query against a Connected source's database
+// funnels its failure here. A friendly error (raised deliberately upstream)
+// keeps its own message; anything else goes through describeQueryError,
+// which - unlike describeIntrospectError - never claims the connection
+// failed when it was really the SQL.
+function sendQueryError(res, tag, err) {
+  // eslint-disable-next-line no-console
+  console.error(`[sources] ${tag} failed:`, err.code || err.message);
+  if (err.isFriendly) {
+    res.status(400).json({ error: err.message });
+    return;
+  }
+  const { status, error } = describeQueryError(err);
+  res.status(status).json({ error });
+}
 
 tablespaceRouter.get(
   "/projects",
@@ -753,9 +769,7 @@ tablespaceRouter.post(
           cached,
         });
       } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error("[sources] model query failed:", err.code || err.message);
-        res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+        sendQueryError(res, "model query", err);
       }
       return;
     }
@@ -900,9 +914,7 @@ tablespaceRouter.post(
           cached,
         });
       } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error("[sources] direct query failed:", err.code || err.message);
-        res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+        sendQueryError(res, "direct query", err);
       }
       return;
     }
@@ -1296,9 +1308,7 @@ tablespaceRouter.post(
         cached,
       });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] query failed:", err.code || err.message);
-      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+      sendQueryError(res, "query", err);
     }
   }),
 );
@@ -1469,9 +1479,7 @@ tablespaceRouter.post(
         total,
       });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] preview failed:", err.code || err.message);
-      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+      sendQueryError(res, "preview", err);
     }
   }),
 );
@@ -1518,9 +1526,7 @@ tablespaceRouter.get(
       }
       res.json({ counts });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] table-counts failed:", err.code || err.message);
-      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+      sendQueryError(res, "table-counts", err);
     }
   }),
 );
@@ -1608,9 +1614,7 @@ tablespaceRouter.post(
         top: (topRes.rows || []).map((r) => ({ value: r.value, count: Number(r.count) })),
       });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] column-summary failed:", err.code || err.message);
-      res.status(err.isFriendly ? 400 : 502).json({ error: describeIntrospectError(err) });
+      sendQueryError(res, "column-summary", err);
     }
   }),
 );
