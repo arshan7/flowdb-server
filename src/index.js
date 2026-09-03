@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
 import { introspectRouter } from "./routes/introspect.js";
 import { tablespaceRouter } from "./routes/tablespace.js";
 import { requireApiKey } from "./middleware/apiKey.js";
@@ -8,22 +10,57 @@ import { startSyncScheduler } from "./lib/syncScheduler.js";
 import { startQueryCacheSweeper } from "./lib/queryCache.js";
 import { pool } from "./lib/db.js";
 
-// A rejected promise or a thrown error with no local handler would
-// otherwise take the whole process down (Node >=15) with no line in the
-// log saying why. Log it and keep serving - a single bad request must not
-// end the server for everyone else.
+// A rejected promise with no handler is almost always a specific request
+// that failed to clean up - log it (previously this could take the whole
+// process down on Node >=15 with no line saying why) but keep serving.
 process.on("unhandledRejection", (reason) => {
   // eslint-disable-next-line no-console
   console.error("[server] unhandled rejection:", reason instanceof Error ? reason.stack : reason);
 });
+// An uncaught exception means the process is in an unknown state (Node's
+// own guidance) - log it and exit non-zero so Render restarts a clean one,
+// rather than limping on.
 process.on("uncaughtException", (err) => {
   // eslint-disable-next-line no-console
-  console.error("[server] uncaught exception:", err.stack || err.message);
+  console.error("[server] uncaught exception, exiting:", err.stack || err.message);
+  process.exit(1);
 });
 
 const app = express();
 
+// Behind Render's proxy - trust one hop so express-rate-limit keys on the
+// real client IP (X-Forwarded-For) rather than the proxy's.
+app.set("trust proxy", 1);
+
+// This is a JSON API, not an HTML app: helmet's defaults minus the
+// content/frame policies that only matter for a page. Mainly this sets
+// nosniff, no-referrer, HSTS, and drops X-Powered-By.
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  }),
+);
+
 app.use(express.json({ limit: "1mb" }));
+
+// A broad ceiling on every route, and a much tighter one on /introspect -
+// it opens an outbound connection to an attacker-chosen host, so it's the
+// path worth throttling hardest if the shared key ever leaks.
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 300,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many requests, slow down." },
+});
+const introspectLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 20,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many introspection requests, slow down." },
+});
 
 // ALLOWED_ORIGIN should be the deployed frontend's exact origin in production
 // (e.g. https://your-app.vercel.app) - defaulting to "*" only so local dev
@@ -47,6 +84,8 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+app.use("/api", apiLimiter);
+app.use("/api/introspect", introspectLimiter);
 app.use("/api", requireApiKey, introspectRouter);
 app.use("/api", requireApiKey, tablespaceRouter);
 
