@@ -14,7 +14,9 @@
 // change.
 export function valuesEqual(a, b) {
   if (a === b) return true;
-  if (a == null || b == null) return a == b;
+  // Past the `a === b` check, one being nullish means equal only if the
+  // other is too (null and undefined count as the same "no value" here).
+  if (a == null || b == null) return a == null && b == null;
   if (typeof a !== "object" || typeof b !== "object") return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
   const aKeys = Object.keys(a);

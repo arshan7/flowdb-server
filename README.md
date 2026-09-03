@@ -1,67 +1,115 @@
 # flowdb-server
 
-Introspection API for [Tablespace/FlowDB](https://github.com/arshan7/FlowDB). Connects to a live Postgres database (Neon or any standard Postgres) and returns its schema in the exact `{ nodes, edges, enums }` shape the frontend's existing SQL/DBML importers already produce, so it plugs into the same import pipeline rather than needing a new one.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-This is a pure introspection service - it reads `information_schema`/`pg_catalog`, never writes to the target database, and never stores connection credentials. Each request opens a fresh connection, runs the introspection queries, and closes it immediately.
+Backend for [Tablespace / FlowDB](https://github.com/arshan7/FlowDB). It does
+two jobs:
+
+1. **Persistence** — stores every Tablespace project, source, model, report,
+   dashboard, branch and checkpoint in its own Postgres database. The
+   frontend has no local (IndexedDB) fallback anymore; this service is
+   required to run the app.
+2. **Live-database access** — introspects an external Postgres database into
+   the `{ nodes, edges, enums }` shape the frontend's SQL/DBML importers
+   already produce, and (for a "Connected" source) runs read-only,
+   row-capped `SELECT` queries against it for the Data / report layer.
+
+It talks to two kinds of database, kept strictly separate:
+
+| | flowdb-server's own DB | a user's external DB |
+|---|---|---|
+| what | projects, diagrams, checkpoints | the schema/data the user is modelling |
+| pooling | one long-lived pool (`src/lib/db.js`) | a fresh pool per request (`src/lib/pgIntrospect.js`), torn down immediately |
+| credentials | `DATABASE_URL` env var | supplied per request, or stored **AES-256-GCM encrypted** at rest for a Connected source (`src/lib/crypto.js`) |
+| writes | yes | **never** — read-only, `information_schema` / `pg_catalog` / `SELECT` only |
+
+The schema of flowdb-server's own database is managed by a separate repo,
+[`flowdb-migrations`](../flowdb-migrations) (Alembic). This service does not
+run migrations; point both at the same Postgres instance.
+
+## Architecture
+
+```
+src/
+  index.js              # express app, CORS, auth mount, error backstop, graceful shutdown
+  middleware/apiKey.js   # constant-time x-api-key check (fails closed if unset)
+  routes/
+    introspect.js        # POST /api/introspect
+    tablespace.js         # ~40 CRUD + query routes (projects → checkpoints)
+  lib/
+    db.js                # the app's own pooled Postgres connection
+    tablespaceStore.js    # every DB read/write for the persistence layer
+    pgIntrospect.js       # per-request connection to an external DB
+    queryEngine.js        # compiles a report spec → parameterised SQL
+    queryCache.js         # 30s in-process result cache (bounded, swept)
+    crypto.js            # encrypt/decrypt a stored connection string
+    syncSource.js / syncScheduler.js  # background re-introspection of Connected sources
+    schemaDiff / schemaMerge / reconcile  # 3-way merge for branches
+```
+
+Every async route is wrapped so a rejected promise reaches the Express error
+handler instead of crashing the process; `unhandledRejection` /
+`uncaughtException` / `SIGTERM` are all handled in `index.js`.
 
 ## API
 
-### `POST /api/introspect`
+All `/api/*` routes require `x-api-key: <API_KEY>` and `Content-Type:
+application/json`. Errors are `{ "error": "<message>" }` with a 4xx/5xx
+status; connection strings are never echoed or logged, even on failure.
 
-Headers:
-- `x-api-key: <API_KEY>` (required)
-- `Content-Type: application/json`
-
-Body:
-```json
-{
-  "connectionString": "postgres://user:pass@host/db?sslmode=require",
-  "schema": "public"
-}
-```
-`schema` is optional, defaults to `"public"`.
-
-Response `200`:
-```json
-{ "nodes": [...], "edges": [...], "enums": [...] }
-```
-Same shape as `astToSchema()`/`dbmlToSchema()` in the frontend repo - table nodes have placeholder `position: {x: 0, y: 0}`, so the frontend should run its existing `gridLayout()` on the result before dropping it into the canvas, same as it already does for a pasted-SQL import.
-
-Errors come back as `{ "error": "..." }` with a 400/401/404/502 status. The connection string is never echoed back or logged, even on failure.
-
-### `GET /health`
-
-Unauthenticated, for Render's health check / uptime monitoring. Returns `{ "status": "ok" }`.
+- `POST /api/introspect` — `{ connectionString, schema? }` → `{ nodes,
+  edges, enums }`. Read-only; `schema` defaults to `"public"`.
+- `/api/projects`, `/api/projects/:id/sources`, `/api/sources/:id/models`,
+  `/api/sources/:id/reports`, `/api/sources/:id/dashboards`,
+  `/api/sources/:id/branches`, `/api/sources/:id/checkpoints`, … — standard
+  REST CRUD for the persistence layer (see `src/routes/tablespace.js`).
+- `POST /api/sources/:id/preview` / `/query` / `/column-summary` — read-only,
+  row-capped data access against a Connected source.
+- `GET /health` — unauthenticated, `{ "status": "ok" }`, for uptime checks.
 
 ## Local development
 
 ```bash
 npm install
-cp .env.example .env   # fill in API_KEY at minimum
-npm run dev
+cp .env.example .env    # fill in every variable — see the comments in that file
+npm run dev             # node --watch src/index.js
+npm test                # node --test
 ```
 
-Test it against a real database:
-```bash
-curl -X POST http://localhost:4000/api/introspect \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: <your API_KEY>" \
-  -d '{"connectionString": "postgres://user:pass@host/db?sslmode=require"}'
-```
+You need a reachable Postgres for `DATABASE_URL` with the `flowdb-migrations`
+schema applied (`alembic upgrade head` in that repo).
 
-## Deploying to Render
+Required env (all documented in `.env.example`): `API_KEY`, `DATABASE_URL`,
+`CONNECTION_ENCRYPTION_KEY`. Optional: `PORT`, `ALLOWED_ORIGIN`.
 
-1. Push this repo to GitHub.
-2. In Render: **New > Blueprint**, point it at this repo - `render.yaml` configures the service automatically.
-   - Alternatively: **New > Web Service**, connect the repo, Render auto-detects Node (`npm install` / `npm start`).
-3. In the service's **Environment** tab, set:
-   - `API_KEY` - a random secret (matches what the frontend sends)
-   - `ALLOWED_ORIGIN` - the deployed frontend's exact origin, e.g. `https://your-app.vercel.app`
-4. Once deployed, the frontend calls `https://<your-service>.onrender.com/api/introspect`.
+## Deploying (Render)
+
+`render.yaml` is a Blueprint. **New → Blueprint**, point it at this repo,
+then set the `sync: false` secrets (`API_KEY`, `DATABASE_URL`,
+`ALLOWED_ORIGIN`, `CONNECTION_ENCRYPTION_KEY`) in the service's Environment
+tab. The frontend derives its server URL from its own build (see the FlowDB
+repo's `src/core/api/client.js`).
 
 ## Security notes
 
-- **API_KEY is required in production.** The server fails closed (500, not "allow everything") if it isn't set - see `src/middleware/apiKey.js`.
-- **Connections are ephemeral**, not pooled - a request's credentials only exist in memory for the duration of that one request.
-- **CORS is locked to `ALLOWED_ORIGIN`** once set; only unset (defaults to `*`) for local dev convenience.
-- This service can still be pointed at *any* reachable Postgres instance by anyone holding the API key - the API key protects against random internet abuse, not against a leaked key. Treat it like a password.
+- `API_KEY` is a **shared secret**, sent by the frontend on every request
+  and compared in constant time; it fails closed (500) if unset. It is
+  inlined into the frontend bundle at build time, so it stops casual abuse,
+  not a determined caller with devtools. Real per-user auth is future work
+  (see the FlowDB `ROADMAP.md`). Until then, treat the deployed instance as
+  a shared-trust environment.
+- The introspection/query paths only ever read. Every column name a report
+  references is re-validated server-side against the modelled schema before
+  it reaches SQL; identifiers are quoted, values are bound parameters.
+- Set `ALLOWED_ORIGIN` in production to lock CORS to your frontend's origin
+  (it defaults to `*` only for local convenience).
+- `CONNECTION_ENCRYPTION_KEY` protects stored connection strings at rest —
+  back it up; rotating or losing it makes every stored string
+  undecryptable.
+
+See [`../FlowDB/docs/CODE_AUDIT.md`](../FlowDB/docs/CODE_AUDIT.md) for the
+current known-gaps list.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

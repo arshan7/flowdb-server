@@ -2,7 +2,12 @@
   "name": "flowdb-server",
   "version": "1.0.0",
   "private": true,
-  "description": "Introspection API for Tablespace/FlowDB - connects to a live Postgres database (e.g. Neon) and returns its schema in the same {nodes, edges, enums} shape the frontend's SQL/DBML importers already produce.",
+  "description": "Backend for Tablespace/FlowDB: Postgres persistence for the app's projects/models/reports, plus read-only introspection and querying of users' external Postgres databases.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arshan7/flowdb-server.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=18"
@@ -10,7 +15,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test src/**/*.test.js"
+    "test": "node --test src/**/*.test.js",
+    "lint": "eslint ."
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -18,5 +24,10 @@
     "express": "^4.19.2",
     "nanoid": "^5.0.7",
     "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^15.15.0"
   }
 }
