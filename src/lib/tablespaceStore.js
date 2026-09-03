@@ -151,12 +151,16 @@ const USER_COLUMNS = `
 `;
 
 export async function upsertUser({ clerkUserId, email, orgId }) {
+  // `xmax = 0` on the returned row is true only when this call actually
+  // inserted (vs. updated an existing row) - lets the webhook fire a
+  // welcome email exactly once, even on a Clerk retry or when ensureUser
+  // already created the row on the user's first API call.
   const { rows } = await query(
     `INSERT INTO tablespace_users (clerk_user_id, email, org_id)
      VALUES ($1, $2, $3)
      ON CONFLICT (clerk_user_id)
      DO UPDATE SET email = EXCLUDED.email, org_id = EXCLUDED.org_id, updated_at = now()
-     RETURNING ${USER_COLUMNS}`,
+     RETURNING ${USER_COLUMNS}, (xmax = 0) AS "isNew"`,
     [clerkUserId, email ?? null, orgId ?? null],
   );
   return rows[0];

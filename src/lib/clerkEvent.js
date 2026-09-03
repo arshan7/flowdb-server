@@ -20,5 +20,6 @@ export function clerkEventToUser(evt) {
     clerkUserId: data.id || null,
     email: (primary && primary.email_address) || null,
     orgId: (memberships[0] && memberships[0].organization && memberships[0].organization.id) || null,
+    firstName: data.first_name || null,
   };
 }

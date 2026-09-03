@@ -1,6 +1,7 @@
 import { Webhook } from "svix";
 import * as store from "../lib/tablespaceStore.js";
 import { clerkEventToUser } from "../lib/clerkEvent.js";
+import { sendWelcomeEmail } from "../lib/email.js";
 
 // POST /webhooks/clerk - Clerk (via Svix) calls this on user lifecycle
 // events so our own tablespace_users mirror stays in sync. Clerk remains
@@ -52,7 +53,17 @@ export async function clerkWebhookHandler(req, res) {
           res.status(400).json({ error: "Event is missing a user id." });
           return;
         }
-        await store.upsertUser(u);
+        const saved = await store.upsertUser(u);
+        // Welcome email only on a genuinely new row (saved.isNew guards
+        // against Clerk retries and the ensureUser fast-path). Fire and
+        // forget - it must never fail the webhook. No-op unless
+        // RESEND_API_KEY is configured.
+        if (evt.type === "user.created" && saved?.isNew && u.email) {
+          sendWelcomeEmail({ to: u.email, name: u.firstName }).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error("[clerk-webhook] welcome email failed:", err.message);
+          });
+        }
         break;
       }
       case "user.deleted": {

@@ -2,11 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { clerkEventToUser } from "./clerkEvent.js";
 
-test("clerkEventToUser: user.created picks the primary email", () => {
+test("clerkEventToUser: user.created picks the primary email + first name", () => {
   const evt = {
     type: "user.created",
     data: {
       id: "user_2abc",
+      first_name: "Ada",
       primary_email_address_id: "idn_2",
       email_addresses: [
         { id: "idn_1", email_address: "old@example.com" },
@@ -18,6 +19,7 @@ test("clerkEventToUser: user.created picks the primary email", () => {
     clerkUserId: "user_2abc",
     email: "ada@example.com",
     orgId: null,
+    firstName: "Ada",
   });
 });
 
@@ -35,7 +37,12 @@ test("clerkEventToUser: falls back to the first email when no primary id matches
 
 test("clerkEventToUser: no email addresses -> email null, id still extracted", () => {
   const evt = { type: "user.created", data: { id: "user_x" } };
-  assert.deepEqual(clerkEventToUser(evt), { clerkUserId: "user_x", email: null, orgId: null });
+  assert.deepEqual(clerkEventToUser(evt), {
+    clerkUserId: "user_x",
+    email: null,
+    orgId: null,
+    firstName: null,
+  });
 });
 
 test("clerkEventToUser: reads org id from the first organization membership", () => {
@@ -51,6 +58,7 @@ test("clerkEventToUser: reads org id from the first organization membership", ()
 });
 
 test("clerkEventToUser: tolerates a missing/empty payload", () => {
-  assert.deepEqual(clerkEventToUser({}), { clerkUserId: null, email: null, orgId: null });
-  assert.deepEqual(clerkEventToUser({ data: null }), { clerkUserId: null, email: null, orgId: null });
+  const empty = { clerkUserId: null, email: null, orgId: null, firstName: null };
+  assert.deepEqual(clerkEventToUser({}), empty);
+  assert.deepEqual(clerkEventToUser({ data: null }), empty);
 });
