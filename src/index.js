@@ -3,11 +3,12 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
-import { clerkMiddleware, requireAuth } from "@clerk/express";
+import { clerkMiddleware } from "@clerk/express";
 import { introspectRouter } from "./routes/introspect.js";
 import { tablespaceRouter } from "./routes/tablespace.js";
 import { clerkWebhookHandler } from "./routes/clerkWebhook.js";
 import { requireApiKey } from "./middleware/apiKey.js";
+import { requireUser } from "./middleware/requireUser.js";
 import { startSyncScheduler } from "./lib/syncScheduler.js";
 import { startQueryCacheSweeper } from "./lib/queryCache.js";
 import { pool } from "./lib/db.js";
@@ -104,9 +105,9 @@ app.use(clerkMiddleware());
 app.use("/api", apiLimiter);
 app.use("/api/introspect", introspectLimiter);
 // Two gates, in order: the shared x-api-key (a coarse origin filter that
-// predates auth) then a valid Clerk session (per-user identity).
-app.use("/api", requireApiKey, requireAuth(), introspectRouter);
-app.use("/api", requireApiKey, requireAuth(), tablespaceRouter);
+// predates auth) then a valid Clerk session (per-user identity, JSON 401).
+app.use("/api", requireApiKey, requireUser, introspectRouter);
+app.use("/api", requireApiKey, requireUser, tablespaceRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: "Not found." });
