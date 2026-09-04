@@ -137,28 +137,44 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
       continue;
     }
 
-    if (existing.data?.sourceOrigin === "synced") {
-      // Already synced in an earlier pass - left completely untouched.
-      // (v1 deliberately doesn't refresh an existing synced table's own
-      // columns/constraints on resync - doing that correctly means
-      // preserving column ids by name-match AND remapping every
-      // `references.columnId` pointer that used the introspected batch's
-      // fresh ids, which is real enough complexity to earn its own pass
-      // rather than risk getting subtly wrong here. New tables and
-      // conflicts - what was actually asked for - are unaffected by this.)
+    // A table counts as already-synced if it carries the tag OR the sync
+    // ledger already lists its key. The ledger only ever gains a key when
+    // reconcile itself synced that table (`ledgerTables.add` below), so a
+    // ledger hit on an untagged node means it was synced by a build that
+    // predates the `sourceOrigin` tag - NOT that the user built it by hand.
+    // Without this, that node is misread as a manual table forever: every
+    // resync reports it as a phantom conflict, and "View data" / the live-
+    // DB icon never light up for it because nothing ever writes the tag.
+    if (existing.data?.sourceOrigin === "synced" || ledgerTables.has(key)) {
+      // Already synced in an earlier pass - its own columns/constraints are
+      // left untouched on resync. (v1 deliberately doesn't refresh them -
+      // doing that correctly means preserving column ids by name-match AND
+      // remapping every `references.columnId` pointer that used the
+      // introspected batch's fresh ids, real enough complexity to earn its
+      // own pass. New tables and conflicts - what was asked for - are
+      // unaffected.)
       //
-      // The ONE exception: back-fill data.schema on a node synced before
-      // multi-schema existed (schema-less). It's a single scalar, no id
-      // remapping, and without it every pre-existing connected source
-      // stays unqualified in FROM/JOIN forever (a `shop` table compiled as
-      // bare "orders" -> 42P01). A resync now heals it in place.
+      // Two in-place heals, both single scalars with no id remapping:
+      //   - back-fill data.sourceOrigin on a node synced before the tag
+      //     existed, so it's recognised as a live table from here on
+      //   - back-fill data.schema on a node synced before multi-schema
+      //     existed (schema-less), else it's compiled as a bare unqualified
+      //     name in FROM/JOIN forever (a `shop` table as bare "orders" ->
+      //     42P01)
+      const patch = {};
+      if (existing.data?.sourceOrigin !== "synced") patch.sourceOrigin = "synced";
       if (existing.data?.schema == null && incoming.data?.schema != null) {
+        patch.schema = incoming.data.schema;
+      }
+      if (Object.keys(patch).length) {
         const idx = nextNodes.indexOf(existing);
         if (idx !== -1) {
-          nextNodes[idx] = { ...existing, data: { ...existing.data, schema: incoming.data.schema } };
+          nextNodes[idx] = { ...existing, data: { ...existing.data, ...patch } };
         }
       }
       introspectedIdToFinalId.set(incoming.id, existing.id);
+      // Keep the ledger authoritative even when the match was tag-only.
+      ledgerTables.add(key);
     } else {
       conflicts.push({ name: key, reason: `A manual table named "${key}" already exists.` });
     }

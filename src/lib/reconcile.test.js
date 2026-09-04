@@ -75,6 +75,48 @@ test("reconcileSchema - back-fill never overwrites an explicit public tag with a
   assert.deepEqual(byName, ["public.orders", "shop.orders"]);
 });
 
+// A node with no sourceOrigin at all - what a table synced by a build from
+// before the tag existed looks like on disk. (tableNode() can't express
+// this: passing undefined for its `origin` arg just triggers the "synced"
+// default.)
+function untaggedNode(id, schema, label) {
+  return {
+    id,
+    type: "tableNode",
+    position: { x: 0, y: 0 },
+    data: { label, schema, columns: [] },
+  };
+}
+
+test("reconcileSchema - resync heals a ledger-known node that predates the sourceOrigin tag", () => {
+  // Synced by an old build: the key is in the ledger, but data.sourceOrigin
+  // was never written. Must be recognised as synced (not a manual-table
+  // conflict) and get the tag back-filled in place so "View data" works.
+  const existing = { nodes: [untaggedNode("e1", "public", "orders")], edges: [], enums: [] };
+  const introspected = { nodes: [tableNode("n1", "public", "orders")], edges: [], enums: [] };
+  const result = reconcileSchema(existing, introspected, { tables: ["orders"], edges: [] });
+
+  assert.equal(result.nodes.length, 1, "no duplicate");
+  assert.equal(result.nodes[0].id, "e1", "keeps the original node id");
+  assert.equal(result.nodes[0].data.sourceOrigin, "synced", "tag is back-filled");
+  assert.deepEqual(result.conflicts, [], "not reported as a conflict");
+  assert.deepEqual(result.added, [], "nothing counted as newly added");
+});
+
+test("reconcileSchema - an untagged node NOT in the ledger is still a conflict", () => {
+  // Genuinely hand-built table that happens to share a name with an
+  // incoming live table: the ledger has never seen it, so the manual-table
+  // protection still holds and nothing is silently absorbed or tagged.
+  const existing = { nodes: [untaggedNode("e1", "public", "orders")], edges: [], enums: [] };
+  const introspected = { nodes: [tableNode("n1", "public", "orders")], edges: [], enums: [] };
+  const result = reconcileSchema(existing, introspected, { tables: [], edges: [] });
+
+  assert.equal(result.conflicts.length, 1);
+  assert.equal(result.conflicts[0].name, "orders");
+  assert.equal(result.nodes[0].data.sourceOrigin, undefined, "manual table left untagged");
+  assert.deepEqual(result.added, []);
+});
+
 test("reconcileSchema - a public-schema resync is byte-for-byte the old behavior (bare ledger keys)", () => {
   const existing = {
     nodes: [tableNode("e1", "public", "orders", [], "synced")],
