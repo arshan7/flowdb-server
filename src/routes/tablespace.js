@@ -1685,7 +1685,12 @@ tablespaceRouter.post(
     // `limit` is the report builder's tiny "describe columns" probe; the
     // Model builder's live preview sends `pageSize` + `offset` + `orderBy`
     // ({ ordinal, direction }) so it can page and sort like the Data grid.
-    const { model: bodyModel, modelId, limit, offset = 0, pageSize, orderBy = null } = req.body || {};
+    // `filterGroup` is the Model builder's new grouped AND/OR row filter
+    // (same shape /preview's own filterGroup uses) - a live-preview-only
+    // view filter over the model's OUTPUT columns, never part of the saved
+    // model (that stays `model.filters`, resolved by resolveModelSql as
+    // before, untouched here).
+    const { model: bodyModel, modelId, limit, offset = 0, pageSize, orderBy = null, filterGroup = null } = req.body || {};
     const size = ALLOWED_PAGE_SIZES.includes(pageSize)
       ? pageSize
       : Math.max(1, Math.min(Number(limit) || 50, 200));
@@ -1716,17 +1721,45 @@ tablespaceRouter.post(
     // builder model; a SQL model's columns aren't known here, so Postgres
     // rejects an out-of-range position itself.
     let sql = compiled.sql;
+    const params = [...compiled.params];
+    let wrapped = false;
+
+    // The Model builder's grouped AND/OR row filter - same
+    // filterGroup/compileFilterGroup pattern /preview uses, but filtering
+    // the model's own OUTPUT columns (by alias) rather than a table's raw
+    // ones, so it wraps the compiled model as a subquery. A builder
+    // model's output aliases are known (`compiled.columns`); a SQL model's
+    // aren't knowable without running it, so any column name is accepted
+    // and Postgres rejects a bad one itself, same as the orderBy check
+    // below already does for that case.
+    if (filterGroup && typeof filterGroup === "object") {
+      const columnNames = Array.isArray(compiled.columns) ? new Set(compiled.columns) : { has: () => true };
+      const wc = previewWhereClause(filterGroup, null, columnNames, "_ms", params);
+      if (wc.error) {
+        res.status(400).json({ error: wc.error });
+        return;
+      }
+      sql = `SELECT * FROM (${compiled.sql}) AS _ms${wc.clause}`;
+      wrapped = true;
+    }
     if (orderBy && typeof orderBy === "object" && Number.isInteger(orderBy.ordinal) && orderBy.ordinal >= 1) {
       const maxOrdinal = Array.isArray(compiled.columns) ? compiled.columns.length : null;
       if (maxOrdinal && orderBy.ordinal > maxOrdinal) {
         res.status(400).json({ error: "Can't sort by a column that isn't in this model." });
         return;
       }
-      sql = `SELECT * FROM (${compiled.sql}) AS _ms ORDER BY ${orderBy.ordinal} ${orderBy.direction === "desc" ? "DESC" : "ASC"}`;
+      // `ORDER BY <ordinal>` binds to the CURRENT query's own SELECT list -
+      // since both wraps are `SELECT *`, the model's output order survives
+      // either way, so the filtered query can be ordered in place without
+      // wrapping it a second time.
+      const dir = orderBy.direction === "desc" ? "DESC" : "ASC";
+      sql = wrapped
+        ? `${sql} ORDER BY ${orderBy.ordinal} ${dir}`
+        : `SELECT * FROM (${compiled.sql}) AS _ms ORDER BY ${orderBy.ordinal} ${dir}`;
     }
 
     try {
-      const out = await runNativeQuery(secrets.connectionString, sql, compiled.params, { offset, pageSize: size });
+      const out = await runNativeQuery(secrets.connectionString, sql, params, { offset, pageSize: size });
       const { rows, hasMore } = paginateRows(out.rows, size);
       res.json({
         columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
