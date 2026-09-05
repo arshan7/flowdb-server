@@ -42,7 +42,7 @@ const OUTER_WRAP = { count: "sum", sum: "sum", avg: "avg", min: "min", max: "max
 // paging session" stays a single, easy-to-reason-about invariant no
 // matter how it's sliced - a deliberate, considered relaxation of the
 // old flat LIMIT 1000, not an accidental one.
-export const ALLOWED_PAGE_SIZES = [10, 50, 100, 500, 1000];
+export const ALLOWED_PAGE_SIZES = [10, 20, 50, 100, 500, 1000];
 export const DEFAULT_PAGE_SIZE = 100;
 export const MAX_ROWS = 5000;
 
