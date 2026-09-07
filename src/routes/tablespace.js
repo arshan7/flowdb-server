@@ -1444,6 +1444,12 @@ tablespaceRouter.post(
       offset = 0,
       pageSize = 50,
       orderBy = null,
+      // An optional second, always-ascending sort key appended after
+      // `orderBy`. Purely for determinism: LIMIT/OFFSET paging over a sort
+      // key with ties has no defined row order, so pages can repeat or skip
+      // rows. The Data tab's grouped view sorts by the group column - where
+      // every row inside a group ties - and passes the primary key here.
+      orderTiebreak = null,
       filters = [],
       filterGroup = null,
       withCount = false,
@@ -1496,6 +1502,15 @@ tablespaceRouter.post(
         return;
       }
       orderClause = ` ORDER BY ${quoteIdent(orderBy.column)} ${orderBy.direction === "desc" ? "DESC" : "ASC"}`;
+      if (typeof orderTiebreak === "string" && orderTiebreak && orderTiebreak !== orderBy.column) {
+        if (!columnNames.has(orderTiebreak)) {
+          res
+            .status(400)
+            .json({ error: `Can't sort by "${orderTiebreak}" - it isn't a column of this table.` });
+          return;
+        }
+        orderClause += `, ${quoteIdent(orderTiebreak)} ASC`;
+      }
     }
 
     try {
@@ -1671,6 +1686,215 @@ tablespaceRouter.post(
       });
     } catch (err) {
       sendQueryError(res, "column-summary", err);
+    }
+  }),
+);
+
+// Data browse - the Σ summary row computed across the WHOLE filtered
+// table, not just the loaded page ("Summarize all N matching rows"). Same
+// table/column revalidation and filter handling as /column-summary; takes
+// a list of { column, agg } and returns one value per column, all from a
+// single aggregate query. `agg` is the grid's own vocabulary. A column
+// whose agg doesn't fit its type (sum on text, say) comes back null
+// rather than failing the whole request.
+const TABLE_SUMMARY_AGGS = new Set(["count", "filled", "distinct", "sum", "avg", "min", "max"]);
+const TABLE_SUMMARY_MAX_COLUMNS = 200;
+
+// The SQL fragment for one { column, agg }, or null when the aggregate
+// doesn't apply to the column's type (Postgres would raise on it). `col`
+// is already quoteIdent'd.
+function tableSummaryAggSql(agg, col, colType) {
+  const t = String(colType || "").toLowerCase();
+  const numeric = /int|numeric|decimal|real|double|float|money|serial/.test(t);
+  const rangeable = numeric || /date|time/.test(t);
+  switch (agg) {
+    case "count":
+      return "count(*)::bigint";
+    case "filled":
+      return `count(${col})::bigint`;
+    case "distinct":
+      return `count(DISTINCT ${col})::bigint`;
+    case "sum":
+      return numeric ? `sum(${col})::text` : null;
+    case "avg":
+      return numeric ? `avg(${col})::text` : null;
+    case "min":
+      return rangeable ? `min(${col})::text` : null;
+    case "max":
+      return rangeable ? `max(${col})::text` : null;
+    default:
+      return null;
+  }
+}
+
+tablespaceRouter.post(
+  "/sources/:sourceId/table-summary",
+  wrap(async (req, res) => {
+    const { tableId, columns = [], filters = [], filterGroup = null } = req.body || {};
+    if (!tableId || !Array.isArray(columns) || columns.length === 0) {
+      res.status(400).json({ error: "tableId and a non-empty columns array are required." });
+      return;
+    }
+    if (columns.length > TABLE_SUMMARY_MAX_COLUMNS) {
+      res.status(400).json({ error: `Too many columns (max ${TABLE_SUMMARY_MAX_COLUMNS}).` });
+      return;
+    }
+    if (!Array.isArray(filters)) {
+      res.status(400).json({ error: "filters must be an array." });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const node = (branch?.nodes || []).find((n) => n.id === tableId && n.type === "tableNode");
+    if (!node) {
+      res.status(404).json({ error: "Table not found." });
+      return;
+    }
+    const modeledCols = node.data?.columns || [];
+    const typeByName = new Map(modeledCols.map((c) => [c.name, c.type]));
+    const columnNames = new Set(modeledCols.map((c) => c.name));
+
+    // One bad { column, agg } is a client bug - reject the request rather
+    // than silently dropping it (a type mismatch, handled below, is not).
+    for (const spec of columns) {
+      if (!spec || typeof spec.column !== "string" || !columnNames.has(spec.column)) {
+        res.status(400).json({ error: `"${spec?.column}" isn't a column of this table.` });
+        return;
+      }
+      if (!TABLE_SUMMARY_AGGS.has(spec.agg)) {
+        res.status(400).json({ error: `"${spec.agg}" isn't a summary this endpoint computes.` });
+        return;
+      }
+    }
+
+    const params = [];
+    const wc = previewWhereClause(filterGroup, filters, columnNames, node.data.label, params);
+    if (wc.error) {
+      res.status(400).json({ error: wc.error });
+      return;
+    }
+
+    // One SELECT, a positional alias per column (c0, c1, ...) so nothing
+    // derived from a column name reaches the SQL beyond quoteIdent. A spec
+    // whose agg doesn't fit its column type is recorded null and left out.
+    const selectParts = [];
+    const aliasToSpec = new Map();
+    const values = {};
+    columns.forEach((spec, i) => {
+      const sql = tableSummaryAggSql(spec.agg, quoteIdent(spec.column), typeByName.get(spec.column));
+      if (!sql) {
+        values[spec.column] = null;
+        return;
+      }
+      const alias = `c${i}`;
+      selectParts.push(`${sql} AS ${alias}`);
+      aliasToSpec.set(alias, spec);
+    });
+
+    if (selectParts.length === 0) {
+      res.json({ values });
+      return;
+    }
+
+    try {
+      const from = quoteTable(node.data.schema ?? secrets.schema ?? null, node.data.label);
+      const out = await runNativeQuery(
+        secrets.connectionString,
+        `SELECT ${selectParts.join(", ")} FROM ${from}${wc.clause}`,
+        params,
+        { offset: 0, pageSize: 1 },
+      );
+      const row = out.rows?.[0] || {};
+      for (const [alias, spec] of aliasToSpec) {
+        const raw = row[alias];
+        if (raw == null) {
+          values[spec.column] = null;
+        } else if (spec.agg === "count" || spec.agg === "filled" || spec.agg === "distinct") {
+          values[spec.column] = Number(raw);
+        } else {
+          // sum/avg/min/max come back as ::text to keep precision; numeric
+          // columns parse to Number, dates stay strings for the client to
+          // format.
+          const t = String(typeByName.get(spec.column) || "").toLowerCase();
+          const numeric = /int|numeric|decimal|real|double|float|money|serial/.test(t);
+          values[spec.column] = numeric ? Number(raw) : raw;
+        }
+      }
+      res.json({ values });
+    } catch (err) {
+      sendQueryError(res, "table-summary", err);
+    }
+  }),
+);
+
+// Data browse - row grouping. One column's distinct values with a
+// per-value COUNT(*) across the WHOLE filtered table, so the Data tab's
+// group headers can show a real total even though only the loaded page's
+// rows are clustered under them (DATA_TAB.md §19). Same table/column
+// revalidation and filter handling as /column-summary. Ordered by count so
+// the cap keeps the biggest groups; `capped` says whether it was hit.
+const GROUP_BY_MAX_GROUPS = 2000;
+
+tablespaceRouter.post(
+  "/sources/:sourceId/group-by",
+  wrap(async (req, res) => {
+    const { tableId, groupColumn, filters = [], filterGroup = null } = req.body || {};
+    if (!tableId || typeof groupColumn !== "string") {
+      res.status(400).json({ error: "tableId and groupColumn are required." });
+      return;
+    }
+    if (!Array.isArray(filters)) {
+      res.status(400).json({ error: "filters must be an array." });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const node = (branch?.nodes || []).find((n) => n.id === tableId && n.type === "tableNode");
+    if (!node) {
+      res.status(404).json({ error: "Table not found." });
+      return;
+    }
+    const modeledCols = node.data?.columns || [];
+    const columnNames = new Set(modeledCols.map((c) => c.name));
+    if (!columnNames.has(groupColumn)) {
+      res.status(400).json({ error: `"${groupColumn}" isn't a column of this table.` });
+      return;
+    }
+    const label = node.data.label;
+    const params = [];
+    const wc = previewWhereClause(filterGroup, filters, columnNames, label, params);
+    if (wc.error) {
+      res.status(400).json({ error: wc.error });
+      return;
+    }
+    const col = quoteIdent(groupColumn);
+    try {
+      const from = quoteTable(node.data.schema ?? secrets.schema ?? null, label);
+      const out = await runNativeQuery(
+        secrets.connectionString,
+        `SELECT ${col}::text AS value, count(*)::bigint AS count FROM ${from}${wc.clause} ` +
+          `GROUP BY ${col} ORDER BY count(*) DESC, ${col} ASC`,
+        params,
+        { offset: 0, pageSize: GROUP_BY_MAX_GROUPS },
+      );
+      const all = out.rows || [];
+      const capped = all.length > GROUP_BY_MAX_GROUPS;
+      res.json({
+        groups: all
+          .slice(0, GROUP_BY_MAX_GROUPS)
+          .map((r) => ({ value: r.value, count: Number(r.count) })),
+        capped,
+      });
+    } catch (err) {
+      sendQueryError(res, "group-by", err);
     }
   }),
 );
