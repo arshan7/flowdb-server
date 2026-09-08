@@ -5,6 +5,7 @@ import { diffSchemas } from "../lib/schemaDiff.js";
 import { mergeSchemas } from "../lib/schemaMerge.js";
 import { syncSource } from "../lib/syncSource.js";
 import { describeIntrospectError, describeQueryError } from "../lib/introspectErrors.js";
+import { reportError } from "../lib/errorReporting.js";
 import {
   compileQuery,
   runQuery,
@@ -2770,5 +2771,6 @@ tablespaceRouter.delete(
 tablespaceRouter.use((err, req, res, next) => {
   // eslint-disable-next-line no-console
   console.error("[tablespace] request failed:", err.message);
+  reportError(err);
   res.status(500).json({ error: "Internal server error." });
 });
