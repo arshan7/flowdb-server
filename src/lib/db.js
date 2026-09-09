@@ -1,5 +1,6 @@
 import pg from "pg";
 import { splitSsl } from "./pgIntrospect.js";
+import { logger } from "./logger.js";
 
 // A single, long-lived pool created once at process startup and reused
 // across every request - contrast with pgIntrospect.js's withClient(),
@@ -34,8 +35,7 @@ export const pool = new pg.Pool({
 // crashes the whole process - a real, documented pg.Pool gotcha, not a
 // hypothetical one.
 pool.on("error", (err) => {
-  // eslint-disable-next-line no-console
-  console.error("[db] unexpected pool error:", err.message);
+  logger.error("[db] unexpected pool error", err);
 });
 
 export const query = (text, params) => pool.query(text, params);

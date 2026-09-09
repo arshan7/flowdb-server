@@ -2,6 +2,7 @@ import { Router } from "express";
 import { introspectPostgres } from "../lib/pgIntrospect.js";
 import { toTablespaceSchema } from "../lib/toTablespaceSchema.js";
 import { describeIntrospectError } from "../lib/introspectErrors.js";
+import { logger } from "../lib/logger.js";
 
 export const introspectRouter = Router();
 
@@ -23,8 +24,7 @@ introspectRouter.post("/introspect", async (req, res) => {
     }
     res.json(toTablespaceSchema(raw));
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[introspect] failed:", err.code || err.message);
+    logger.error("[introspect] failed", err);
     res.status(502).json({ error: describeIntrospectError(err) });
   }
 });

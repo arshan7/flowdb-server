@@ -18,6 +18,9 @@ const REQUIRED = [
 export function assertRequiredEnv() {
   const missing = REQUIRED.filter((name) => !process.env[name]);
   if (missing.length > 0) {
+    // Uses console.error directly, not the shared logger - this check must
+    // run and fail before anything else in the app (including the logger's
+    // own setup) is trusted to work.
     // eslint-disable-next-line no-console
     console.error(
       `[env] Missing required environment variable(s): ${missing.join(", ")}. See .env.example.`,

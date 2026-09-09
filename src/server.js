@@ -11,7 +11,8 @@ import { requireUser } from "./middleware/requireUser.js";
 import { startSyncScheduler } from "./lib/syncScheduler.js";
 import { startQueryCacheSweeper } from "./lib/queryCache.js";
 import { pool } from "./lib/db.js";
-import { initErrorReporting, reportError } from "./lib/errorReporting.js";
+import { initErrorReporting } from "./lib/errorReporting.js";
+import { logger } from "./lib/logger.js";
 
 initErrorReporting();
 
@@ -19,17 +20,13 @@ initErrorReporting();
 // that failed to clean up - log it (previously this could take the whole
 // process down on Node >=15 with no line saying why) but keep serving.
 process.on("unhandledRejection", (reason) => {
-  // eslint-disable-next-line no-console
-  console.error("[server] unhandled rejection:", reason instanceof Error ? reason.stack : reason);
-  reportError(reason instanceof Error ? reason : new Error(String(reason)));
+  logger.error("[server] unhandled rejection", reason instanceof Error ? reason : new Error(String(reason)));
 });
 // An uncaught exception means the process is in an unknown state (Node's
 // own guidance) - log it and exit non-zero so Render restarts a clean one,
 // rather than limping on.
 process.on("uncaughtException", (err) => {
-  // eslint-disable-next-line no-console
-  console.error("[server] uncaught exception, exiting:", err.stack || err.message);
-  reportError(err);
+  logger.error("[server] uncaught exception, exiting", err);
   process.exit(1);
 });
 
@@ -112,8 +109,7 @@ app.get("/health/ready", async (req, res) => {
     await pool.query("SELECT 1");
     res.json({ status: "ok" });
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[server] readiness check failed:", err.message);
+    logger.error("[server] readiness check failed", err);
     res.status(503).json({ status: "unavailable" });
   }
 });
@@ -140,17 +136,14 @@ app.use((req, res) => {
 // trace to the client.
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-  // eslint-disable-next-line no-console
-  console.error("[server] request failed:", err.stack || err.message);
-  reportError(err);
+  logger.error("[server] request failed", err);
   if (res.headersSent) return;
   res.status(500).json({ error: "Internal server error." });
 });
 
 const port = process.env.PORT || 4000;
 const server = app.listen(port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`flowdb-server listening on port ${port}`);
+  logger.info(`flowdb-server listening on port ${port}`);
 });
 
 startSyncScheduler();
@@ -161,8 +154,7 @@ startQueryCacheSweeper();
 // requests finish, and close the DB pool so nothing is left half-open.
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
-    // eslint-disable-next-line no-console
-    console.log(`[server] ${signal} received, shutting down`);
+    logger.info(`[server] ${signal} received, shutting down`);
     server.close(() => {
       pool.end().finally(() => process.exit(0));
     });

@@ -1,8 +1,8 @@
 import * as Sentry from "@sentry/node";
 
 // Entirely optional, same pattern email.js already uses for RESEND_API_KEY:
-// with no DSN set, this is a no-op and every report() call just falls
-// through to the existing console.error - nothing else changes. Set
+// with no DSN set, this is a no-op and callers (chiefly logger.js's
+// error()) just keep logging normally - nothing else changes. Set
 // SENTRY_DSN to turn it on; see .env.example.
 const DSN = process.env.SENTRY_DSN;
 let initialized = false;

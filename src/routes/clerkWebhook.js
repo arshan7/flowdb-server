@@ -2,6 +2,7 @@ import { Webhook } from "svix";
 import * as store from "../lib/tablespaceStore.js";
 import { clerkEventToUser } from "../lib/clerkEvent.js";
 import { sendWelcomeEmail } from "../lib/email.js";
+import { logger } from "../lib/logger.js";
 
 // POST /webhooks/clerk - Clerk (via Svix) calls this on user lifecycle
 // events so our own tablespace_users mirror stays in sync. Clerk remains
@@ -19,8 +20,7 @@ import { sendWelcomeEmail } from "../lib/email.js";
 export async function clerkWebhookHandler(req, res) {
   const secret = process.env.CLERK_WEBHOOK_SECRET;
   if (!secret) {
-    // eslint-disable-next-line no-console
-    console.error("[clerk-webhook] CLERK_WEBHOOK_SECRET is not set - rejecting.");
+    logger.error("[clerk-webhook] CLERK_WEBHOOK_SECRET is not set - rejecting.");
     res.status(500).json({ error: "Webhook not configured." });
     return;
   }
@@ -38,8 +38,7 @@ export async function clerkWebhookHandler(req, res) {
     });
     evt = JSON.parse(payload);
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[clerk-webhook] signature verification failed:", err.message);
+    logger.error("[clerk-webhook] signature verification failed", err);
     res.status(400).json({ error: "Invalid signature." });
     return;
   }
@@ -60,8 +59,7 @@ export async function clerkWebhookHandler(req, res) {
         // RESEND_API_KEY is configured.
         if (evt.type === "user.created" && saved?.isNew && u.email) {
           sendWelcomeEmail({ to: u.email, name: u.firstName }).catch((err) => {
-            // eslint-disable-next-line no-console
-            console.error("[clerk-webhook] welcome email failed:", err.message);
+            logger.error("[clerk-webhook] welcome email failed", err);
           });
         }
         break;
@@ -78,8 +76,7 @@ export async function clerkWebhookHandler(req, res) {
         break;
     }
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error(`[clerk-webhook] handling ${evt?.type} failed:`, err.stack || err.message);
+    logger.error(`[clerk-webhook] handling ${evt?.type} failed`, err);
     res.status(500).json({ error: "Failed to process event." });
     return;
   }

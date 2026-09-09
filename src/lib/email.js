@@ -1,4 +1,5 @@
 import { Resend } from "resend";
+import { logger } from "./logger.js";
 
 // Transactional email via Resend. Entirely optional: with no RESEND_API_KEY
 // set, every send is a logged no-op, so the webhook path that calls this
@@ -99,8 +100,7 @@ export async function sendWelcomeEmail({ to, name } = {}) {
   const resend = getClient();
   if (!resend) {
     if (!warnedNoKey) {
-      // eslint-disable-next-line no-console
-      console.log("[email] RESEND_API_KEY not set - welcome emails are disabled.");
+      logger.info("[email] RESEND_API_KEY not set - welcome emails are disabled.");
       warnedNoKey = true;
     }
     return { sent: false, skipped: "not configured" };
@@ -115,14 +115,12 @@ export async function sendWelcomeEmail({ to, name } = {}) {
       text,
     });
     if (error) {
-      // eslint-disable-next-line no-console
-      console.error("[email] welcome send rejected:", error.message || error);
+      logger.error("[email] welcome send rejected", error instanceof Error ? error : new Error(String(error)));
       return { sent: false, error: error.message || String(error) };
     }
     return { sent: true };
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[email] welcome send threw:", err.message);
+    logger.error("[email] welcome send threw", err);
     return { sent: false, error: err.message };
   }
 }

@@ -1,5 +1,6 @@
 import * as store from "./tablespaceStore.js";
 import { syncSource } from "./syncSource.js";
+import { logger } from "./logger.js";
 
 // True background sync - runs for the lifetime of this process, no
 // browser needed, which is the whole point of storing a Connected
@@ -27,8 +28,7 @@ async function runDueSyncs() {
     try {
       await syncSource(source.id);
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(`[syncScheduler] source ${source.id} failed:`, err.message);
+      logger.error(`[syncScheduler] source ${source.id} failed`, err);
     }
   }
 }
@@ -36,8 +36,7 @@ async function runDueSyncs() {
 export function startSyncScheduler() {
   setInterval(() => {
     runDueSyncs().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error("[syncScheduler] run failed:", err.message);
+      logger.error("[syncScheduler] run failed", err);
     });
   }, CHECK_INTERVAL_MS);
 }

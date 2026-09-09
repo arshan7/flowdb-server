@@ -5,7 +5,7 @@ import { diffSchemas } from "../lib/schemaDiff.js";
 import { mergeSchemas } from "../lib/schemaMerge.js";
 import { syncSource } from "../lib/syncSource.js";
 import { describeIntrospectError, describeQueryError } from "../lib/introspectErrors.js";
-import { reportError } from "../lib/errorReporting.js";
+import { logger } from "../lib/logger.js";
 import {
   compileQuery,
   runQuery,
@@ -312,8 +312,7 @@ const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 // which - unlike describeIntrospectError - never claims the connection
 // failed when it was really the SQL.
 function sendQueryError(res, tag, err) {
-  // eslint-disable-next-line no-console
-  console.error(`[sources] ${tag} failed:`, err.code || err.message);
+  logger.error(`[sources] ${tag} failed`, err);
   if (err.isFriendly) {
     res.status(400).json({ error: err.message });
     return;
@@ -565,8 +564,7 @@ tablespaceRouter.post(
       // "Connected" with a connection string that's never actually been
       // proven to work.
       await store.clearSourceConnection(req.params.sourceId);
-      // eslint-disable-next-line no-console
-      console.error("[sources] connect failed:", err.code || err.message);
+      logger.error("[sources] connect failed", err);
       res.status(502).json({ error: err.isFriendly ? err.message : describeIntrospectError(err) });
     }
   }),
@@ -592,8 +590,7 @@ tablespaceRouter.post(
       const result = await syncSource(req.params.sourceId);
       res.json(result);
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] sync failed:", err.code || err.message);
+      logger.error("[sources] sync failed", err);
       res
         .status(err.isFriendly ? 400 : 502)
         .json({ error: err.isFriendly ? err.message : describeIntrospectError(err) });
@@ -1418,8 +1415,7 @@ tablespaceRouter.post(
         cached,
       });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] native query failed:", err.code || err.message);
+      logger.error("[sources] native query failed", err);
       // A user SQL mistake (syntax, unknown column, write in a read-only
       // txn) is a 400 with the DB's own message - that's the feedback they
       // need; it never contains the connection string.
@@ -1994,8 +1990,7 @@ tablespaceRouter.post(
         params: compiled.params,
       });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[sources] model preview failed:", err.code || err.message);
+      logger.error("[sources] model preview failed", err);
       res.status(400).json({ error: err.message || "Model query failed." });
     }
   }),
@@ -2769,8 +2764,6 @@ tablespaceRouter.delete(
 
 // eslint-disable-next-line no-unused-vars
 tablespaceRouter.use((err, req, res, next) => {
-  // eslint-disable-next-line no-console
-  console.error("[tablespace] request failed:", err.message);
-  reportError(err);
+  logger.error("[tablespace] request failed", err);
   res.status(500).json({ error: "Internal server error." });
 });
