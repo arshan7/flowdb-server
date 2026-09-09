@@ -185,6 +185,46 @@ export async function deleteUser(clerkUserId) {
   return rowCount > 0;
 }
 
+// Every project this user owns, with the full tree beneath each source
+// (branches/checkpoints/reports/dashboards/models/collections) - backs the
+// account data-export feature. Built from the same list* functions the app
+// itself already uses (not a new bulk query), so it automatically inherits
+// their existing safety properties - critically, listSources' query never
+// selects connection_string_encrypted, so an export can never leak a
+// connected source's credentials.
+export async function exportAccountData(ownerUserId) {
+  const projects = await listProjects(ownerUserId);
+  const fullProjects = [];
+  for (const project of projects) {
+    const sources = await listSources(project.id);
+    const fullSources = [];
+    for (const source of sources) {
+      const [branches, checkpoints, reports, dashboards, models, collections] = await Promise.all([
+        listBranches(source.id),
+        listCheckpoints(source.id),
+        listReports(source.id),
+        listDashboards(source.id),
+        listModels(source.id),
+        listCollections(source.id),
+      ]);
+      fullSources.push({ ...source, branches, checkpoints, reports, dashboards, models, collections });
+    }
+    fullProjects.push({ ...project, sources: fullSources });
+  }
+  return { exportedAt: new Date().toISOString(), projects: fullProjects };
+}
+
+// Deletes every project this user owns (ON DELETE CASCADE takes each
+// project's sources, and everything below those, with it - see
+// deleteProject's own note) then the user's own tablespace_users row.
+// Deliberately one bulk DELETE rather than looping deleteProject per row -
+// there's no per-project response to report back here, unlike the route
+// that lets a user delete one project at a time.
+export async function deleteAccountData(ownerUserId) {
+  await query(`DELETE FROM tablespace_projects WHERE owner_user_id = $1`, [ownerUserId]);
+  await deleteUser(ownerUserId);
+}
+
 // One connected source inside a project (ROADMAP.md Phase 3) - a Neon
 // database, a Supabase project, a MongoDB project, a Salesforce
 // connection, etc. Each owns its own independent branch/checkpoint
