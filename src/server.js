@@ -2,9 +2,9 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
-import { clerkMiddleware } from "@clerk/express";
+import { authMiddleware, devAuthUser } from "./lib/auth.js";
 import { introspectRouter } from "./routes/introspect.js";
-import { tablespaceRouter } from "./routes/tablespace.js";
+import { apiRouter } from "./routes/index.js";
 import { clerkWebhookHandler } from "./routes/clerkWebhook.js";
 import { requireApiKey } from "./middleware/apiKey.js";
 import { requireUser } from "./middleware/requireUser.js";
@@ -78,7 +78,7 @@ const introspectLimiter = rateLimit({
 // there's even an origin to lock it to.
 //
 // PATCH/PUT/DELETE added alongside the original GET/POST for the new
-// tablespaceRouter below (project rename/favorite, diagram save, checkpoint
+// apiRouter below (project rename/favorite, diagram save, checkpoint
 // delete) - introspect.js only ever needed GET/POST.
 app.use(
   cors({
@@ -117,20 +117,21 @@ app.get("/health/ready", async (req, res) => {
 // Populates req.auth for every route below from the Clerk session token
 // (reads CLERK_SECRET_KEY from the environment). Does not itself reject
 // anonymous requests - requireAuth() on the routers does that.
-app.use(clerkMiddleware());
+app.use(authMiddleware());
+if (devAuthUser) logger.warn(`[server] DEV_AUTH_USER set - every request is "${devAuthUser}" (local testing only)`);
 
 app.use("/api", apiLimiter);
 app.use("/api/introspect", introspectLimiter);
 // Two gates, in order: the shared x-api-key (a coarse origin filter that
 // predates auth) then a valid Clerk session (per-user identity, JSON 401).
 app.use("/api", requireApiKey, requireUser, introspectRouter);
-app.use("/api", requireApiKey, requireUser, tablespaceRouter);
+app.use("/api", requireApiKey, requireUser, apiRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: "Not found." });
 });
 
-// App-level backstop: tablespaceRouter has its own error handler, but
+// App-level backstop: apiRouter has its own error handler, but
 // anything that reaches Express without one (introspectRouter, a future
 // route that forgets `wrap`) lands here as a generic 500 - never a stack
 // trace to the client.

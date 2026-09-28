@@ -69,6 +69,33 @@ export function describeQueryError(err) {
       return { status: 504, error: "The query took too long and was cancelled by the database." };
     case "42601": // syntax_error - the compiler emitted bad SQL; a bug, but not a connection fault
       return { status: 500, error: `The generated SQL was invalid.${detail ? ` (${detail})` : ""}` };
+    // Data-tab write path - constraint violations, the most common failure
+    // mode for an insert/update/delete. Postgres's own DatabaseError exposes
+    // structured fields (constraint/table/column/detail) for exactly these
+    // four codes, more precise and definitely-current than pre-validating
+    // against cached introspected metadata could ever be - so writes are
+    // attempted and the real error translated, the same "attempt, then
+    // translate" pattern every other case in this function already uses.
+    case "23502": // not_null_violation
+      return {
+        status: 400,
+        error: `"${err.column || "A required column"}" can't be empty.`,
+      };
+    case "23503": // foreign_key_violation
+      return {
+        status: 409,
+        error: `That value doesn't match any row in the related table.${err.detail ? ` (${err.detail})` : ""}`,
+      };
+    case "23505": // unique_violation
+      return {
+        status: 409,
+        error: `A row with that value already exists.${err.constraint ? ` (${err.constraint})` : ""}`,
+      };
+    case "23514": // check_violation
+      return {
+        status: 400,
+        error: `That value violates the "${err.constraint || "column"}" constraint.`,
+      };
     default:
       return { status: 502, error: "The query could not run against the source database." };
   }

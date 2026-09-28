@@ -1051,3 +1051,58 @@ export async function deleteCheckpoint(sourceId, checkpointId) {
   );
   return rowCount > 0;
 }
+
+// Data-tab write path (HIST-01/02) - one row per insert/update/delete made
+// against a connected source's own tables, in FlowDB's OWN database (see
+// the migration that introduced tablespace_audit_log for why: it can't
+// live in the connected source itself). `before`/`after` are full row
+// snapshots (JSONB); `null` here means "genuinely absent" (no before-state
+// on an insert, no after-state on a delete), so this uses its own
+// null-preserving JSON helper rather than toJson()'s "default to []".
+// Written AFTER the connected-source write transaction commits - a
+// different database, so it can't share that transaction; a best-effort
+// record, same as the rest of this file's write-then-record-metadata
+// sequences (e.g. markSourceSynced after a sync).
+const toAuditJson = (value) => (value === undefined || value === null ? null : JSON.stringify(value));
+
+export async function insertAuditLog(sourceId, {
+  ownerUserId, tableId, tableSchema, tableName, operation, rowIdentity, before, after,
+}) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_audit_log
+       (source_id, owner_user_id, table_id, table_schema, table_name, operation, row_identity, before, after)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING id, source_id AS "sourceId", owner_user_id AS "ownerUserId", table_id AS "tableId",
+       table_schema AS "tableSchema", table_name AS "tableName", operation,
+       row_identity AS "rowIdentity", before, after, created_at AS "createdAt"`,
+    [sourceId, ownerUserId, tableId, tableSchema, tableName, operation, toAuditJson(rowIdentity), toAuditJson(before), toAuditJson(after)],
+  );
+  return rows[0];
+}
+
+export async function getAuditLogEntry(sourceId, auditId) {
+  const { rows } = await query(
+    `SELECT id, source_id AS "sourceId", owner_user_id AS "ownerUserId", table_id AS "tableId",
+       table_schema AS "tableSchema", table_name AS "tableName", operation,
+       row_identity AS "rowIdentity", before, after, created_at AS "createdAt"
+     FROM tablespace_audit_log WHERE id = $1 AND source_id = $2`,
+    [auditId, sourceId],
+  );
+  return rows[0] || null;
+}
+
+// Newest first, optionally narrowed to one table (branch node id) - the
+// Data tab's own history panel is always scoped to the table it's open on.
+export async function listAuditLog(sourceId, { tableId = null, limit = 200 } = {}) {
+  const { rows } = await query(
+    `SELECT id, source_id AS "sourceId", owner_user_id AS "ownerUserId", table_id AS "tableId",
+       table_schema AS "tableSchema", table_name AS "tableName", operation,
+       row_identity AS "rowIdentity", before, after, created_at AS "createdAt"
+     FROM tablespace_audit_log
+     WHERE source_id = $1 AND ($2::text IS NULL OR table_id = $2)
+     ORDER BY created_at DESC
+     LIMIT $3`,
+    [sourceId, tableId, limit],
+  );
+  return rows;
+}

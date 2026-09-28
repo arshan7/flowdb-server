@@ -340,3 +340,12 @@ test("bucket + sort + limit + distinct compose in one query", () => {
   assert.match(sql, /GROUP BY DATE_TRUNC\('month', "orders"\."created_at"\) ORDER BY "d1" ASC LIMIT/);
   assert.equal(windowSize, 24);
 });
+
+test("compileFilterCondition - notin compiles to NOT = ANY over text", () => {
+  const params = [];
+  assert.equal(
+    compileFilterCondition("orders", "status", "notin", ["paid", 7], params),
+    'NOT ("orders"."status"::text = ANY($1))',
+  );
+  assert.deepEqual(params, [["paid", "7"]]);
+});

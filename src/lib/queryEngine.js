@@ -1,6 +1,11 @@
 import pg from "pg";
 import { splitSsl, isSslRefusedError, sslFallbackAllowed } from "./pgIntrospect.js";
 
+// DATE (oid 1082) stays the database's own "2026-08-08" text. Parsed into a JS
+// Date it becomes local midnight, which serializes as the previous day in UTC
+// for any server east of Greenwich - every date showed one day early.
+pg.types.setTypeParser(1082, (value) => value);
+
 const AGGREGATIONS = { count: "COUNT", sum: "SUM", avg: "AVG", min: "MIN", max: "MAX" };
 // Reporting-parity slice 1 - `date_trunc` units a dimension can be grouped
 // by. Same fixed-map discipline as OPERATORS/CALC_OPERATORS: the client
@@ -45,6 +50,10 @@ const OUTER_WRAP = { count: "sum", sum: "sum", avg: "avg", min: "min", max: "max
 export const ALLOWED_PAGE_SIZES = [10, 20, 50, 100, 500, 1000];
 export const DEFAULT_PAGE_SIZE = 100;
 export const MAX_ROWS = 5000;
+// Data-tab write path - a bulk update/delete's own cap, deliberately
+// smaller than MAX_ROWS (that constant was tuned for read pagination, not
+// "how many rows should one bulk-write call ever touch in one go").
+export const MAX_BULK_WRITE_ROWS = 1000;
 
 export function quoteIdent(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
@@ -123,6 +132,11 @@ export function compileFilterCondition(tableName, columnName, operator, value, p
     // having to know the column's type; `7::text = ANY(ARRAY['7'])` holds.
     params.push((Array.isArray(value) ? value : [value]).map((v) => String(v)));
     return `${colExpr}::text = ANY($${params.length})`;
+  }
+  if (operator === "notin") {
+    // "is none of" - NULLs drop out too (SQL); the client ORs "is empty" back in.
+    params.push((Array.isArray(value) ? value : [value]).map((v) => String(v)));
+    return `NOT (${colExpr}::text = ANY($${params.length}))`;
   }
   params.push(operator === "contains" ? `%${value}%` : value);
   return `${colExpr} ${OPERATORS[operator]} $${params.length}`;
@@ -433,27 +447,30 @@ export function paginateRows(rows, pageSize = DEFAULT_PAGE_SIZE) {
 // same "scoped to one request's lifetime" principle pgIntrospect.js's own
 // withClient already uses. max:1 (one query, not introspection's 8
 // concurrent ones), a tighter query_timeout (interactive, not a
-// background sync). Wrapped in an explicit READ ONLY transaction - the
-// real, DB-enforced guarantee: for compileQuery it's defense in depth (it
-// only emits SELECT), for runNativeQuery (Slice 4, user-typed SQL) it's
-// the load-bearing guard - any INSERT/UPDATE/DELETE/DDL fails outright.
-// Returns the raw pg result (callers read `.rows` or `.fields`).
-async function runReadOnly(connectionString, sql, params) {
+// background sync). `mode` is "READ ONLY" or "READ WRITE" - the real,
+// DB-enforced guarantee: for a read it's defense in depth (compileQuery
+// only ever emits SELECT; for runNativeQuery, Slice 4 user-typed SQL, it's
+// the load-bearing guard - any INSERT/UPDATE/DELETE/DDL fails outright).
+// `work(client)` runs inside BEGIN <mode> ... COMMIT/ROLLBACK and can issue
+// more than one statement (a write route may re-SELECT the row it just
+// wrote, in the same transaction, for its response) - its return value is
+// what's committed and handed back to the caller.
+async function runInTransaction(connectionString, mode, timeoutMs, work) {
   const { connectionString: cleanUrl, ssl: resolvedSsl } = splitSsl(connectionString);
   const attempt = async (ssl) => {
     const pool = new pg.Pool({
       connectionString: cleanUrl,
       ssl,
       connectionTimeoutMillis: 10_000,
-      query_timeout: 15_000,
+      query_timeout: timeoutMs,
       max: 1,
     });
     try {
       const client = await pool.connect();
       try {
-        await client.query("BEGIN READ ONLY");
+        await client.query(`BEGIN ${mode}`);
         try {
-          const result = await client.query(sql, params);
+          const result = await work(client);
           await client.query("COMMIT");
           return result;
         } catch (err) {
@@ -480,9 +497,78 @@ async function runReadOnly(connectionString, sql, params) {
   }
 }
 
+async function runReadOnly(connectionString, sql, params) {
+  return runInTransaction(connectionString, "READ ONLY", 15_000, (client) => client.query(sql, params));
+}
+
 export async function runQuery(connectionString, sql, params) {
   const result = await runReadOnly(connectionString, sql, params);
   return result.rows;
+}
+
+// Data-tab write path - runs `work(client)` inside a real READ WRITE
+// transaction against the connected source's own database. A shorter
+// timeout than reads: a write blocking behind a lock held elsewhere is a
+// worse failure mode to let ride than a slow SELECT. Every write route
+// (insert/update/delete/bulk-update/duplicate) goes through this single
+// entry point, same discipline runReadOnly already enforces for reads -
+// one place that owns connection lifecycle and SSL fallback, not one per
+// route.
+export async function runWriteTransaction(connectionString, work) {
+  return runInTransaction(connectionString, "READ WRITE", 10_000, work);
+}
+
+// Builds the WHERE fragment that targets exactly one row, for UPDATE/
+// DELETE/duplicate. `identity` is `{ pk: { col: value, ... } }` (composite-
+// PK safe - every entry ANDed) or `{ ctid: "(0,1)" }` for a table with no
+// primary key (see toTablespaceSchema's constraints.primaryKey - an empty
+// array means this fallback is the only option). ctid isn't a normal typed
+// column compileFilterCondition already understands, so it gets its own
+// small branch rather than being forced through that map; it must be sent
+// back exactly as `/preview` returned it and cast with `::tid`, since it's
+// a Postgres system column, not user data.
+//
+// NOT stable across VACUUM FULL/CLUSTER - good enough for "update the row
+// I'm looking at in this same page load", not for anything persisted
+// across sessions. Callers on a PK-less table should treat a 0-row result
+// as ambiguous between "someone else changed it" and "ctid moved under a
+// vacuum" and say so.
+export function compileRowIdentityWhere(tableName, identity, params) {
+  if (identity && identity.ctid) {
+    params.push(identity.ctid);
+    return `${quoteQualified(tableName, "ctid")} = $${params.length}::tid`;
+  }
+  const pk = identity && identity.pk;
+  if (!pk || typeof pk !== "object" || Object.keys(pk).length === 0) {
+    throw new Error("A row's primary key or ctid is required.");
+  }
+  return Object.entries(pk)
+    .map(([col, value]) => compileFilterCondition(tableName, col, "eq", value, params))
+    .join(" AND ");
+}
+
+// Optimistic-concurrency guard for UPDATE, appended to the identity WHERE
+// alongside PK/ctid. Zero extra round trip: a 0-row UPDATE result IS the
+// conflict signal, so this doesn't need a separate SELECT-then-compare.
+// Prefers a detected updated_at-shaped column (one comparison) when the
+// client sends `expectedUpdatedAt`; otherwise falls back to a full-row
+// compare-and-swap over whatever column values the client last saw
+// (`expectedValues`) - the honest default, since most real tables have
+// neither a primary key guarantee nor an auto-maintained timestamp.
+// `IS NOT DISTINCT FROM` (not `=`) so a NULL-to-NULL "unchanged" value
+// doesn't wrongly register as a mismatch.
+export function compileConcurrencyWhere(tableName, { updatedAtColumn, expectedUpdatedAt, expectedValues } = {}, params) {
+  const parts = [];
+  if (updatedAtColumn && expectedUpdatedAt !== undefined) {
+    params.push(expectedUpdatedAt);
+    parts.push(`${quoteQualified(tableName, updatedAtColumn)} IS NOT DISTINCT FROM $${params.length}`);
+  } else if (expectedValues && typeof expectedValues === "object") {
+    for (const [col, value] of Object.entries(expectedValues)) {
+      params.push(value);
+      parts.push(`${quoteQualified(tableName, col)} IS NOT DISTINCT FROM $${params.length}`);
+    }
+  }
+  return parts;
 }
 
 // Slice 4 - native SQL reports. `userSql` is raw, user-typed SELECT text

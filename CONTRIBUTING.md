@@ -16,7 +16,7 @@ You need a Postgres instance for `DATABASE_URL` with the
 ## Conventions
 
 - **ES modules**, Node ≥ 18. No build step — the source runs as-is.
-- **Every async route handler goes through `wrap(...)`** (`src/routes/tablespace.js`)
+- **Every async route handler goes through `wrap(...)`** (`src/routes/http.js`)
   so a rejected promise reaches the Express error handler instead of
   becoming an unhandled rejection.
 - **Validate at the boundary.** A route validates types / ranges / enum

@@ -191,6 +191,7 @@ const COLUMNS_QUERY = `
     information_schema._pg_numeric_scale(a.atttypid, a.atttypmod) AS numeric_scale,
     CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
     pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+    a.attidentity <> '' AS is_identity,
     a.attnum AS ordinal_position
   FROM pg_attribute a
   JOIN pg_class c ON c.oid = a.attrelid

@@ -62,7 +62,8 @@ status; connection strings are never echoed or logged, even on failure.
 - `/api/projects`, `/api/projects/:id/sources`, `/api/sources/:id/models`,
   `/api/sources/:id/reports`, `/api/sources/:id/dashboards`,
   `/api/sources/:id/branches`, `/api/sources/:id/checkpoints`, … — standard
-  REST CRUD for the persistence layer (see `src/routes/tablespace.js`).
+  REST CRUD for the persistence layer (`src/routes/`: one router per resource,
+  mounted in `src/routes/index.js`).
 - `POST /api/sources/:id/preview` / `/query` / `/column-summary` — read-only,
   row-capped data access against a Connected source.
 - `GET /health` — unauthenticated, `{ "status": "ok" }`, for uptime checks.

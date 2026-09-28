@@ -99,3 +99,21 @@ test("toTablespaceSchema - PK/unique/check/index rows are matched by schema + ta
   assert.equal(b.data.columns[0].isPrimaryKey, false);
   assert.equal(b.data.constraints.primaryKey.length, 0);
 });
+
+test("toTablespaceSchema - identity and serial columns are marked autoIncrement", () => {
+  const { nodes } = toTablespaceSchema(
+    raw({
+      tables: [{ table_schema: "public", table_name: "t" }],
+      columns: [
+        { table_schema: "public", table_name: "t", column_name: "a", data_type: "int8", is_nullable: "NO", is_identity: true },
+        { table_schema: "public", table_name: "t", column_name: "b", data_type: "int4", is_nullable: "NO", column_default: "nextval('t_b_seq'::regclass)" },
+        { table_schema: "public", table_name: "t", column_name: "c", data_type: "int4", is_nullable: "NO", is_identity: false },
+      ],
+    }),
+  );
+  const cols = Object.fromEntries(nodes[0].data.columns.map((c) => [c.name, c]));
+  assert.equal(cols.a.autoIncrement, true);
+  assert.equal(cols.b.autoIncrement, true);
+  assert.equal(cols.b.default, "");
+  assert.equal(cols.c.autoIncrement, undefined);
+});

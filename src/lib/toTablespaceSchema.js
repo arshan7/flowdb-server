@@ -82,6 +82,8 @@ export function toTablespaceSchema(raw) {
       type,
       typeParams,
       default: cleanDefault(c.column_default),
+      // cleanDefault drops nextval(), so keep "the database numbers this" here.
+      ...((c.is_identity === true || /^nextval\(/i.test(String(c.column_default ?? ""))) && { autoIncrement: true }),
       comment: "",
       isPrimaryKey: false,
       isForeignKey: false,
