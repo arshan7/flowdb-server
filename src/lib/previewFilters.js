@@ -1,4 +1,8 @@
-import { compileFilterCondition, compileFilterGroup } from "./queryEngine.js";
+import { compileFilterCondition, compileFilterGroup, quoteQualified } from "./queryEngine.js";
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const isDayList = (type, list) =>
+  /date|timestamp/i.test(String(type || "")) && list.every((v) => DAY_RE.test(String(v)));
 
 export const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains", "in"]);
 
@@ -18,6 +22,18 @@ export function compilePreviewLeaf(f, columnNames, label, params) {
   }
   if ((f.operator === "in" || f.operator === "notin") && (!Array.isArray(f.value) || f.value.length === 0)) {
     return { error: 'An "is any of" filter needs a non-empty list of values.' };
+  }
+  // Dates picked by day ("2024-01-05") match a timestamp column by its day.
+  const type = columnNames instanceof Map ? columnNames.get(f.column) : null;
+  if ((f.operator === "in" || f.operator === "notin") && isDayList(type, f.value)) {
+    params.push(f.value.map(String));
+    const expr = `${quoteQualified(label, f.column)}::date = ANY($${params.length}::date[])`;
+    return { sql: f.operator === "in" ? expr : `NOT (${expr})` };
+  }
+  if ((f.operator === "eq" || f.operator === "neq") && isDayList(type, [f.value])) {
+    params.push(String(f.value));
+    const op = f.operator === "eq" ? "=" : "<>";
+    return { sql: `${quoteQualified(label, f.column)}::date ${op} $${params.length}::date` };
   }
   return { sql: compileFilterCondition(label, f.column, f.operator, f.value, params) };
 }

@@ -2,6 +2,7 @@ import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
 import { runNativeQuery, runWriteTransaction, paginateRows, quoteTable, quoteIdent, quoteQualified, compileRowIdentityWhere, compileConcurrencyWhere, ALLOWED_PAGE_SIZES, MAX_ROWS, MAX_BULK_WRITE_ROWS } from "../lib/queryEngine.js";
 import { previewWhereClause } from "../lib/previewFilters.js";
+import { groupOrderClause } from "../lib/groupOrder.js";
 import { previewOrderClause } from "../lib/previewOrder.js";
 import { wrap, sendQueryError, uid } from "./http.js";
 import { dbFillsIn } from "../lib/dbFillsIn.js";
@@ -25,7 +26,7 @@ async function resolveWritableTable(sourceId, tableId, secrets) {
   return {
     label: node.data.label,
     schema: node.data.schema ?? secrets.schema ?? null,
-    columnNames: new Set(columnByName.keys()),
+    columnNames: new Map(columns.map((c) => [c.name, c.type])),
     columnByName,
     pkColumns,
   };
@@ -166,7 +167,7 @@ dataRouter.post(
     // modeled table actually has can be sorted or filtered on. `label` is
     // the FROM range-table name - compileFilterCondition qualifies as
     // "label"."col", which binds to it whatever schema the FROM used.
-    const columnNames = new Set((node.data?.columns || []).map((c) => c.name));
+    const columnNames = new Map((node.data?.columns || []).map((c) => [c.name, c.type]));
     const label = node.data.label;
     const params = [];
     const wc = previewWhereClause(filterGroup, filters, columnNames, label, params);
@@ -872,7 +873,7 @@ dataRouter.post(
       return;
     }
     const modeledCols = node.data?.columns || [];
-    const columnNames = new Set(modeledCols.map((c) => c.name));
+    const columnNames = new Map(modeledCols.map((c) => [c.name, c.type]));
     if (!columnNames.has(column)) {
       res.status(400).json({ error: `"${column}" isn't a column of this table.` });
       return;
@@ -958,7 +959,7 @@ dataRouter.post(
     }
     const modeledCols = node.data?.columns || [];
     const typeByName = new Map(modeledCols.map((c) => [c.name, c.type]));
-    const columnNames = new Set(modeledCols.map((c) => c.name));
+    const columnNames = new Map(modeledCols.map((c) => [c.name, c.type]));
 
     // One bad { column, agg } is a client bug - reject the request rather
     // than silently dropping it (a type mismatch, handled below, is not).
@@ -1036,7 +1037,7 @@ dataRouter.post(
 dataRouter.post(
   "/sources/:sourceId/group-by",
   wrap(async (req, res) => {
-    const { tableId, groupColumn, filters = [], filterGroup = null, aggregates = [] } = req.body || {};
+    const { tableId, groupColumn, filters = [], filterGroup = null, aggregates = [], order = null } = req.body || {};
     if (!tableId || typeof groupColumn !== "string") {
       res.status(400).json({ error: "tableId and groupColumn are required." });
       return;
@@ -1057,7 +1058,7 @@ dataRouter.post(
       return;
     }
     const modeledCols = node.data?.columns || [];
-    const columnNames = new Set(modeledCols.map((c) => c.name));
+    const columnNames = new Map(modeledCols.map((c) => [c.name, c.type]));
     if (!columnNames.has(groupColumn)) {
       res.status(400).json({ error: `"${groupColumn}" isn't a column of this table.` });
       return;
@@ -1080,6 +1081,11 @@ dataRouter.post(
       res.status(400).json({ error: wc.error });
       return;
     }
+    const orderBy = groupOrderClause(order, groupColumn, columnNames);
+    if (orderBy.error) {
+      res.status(400).json({ error: orderBy.error });
+      return;
+    }
     const col = quoteIdent(groupColumn);
     try {
       const from = quoteTable(node.data.schema ?? secrets.schema ?? null, label);
@@ -1088,7 +1094,7 @@ dataRouter.post(
         `SELECT ${col}::text AS value, count(*)::bigint AS count` +
           aggregates.map((a, i) => `, ${a.fn}(${quoteIdent(a.column)})::text AS agg_${i}`).join("") +
           ` FROM ${from}${wc.clause} ` +
-          `GROUP BY ${col} ORDER BY count(*) DESC, ${col} ASC`,
+          `GROUP BY ${col} ORDER BY ${orderBy.clause}`,
         params,
         { offset: 0, pageSize: GROUP_BY_MAX_GROUPS },
       );
