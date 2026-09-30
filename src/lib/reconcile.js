@@ -72,8 +72,13 @@ function refreshColumns(nextNodes, refreshed, nodeIdMap) {
       const kept = byName.get(c.name) || {};
       const next = { ...kept, id: colIdMap.get(c.id) };
       for (const f of DB_COLUMN_FIELDS) next[f] = c[f] ?? null;
-      next.references = remapRef(c.references);
-      next.isForeignKey = !!(c.isForeignKey && next.references);
+      const dbRef = c.isForeignKey ? remapRef(c.references) : null;
+      if (dbRef) next.references = dbRef;
+      // No FK in the database: a link the app keeps (a virtual link, or one
+      // drawn by hand before virtual links existed) stays, marked virtual.
+      else if (kept.isForeignKey && kept.references?.tableId) next.references = { ...kept.references, virtual: true };
+      else next.references = null;
+      next.isForeignKey = !!next.references;
       if (c.autoIncrement) next.autoIncrement = true;
       else delete next.autoIncrement;
       return next;
@@ -158,7 +163,9 @@ function edgeSignature(nodesById, edge) {
 // it" - both simply look like "not there." A name/signature the ledger
 // already has is never re-added, no matter how many times it still shows
 // up in a fresh introspection. The ledger only ever grows.
-export function reconcileSchema(existingBranch, introspected, ledger) {
+// `scopeSchema`: the one schema this sync read (null = every schema). Only
+// synced tables inside it can be "dropped in the database".
+export function reconcileSchema(existingBranch, introspected, ledger, { scopeSchema = null } = {}) {
   const existingNodes = existingBranch.nodes || [];
   const existingEdges = existingBranch.edges || [];
   const existingEnums = existingBranch.enums || [];
@@ -316,9 +323,47 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
     existingEnumNames.add(incomingEnum.name);
   }
 
-  // A line whose column left a refreshed table (dropped in the database) goes too.
-  const nodesById = new Map(nextNodes.map((n) => [n.id, n]));
+  // Synced tables the database no longer has: out of the design, and out of
+  // the ledger so a table re-created later comes back.
+  const introspectedKeys = new Set(introspected.nodes.map((n) => tableKey(n.data?.schema, n.data?.label)));
+  const inScope = (n) => scopeSchema == null || (n.data?.schema ?? scopeSchema) === scopeSchema;
+  const removed = [];
+  const removedIds = new Set();
+  for (const n of nextNodes) {
+    if (n.type !== "tableNode" || n.data?.sourceOrigin !== "synced" || !inScope(n)) continue;
+    const key = tableKey(n.data?.schema ?? (scopeSchema || null), n.data?.label);
+    if (introspectedKeys.has(key) || introspectedKeys.has(n.data?.label)) continue;
+    removed.push(key);
+    removedIds.add(n.id);
+    ledgerTables.delete(key);
+    for (const sig of [...ledgerEdges]) {
+      if (sig.startsWith(`${key}.`) || sig.includes(`->${key}.`)) ledgerEdges.delete(sig);
+    }
+  }
+  const keptNodes = removedIds.size
+    ? nextNodes
+        .filter((n) => !removedIds.has(n.id))
+        .map((n) =>
+          n.data?.columns?.some((c) => removedIds.has(c.references?.tableId))
+            ? {
+                ...n,
+                data: {
+                  ...n.data,
+                  columns: n.data.columns.map((c) =>
+                    removedIds.has(c.references?.tableId) ? { ...c, references: null, isForeignKey: false } : c,
+                  ),
+                },
+              }
+            : n,
+        )
+    : nextNodes;
+
+  // A line whose column left a refreshed table (dropped in the database) goes
+  // too; lines into refreshed tables are flagged virtual unless the database
+  // has the link.
+  const nodesById = new Map(keptNodes.map((n) => [n.id, n]));
   const liveEdges = nextEdges.filter((e) => {
+    if (removedIds.has(e.source) || removedIds.has(e.target)) return false;
     for (const [nodeId, handle] of [
       [e.source, e.data?.sourceColumnHandle || e.sourceHandle],
       [e.target, e.data?.targetColumnHandle || e.targetHandle],
@@ -326,13 +371,19 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
       if (refreshedIds.has(nodeId) && handle && !findColumnByHandle(nodesById.get(nodeId), handle)) return false;
     }
     return true;
+  }).map((e) => {
+    if (!refreshedIds.has(e.target)) return e;
+    const col = findColumnByHandle(nodesById.get(e.target), e.data?.targetColumnHandle || e.targetHandle);
+    const virtual = !col?.references || !!col.references.virtual;
+    return !!e.data?.virtual === virtual ? e : { ...e, data: { ...e.data, virtual } };
   });
 
   return {
-    nodes: nextNodes,
+    nodes: keptNodes,
     edges: liveEdges,
     enums: nextEnums,
     added,
+    removed,
     conflicts,
     ledger: { tables: [...ledgerTables], edges: [...ledgerEdges] },
   };

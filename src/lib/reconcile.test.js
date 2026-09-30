@@ -66,9 +66,9 @@ test("reconcileSchema - resync back-fills data.schema on a legacy schema-less sy
 test("reconcileSchema - back-fill never overwrites an explicit public tag with a shop tag", () => {
   const pub = tableNode("e1", "public", "orders", [], "synced");
   const existing = { nodes: [pub], edges: [], enums: [] };
-  // A stray shop.orders from a genuinely multi-schema introspection.
+  // A stray shop.orders from a sync scoped to the shop schema.
   const introspected = { nodes: [tableNode("n1", "shop", "orders")], edges: [], enums: [] };
-  const result = reconcileSchema(existing, introspected, { tables: [], edges: [] });
+  const result = reconcileSchema(existing, introspected, { tables: [], edges: [] }, { scopeSchema: "shop" });
 
   const byName = result.nodes.map((n) => `${n.data.schema}.${n.data.label}`).sort();
   // public.orders is untouched; shop.orders is added as its own node.
@@ -172,4 +172,50 @@ test("reconcileSchema - refreshes a synced table's columns from the database, ke
   assert.equal(status.semanticType, "category");
   assert.deepEqual(cols[1].references, { tableId: "tc", columnId: "cid" }, "references use final ids");
   assert.deepEqual(result.edges.map((e) => e.id), ["e1"], "the dropped column's line goes, no duplicate line");
+});
+
+const col = (id, name, extra = {}) => ({ id, name, type: "bigint", typeParams: null, notNull: false, isUnique: false, isPrimaryKey: false, isForeignKey: false, references: null, default: "", ...extra });
+
+test("reconcileSchema - a table dropped in the database leaves the design and the ledger", () => {
+  const users = tableNode("tu", "public", "users", [col("u1", "id", { isPrimaryKey: true })]);
+  const posts = tableNode("tp", "public", "posts", [col("p1", "id"), col("p2", "user_id", { isForeignKey: true, references: { tableId: "tu", columnId: "u1" } })]);
+  const drawn = tableNode("td", "public", "sketch", [], "manual");
+  const edge = { id: "e", source: "tu", target: "tp", sourceHandle: "tu-u1-source", targetHandle: "tp-p2-target", data: {} };
+  const result = reconcileSchema(
+    { nodes: [users, posts, drawn], edges: [edge], enums: [] },
+    { nodes: [tableNode("n2", "public", "posts", [col("x1", "id"), col("x2", "user_id")])], edges: [], enums: [] },
+    { tables: ["users", "posts"], edges: ["users.id->posts.user_id"] },
+  );
+  assert.deepEqual(result.removed, ["users"]);
+  assert.deepEqual(result.nodes.map((n) => n.id).sort(), ["td", "tp"], "hand-drawn tables stay");
+  assert.equal(result.edges.length, 0);
+  assert.deepEqual(result.ledger.tables, ["posts"]);
+  assert.deepEqual(result.ledger.edges, []);
+  const userId = result.nodes.find((n) => n.id === "tp").data.columns.find((c) => c.name === "user_id");
+  assert.equal(userId.references, null, "no link to a table that's gone");
+});
+
+test("reconcileSchema - a link the database doesn't have stays, as a virtual link", () => {
+  const users = tableNode("tu", "public", "users", [col("u1", "id", { isPrimaryKey: true })]);
+  const posts = tableNode("tp", "public", "posts", [
+    col("p1", "id"),
+    col("p2", "user_id", { isForeignKey: true, references: { tableId: "tu", columnId: "u1" } }),
+  ]);
+  const edge = { id: "e", source: "tu", target: "tp", sourceHandle: "tu-u1-source", targetHandle: "tp-p2-target", data: {} };
+  const result = reconcileSchema(
+    { nodes: [users, posts], edges: [edge], enums: [] },
+    {
+      nodes: [
+        tableNode("n1", "public", "users", [col("x0", "id", { isPrimaryKey: true })]),
+        tableNode("n2", "public", "posts", [col("x1", "id"), col("x2", "user_id")]),
+      ],
+      edges: [],
+      enums: [],
+    },
+    { tables: ["users", "posts"], edges: [] },
+  );
+  const userId = result.nodes.find((n) => n.id === "tp").data.columns.find((c) => c.name === "user_id");
+  assert.deepEqual(userId.references, { tableId: "tu", columnId: "u1", virtual: true });
+  assert.equal(userId.isForeignKey, true);
+  assert.equal(result.edges[0].data.virtual, true);
 });

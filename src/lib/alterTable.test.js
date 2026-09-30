@@ -18,7 +18,7 @@ const cols = () => node.data.columns.map((c) => ({ ...c }));
 const sql = (changes, extra) => buildAlterStatements({ table: "orders", changes, ...extra }).statements;
 
 test("no changes -> nothing to run", () => {
-  assert.deepEqual(planAlter(node, cols()), { changes: [], blocked: [] });
+  assert.deepEqual(planAlter(node, cols()), { changes: [], blocked: [], designOnly: [] });
 });
 
 test("adds a column with type, default, required and unique", () => {
@@ -74,7 +74,7 @@ test("blocks what a live table can't take", () => {
   const { blocked } = planAlter(node, next);
   assert.equal(blocked.length, 5);
   assert.match(blocked.join("\n"), /primary key/);
-  assert.match(blocked.join("\n"), /link on "status"/);
+  assert.match(blocked.join("\n"), /"status" links to a table that wasn't found/);
   assert.match(blocked.join("\n"), /letters, numbers/);
   assert.match(blocked.join("\n"), /Two columns are named "note"/);
   assert.match(blocked.join("\n"), /can't be applied to the database \(money\)/);
@@ -95,4 +95,51 @@ test("parses designer defaults", () => {
   assert.deepEqual(parseDefault("'it''s'"), { kind: "value", value: "it's" });
   assert.deepEqual(parseDefault("pending"), { kind: "value", value: "pending" });
   assert.ok(parseDefault("random()").error);
+});
+
+const customers = { id: "tc", type: "tableNode", data: { label: "customers", sourceOrigin: "synced", columns: [col("k1", "id", "bigint", { isPrimaryKey: true })] } };
+const sketch = { id: "ts", type: "tableNode", data: { label: "sketch", columns: [col("s1", "id", "bigint")] } };
+const nodes = [{ id: "to", type: "tableNode", data: node.data }, customers, sketch];
+const link = (extra = {}) => ({ isForeignKey: true, references: { tableId: "tc", columnId: "k1", ...extra } });
+const withCol = (id, patch) => cols().map((c) => (c.id === id ? { ...c, ...patch } : c));
+
+test("links: add a database link, keep one app-only, remove, and soften", () => {
+  const add = planAlter(node, withCol("c3", link()), { nodes });
+  assert.deepEqual(sql(add.changes), [
+    `ALTER TABLE "orders" ADD CONSTRAINT "orders_amount_fkey" FOREIGN KEY ("amount") REFERENCES "customers" ("id");`,
+  ]);
+  const virt = planAlter(node, withCol("c3", link({ virtual: true })), { nodes });
+  assert.deepEqual(virt.changes, []);
+  assert.match(virt.designOnly[0], /App-only link: "amount" → customers.id/);
+
+  const linked = { data: { columns: node.data.columns.map((c) => (c.id === "c3" ? { ...c, ...link() } : c)) } };
+  const drop = planAlter(linked, cols(), { nodes });
+  assert.deepEqual(sql(drop.changes, { fkConstraints: { amount: "orders_amount_fkey" } }), [
+    `ALTER TABLE "orders" DROP CONSTRAINT "orders_amount_fkey";`,
+  ]);
+  const soften = planAlter(linked, withCol("c3", link({ virtual: true })), { nodes });
+  assert.deepEqual(soften.changes.map((c) => c.op), ["dropFk"]);
+  assert.equal(soften.designOnly.length, 1);
+});
+
+test("links: a new column can link; a design-only target gets an app-only link only", () => {
+  const withNew = planAlter(node, [...cols(), col("n9", "customer_id", "bigint", link())], { nodes });
+  assert.deepEqual(sql(withNew.changes), [
+    `ALTER TABLE "orders" ADD COLUMN "customer_id" bigint;`,
+    `ALTER TABLE "orders" ADD CONSTRAINT "orders_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "customers" ("id");`,
+  ]);
+  const toSketch = { isForeignKey: true, references: { tableId: "ts", columnId: "s1" } };
+  assert.match(planAlter(node, withCol("c3", toSketch), { nodes }).blocked[0], /only exists in the design/);
+  const sketchVirtual = { isForeignKey: true, references: { tableId: "ts", columnId: "s1", virtual: true } };
+  assert.deepEqual(planAlter(node, withCol("c3", sketchVirtual), { nodes }).blocked, []);
+});
+
+test("renames the table last, after the column changes", () => {
+  const { changes, blocked } = planAlter(node, withCol("c4", { name: "memo" }), { nodes, name: "purchases" });
+  assert.deepEqual(blocked, []);
+  assert.deepEqual(sql(changes), [
+    `ALTER TABLE "orders" RENAME COLUMN "note" TO "memo";`,
+    `ALTER TABLE "orders" RENAME TO "purchases";`,
+  ]);
+  assert.match(planAlter(node, cols(), { nodes, name: "customers" }).blocked[0], /already exists/);
 });

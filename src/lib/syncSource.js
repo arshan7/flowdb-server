@@ -40,7 +40,7 @@ export async function syncSource(sourceId) {
   }
 
   const ledger = await store.getSourceSyncLedger(sourceId);
-  const result = reconcileSchema(branch, introspected, ledger);
+  const result = reconcileSchema(branch, introspected, ledger, { scopeSchema: secrets.schema ?? null });
   await store.saveBranch(sourceId, branch.id, {
     nodes: result.nodes,
     edges: result.edges,
@@ -51,5 +51,5 @@ export async function syncSource(sourceId) {
   await store.saveSourceSyncLedger(sourceId, result.ledger);
   await store.markSourceSynced(sourceId);
 
-  return { added: result.added, conflicts: result.conflicts };
+  return { added: result.added, removed: result.removed, conflicts: result.conflicts };
 }

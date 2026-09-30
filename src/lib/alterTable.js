@@ -68,16 +68,56 @@ const sameDefault = (a, b) => String(a ?? "").trim() === String(b ?? "").trim();
 const sameRef = (a, b) =>
   (a?.tableId ?? null) === (b?.tableId ?? null) && (a?.columnId ?? null) === (b?.columnId ?? null);
 
+const realRef = (col) => (col?.isForeignKey && col.references && !col.references.virtual ? col.references : null);
+const anyRef = (col) => (col?.isForeignKey && col.references ? col.references : null);
+
 /**
  * Diffs the stored table against the wanted columns (matched by column id).
- * @returns {{ changes: object[], blocked: string[] }}
+ * A link (`references`) is real (a FK constraint) or `virtual` (the app's
+ * own; no SQL). `nodes` resolves link targets; `name` renames the table.
+ * @returns {{ changes: object[], blocked: string[], designOnly: string[] }}
  *   changes (by name, in the order they must run):
- *     { op: "drop", name } | { op: "rename", from, to } | { op: "dropDefault", name }
- *     { op: "type", name, col } | { op: "setDefault", name, col } | { op: "notNull", name, notNull }
- *     { op: "unique", name, unique } | { op: "add", id, col, notNull, unique }
+ *     { op: "dropFk", name } | { op: "drop", name } | { op: "rename", from, to }
+ *     { op: "dropDefault", name } | { op: "type", name, col } | { op: "setDefault", name, col }
+ *     { op: "notNull", name, notNull } | { op: "unique", name, unique }
+ *     { op: "add", id, col, notNull, unique } | { op: "addFk", name, refSchema, refTable, refColumn }
+ *     { op: "renameTable", to }
+ *   designOnly: app-only link edits, described for the review
  */
-export function planAlter(node, wanted) {
+export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
   const blocked = [];
+  const designOnly = [];
+  const dropFks = [];
+  const addFks = [];
+  const target = (ref) => {
+    const t = nodes.find((n) => n.id === ref.tableId);
+    const c = t?.data?.columns?.find((x) => x.id === ref.columnId);
+    return t && c ? { node: t, col: c, label: `${t.data.label}.${c.name}` } : null;
+  };
+  // Link edits on one column (old = as stored, col = as wanted; either may be missing).
+  const planLink = (old, col) => {
+    const before = anyRef(old);
+    const after = anyRef(col);
+    if (before && after && sameRef(before, after) && !!before.virtual === !!after.virtual) return;
+    if (!before && !after) return;
+    if (realRef(old)) dropFks.push({ op: "dropFk", name: old.name });
+    else if (before && col) designOnly.push(`Remove the app-only link on "${old.name}".`);
+    if (!after) return;
+    const t = target(after);
+    if (!t) {
+      blocked.push(`"${col.name}" links to a table that wasn't found. Sync, then try again.`);
+      return;
+    }
+    if (after.virtual) {
+      designOnly.push(`App-only link: "${col.name}" → ${t.label} (nothing changes in the database).`);
+      return;
+    }
+    if (t.node.data?.sourceOrigin !== "synced") {
+      blocked.push(`"${t.node.data.label}" only exists in the design, so "${col.name}" can link to it in the app only.`);
+      return;
+    }
+    addFks.push({ op: "addFk", name: col.name, refSchema: t.node.data.schema ?? null, refTable: t.node.data.label, refColumn: t.col.name });
+  };
   const before = node?.data?.columns || [];
   const byId = new Map(before.map((c) => [c.id, c]));
   const wantedIds = new Set(wanted.map((c) => c.id));
@@ -114,7 +154,7 @@ export function planAlter(node, wanted) {
     const old = byId.get(col.id);
     if (!old) {
       if (col.isPrimaryKey) blocked.push(`New column "${col.name}" can't be the primary key of a live table.`);
-      if (col.isForeignKey || col.references) blocked.push(`Link "${col.name}" after it exists: adding a column with a link isn't supported yet.`);
+      planLink(null, col);
       const pg = toPgColumn(col);
       if (pg.error) blocked.push(pg.error);
       else adds.push({ op: "add", id: col.id, col: pg.col, notNull: !!col.notNull, unique: !!col.isUnique });
@@ -125,9 +165,7 @@ export function planAlter(node, wanted) {
     if (!!old.isPrimaryKey !== !!col.isPrimaryKey) {
       blocked.push(`Changing the primary key ("${name}") isn't supported for a live table.`);
     }
-    if (!!old.isForeignKey !== !!col.isForeignKey || !sameRef(old.references, col.references)) {
-      blocked.push(`Changing the link on "${name}" isn't supported for a live table yet.`);
-    }
+    planLink(old, col);
     const typeChanged = old.type !== col.type || !sameTypeParams(old.typeParams, col.typeParams);
     const defaultChanged = !sameDefault(old.default, col.default);
     if (typeChanged || defaultChanged) {
@@ -145,18 +183,28 @@ export function planAlter(node, wanted) {
     if (!!old.isUnique !== !!col.isUnique && !col.isPrimaryKey) uniques.push({ op: "unique", name, unique: !!col.isUnique });
   }
 
+  const renameTable = [];
+  if (tableName != null && tableName !== node?.data?.label) {
+    const err = checkName(tableName, "The table");
+    if (err) blocked.push(err);
+    else if (nodes.some((n) => n.id !== node.id && n.type === "tableNode" && (n.data?.schema ?? null) === (node.data?.schema ?? null) && String(n.data?.label).toLowerCase() === tableName.toLowerCase())) {
+      blocked.push(`A table named "${tableName}" already exists.`);
+    } else renameTable.push({ op: "renameTable", to: tableName });
+  }
+
   return {
-    changes: [...drops, ...renames, ...dropDefaults, ...types, ...setDefaults, ...notNulls, ...uniques, ...adds],
+    designOnly,
+    changes: [...dropFks, ...drops, ...renames, ...dropDefaults, ...types, ...setDefaults, ...notNulls, ...uniques, ...adds, ...addFks, ...renameTable],
     blocked,
   };
 }
 
 /**
- * @param {{ schema?: string, table: string, changes: object[], uniqueConstraints?: Record<string, string> }} p
- *   uniqueConstraints: column name -> the name of its single-column UNIQUE constraint (for dropping)
+ * @param {{ schema?: string, table: string, changes: object[], uniqueConstraints?: Record<string, string>, fkConstraints?: Record<string, string> }} p
+ *   uniqueConstraints / fkConstraints: column name -> its single-column UNIQUE / FOREIGN KEY constraint (for dropping)
  * @returns {{ statements: string[] } | { error: string }}
  */
-export function buildAlterStatements({ schema, table, changes, uniqueConstraints = {} }) {
+export function buildAlterStatements({ schema, table, changes, uniqueConstraints = {}, fkConstraints = {} }) {
   const t = `ALTER TABLE ${quoteTable(schema, table)}`;
   const out = [];
   for (const c of changes) {
@@ -207,6 +255,22 @@ export function buildAlterStatements({ schema, table, changes, uniqueConstraints
         out.push(`${parts.join(" ")};`);
         break;
       }
+      case "dropFk": {
+        const cname = fkConstraints[c.name];
+        if (!cname) return { error: `Couldn't find the database link on "${c.name}".` };
+        out.push(`${t} DROP CONSTRAINT ${quoteIdent(cname)};`);
+        break;
+      }
+      case "addFk": {
+        const cname = `${table}_${c.name}_fkey`.slice(0, MAX_IDENT);
+        out.push(
+          `${t} ADD CONSTRAINT ${quoteIdent(cname)} FOREIGN KEY (${quoteIdent(c.name)}) REFERENCES ${quoteTable(c.refSchema, c.refTable)} (${quoteIdent(c.refColumn)});`,
+        );
+        break;
+      }
+      case "renameTable":
+        out.push(`${t} RENAME TO ${quoteIdent(c.to)};`);
+        break;
       default:
         return { error: "Unknown change." };
     }
