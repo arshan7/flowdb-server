@@ -3,6 +3,7 @@ import * as store from "../lib/tablespaceStore.js";
 import { runNativeQuery, runWriteTransaction, paginateRows, quoteTable, quoteIdent, quoteQualified, compileRowIdentityWhere, compileConcurrencyWhere, ALLOWED_PAGE_SIZES, MAX_ROWS, MAX_BULK_WRITE_ROWS } from "../lib/queryEngine.js";
 import { previewWhereClause } from "../lib/previewFilters.js";
 import { groupOrderClause } from "../lib/groupOrder.js";
+import { reverseEntry } from "../lib/auditUndo.js";
 import { previewOrderClause } from "../lib/previewOrder.js";
 import { wrap, sendQueryError, uid } from "./http.js";
 import { dbFillsIn } from "../lib/dbFillsIn.js";
@@ -14,6 +15,11 @@ import { dbFillsIn } from "../lib/dbFillsIn.js";
 // write may touch, and the introspected primary-key column names (empty
 // when the table has none, the ctid-fallback case). Five write routes
 // share this rather than each repeating /preview's lookup inline.
+const stripCtid = (row) => {
+  if (!row) return null;
+  const { ctid: _ctid, ...rest } = row;
+  return rest;
+};
 async function resolveWritableTable(sourceId, tableId, secrets) {
   const branch = await store.getMainBranch(sourceId);
   const node = (branch?.nodes || []).find((n) => n.id === tableId && n.type === "tableNode");
@@ -308,7 +314,7 @@ dataRouter.post(
       const identity = table.pkColumns.length
         ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
         : { ctid: row.ctid };
-      await store.insertAuditLog(req.params.sourceId, {
+      const audit = await store.insertAuditLog(req.params.sourceId, {
         ownerUserId: uid(req),
         tableId,
         tableSchema: table.schema,
@@ -318,7 +324,7 @@ dataRouter.post(
         before: null,
         after: row,
       });
-      res.status(201).json({ row });
+      res.status(201).json({ row, auditIds: [Number(audit.id)] });
     } catch (err) {
       sendQueryError(res, "insert row", err);
     }
@@ -398,7 +404,7 @@ dataRouter.patch(
         }
         return;
       }
-      await store.insertAuditLog(req.params.sourceId, {
+      const audit = await store.insertAuditLog(req.params.sourceId, {
         ownerUserId: uid(req),
         tableId,
         tableSchema: table.schema,
@@ -408,7 +414,7 @@ dataRouter.patch(
         before: outcome.before,
         after: outcome.row,
       });
-      res.json({ row: outcome.row });
+      res.json({ row: outcome.row, auditIds: [Number(audit.id)] });
     } catch (err) {
       sendQueryError(res, "update row", err);
     }
@@ -497,25 +503,38 @@ dataRouter.patch(
         res.status(400).json({ error: updateWc.error });
         return;
       }
-      const sql = `UPDATE ${from} SET ${setParts.join(", ")}${updateWc.clause} RETURNING *, ctid::text AS ctid`;
-      const result = await runWriteTransaction(secrets.connectionString, (client) => client.query(sql, updateParams));
-      await Promise.all(
-        result.rows.map((row) =>
-          store.insertAuditLog(req.params.sourceId, {
-            ownerUserId: uid(req),
-            tableId,
-            tableSchema: table.schema,
-            tableName: table.label,
-            operation: "update",
-            rowIdentity: table.pkColumns.length
-              ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
-              : { ctid: row.ctid },
-            before: null,
-            after: row,
-          }),
-        ),
+      // Read the rows first (locked), so each audit entry keeps its before-state
+      // and the change can be undone.
+      const result = await runWriteTransaction(secrets.connectionString, async (client) => {
+        const old = await client.query(
+          `SELECT *, ctid::text AS ctid FROM ${from}${countWc.clause} FOR UPDATE`,
+          countParams,
+        );
+        const updated = await client.query(
+          `UPDATE ${from} SET ${setParts.join(", ")}${updateWc.clause} RETURNING *, ctid::text AS ctid`,
+          updateParams,
+        );
+        return { old: old.rows, rows: updated.rows };
+      });
+      const keyOf = (row) =>
+        table.pkColumns.length ? JSON.stringify(table.pkColumns.map((c) => row[c])) : row.ctid;
+      const beforeByKey = new Map(result.old.map((r) => [keyOf(r), r]));
+      const auditIds = await store.insertAuditLogs(
+        req.params.sourceId,
+        result.rows.map((row) => ({
+          ownerUserId: uid(req),
+          tableId,
+          tableSchema: table.schema,
+          tableName: table.label,
+          operation: "update",
+          rowIdentity: table.pkColumns.length
+            ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
+            : { ctid: row.ctid },
+          before: stripCtid(beforeByKey.get(keyOf(row))),
+          after: row,
+        })),
       );
-      res.json({ updatedCount: result.rowCount });
+      res.json({ updatedCount: result.rows.length, auditIds });
     } catch (err) {
       sendQueryError(res, "bulk update rows", err);
     }
@@ -564,23 +583,22 @@ dataRouter.delete(
 
     try {
       const result = await runWriteTransaction(secrets.connectionString, (client) => client.query(sql, params));
-      await Promise.all(
-        result.rows.map((row) =>
-          store.insertAuditLog(req.params.sourceId, {
-            ownerUserId: uid(req),
-            tableId,
-            tableSchema: table.schema,
-            tableName: table.label,
-            operation: "delete",
-            rowIdentity: table.pkColumns.length
-              ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
-              : { ctid: row.ctid },
-            before: row,
-            after: null,
-          }),
-        ),
+      const auditIds = await store.insertAuditLogs(
+        req.params.sourceId,
+        result.rows.map((row) => ({
+          ownerUserId: uid(req),
+          tableId,
+          tableSchema: table.schema,
+          tableName: table.label,
+          operation: "delete",
+          rowIdentity: table.pkColumns.length
+            ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
+            : { ctid: row.ctid },
+          before: row,
+          after: null,
+        })),
       );
-      res.json({ deletedCount: result.rows.length });
+      res.json({ deletedCount: result.rows.length, auditIds });
     } catch (err) {
       sendQueryError(res, "delete rows", err);
     }
@@ -637,23 +655,22 @@ dataRouter.post(
         }
         return client.query(`DELETE FROM ${from}${wc.clause} RETURNING *, ctid::text AS ctid`, params);
       });
-      await Promise.all(
-        result.rows.map((row) =>
-          store.insertAuditLog(req.params.sourceId, {
-            ownerUserId: uid(req),
-            tableId,
-            tableSchema: table.schema,
-            tableName: table.label,
-            operation: "delete",
-            rowIdentity: table.pkColumns.length
-              ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
-              : { ctid: row.ctid },
-            before: row,
-            after: null,
-          }),
-        ),
+      const auditIds = await store.insertAuditLogs(
+        req.params.sourceId,
+        result.rows.map((row) => ({
+          ownerUserId: uid(req),
+          tableId,
+          tableSchema: table.schema,
+          tableName: table.label,
+          operation: "delete",
+          rowIdentity: table.pkColumns.length
+            ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
+            : { ctid: row.ctid },
+          before: row,
+          after: null,
+        })),
       );
-      res.json({ deletedCount: result.rows.length });
+      res.json({ deletedCount: result.rows.length, auditIds });
     } catch (err) {
       if (err.isLimit) {
         res.status(400).json({ error: err.message });
@@ -726,7 +743,7 @@ dataRouter.post(
         return;
       }
       const row = result.rows[0];
-      await store.insertAuditLog(req.params.sourceId, {
+      const audit = await store.insertAuditLog(req.params.sourceId, {
         ownerUserId: uid(req),
         tableId,
         tableSchema: table.schema,
@@ -738,7 +755,7 @@ dataRouter.post(
         before: null,
         after: row,
       });
-      res.status(201).json({ row });
+      res.status(201).json({ row, auditIds: [Number(audit.id)] });
     } catch (err) {
       sendQueryError(res, "duplicate row", err);
     }
@@ -757,118 +774,79 @@ dataRouter.get(
   }),
 );
 
-// Undo one audit-log entry (REC-07) - replays its before/after snapshot in
-// reverse: a delete is undone by re-inserting `before`, an insert by
-// deleting the row it created, an update by writing `before` back. Each
-// undo is itself written back to the audit log as its own entry (an insert
-// undoing a delete, etc.) - undoing is just another write, not a special
-// hidden state, so the history stays a complete, replayable record.
+// Undo audit-log entries (REC-07): each is replayed in reverse (lib/auditUndo.js)
+// and the reverse write is logged too, so undoing an undo is a redo. The
+// response carries the new entries' ids - what the client undoes next time.
+async function undoEntries(req, res, ids) {
+  const entries = await store.getAuditLogEntries(req.params.sourceId, ids);
+  if (entries.length !== ids.length) {
+    res.status(404).json({ error: "Some of those changes aren't in the history any more." });
+    return;
+  }
+  const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+  if (!secrets) {
+    res.status(400).json({ error: "This source isn't connected." });
+    return;
+  }
+  const tables = new Map();
+  for (const e of entries) {
+    if (tables.has(e.tableId)) continue;
+    const t = await resolveWritableTable(req.params.sourceId, e.tableId, secrets);
+    if (t.error) {
+      res.status(t.status).json({ error: t.error });
+      return;
+    }
+    tables.set(e.tableId, { ...t, from: quoteTable(t.schema, t.label) });
+  }
+  try {
+    // Newest first, all or nothing.
+    const records = await runWriteTransaction(secrets.connectionString, async (client) => {
+      const out = [];
+      for (const e of entries) {
+        const t = tables.get(e.tableId);
+        out.push(await reverseEntry(client, e, t, t.from));
+      }
+      return out;
+    });
+    const auditIds = await store.insertAuditLogs(
+      req.params.sourceId,
+      records.map(({ row: _row, ...r }) => ({ ...r, ownerUserId: uid(req) })),
+    );
+    res.status(201).json({
+      undone: records.length,
+      auditIds,
+      rows: records.map((r) => ({ operation: r.operation, rowIdentity: r.rowIdentity, row: r.row })),
+    });
+  } catch (err) {
+    if (err.status) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    sendQueryError(res, "undo", err);
+  }
+}
+
 dataRouter.post(
   "/sources/:sourceId/audit-log/:auditId/undo",
   wrap(async (req, res) => {
-    const entry = await store.getAuditLogEntry(req.params.sourceId, req.params.auditId);
-    if (!entry) {
-      res.status(404).json({ error: "Audit entry not found." });
+    const id = Number(req.params.auditId);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: "Invalid audit entry id." });
       return;
     }
-    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
-    if (!secrets) {
-      res.status(400).json({ error: "This source isn't connected." });
+    await undoEntries(req, res, [id]);
+  }),
+);
+
+dataRouter.post(
+  "/sources/:sourceId/audit-log/undo",
+  wrap(async (req, res) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_BULK_WRITE_ROWS || !ids.every(Number.isInteger)) {
+      res.status(400).json({ error: `ids must be 1 to ${MAX_BULK_WRITE_ROWS} audit entry ids.` });
       return;
     }
-    const table = await resolveWritableTable(req.params.sourceId, entry.tableId, secrets);
-    if (table.error) {
-      res.status(table.status).json({ error: table.error });
-      return;
-    }
-    const from = quoteTable(table.schema, table.label);
-
-    try {
-      if (entry.operation === "delete") {
-        if (!entry.before) {
-          res.status(400).json({ error: "Nothing to restore." });
-          return;
-        }
-        const cols = Object.keys(entry.before).filter((c) => table.columnNames.has(c));
-        const params = [];
-        const placeholders = cols.map((c) => {
-          params.push(entry.before[c]);
-          return `$${params.length}`;
-        });
-        const sql = `INSERT INTO ${from} (${cols.map((c) => quoteIdent(c)).join(", ")}) VALUES (${placeholders.join(", ")}) RETURNING *, ctid::text AS ctid`;
-        const result = await runWriteTransaction(secrets.connectionString, (client) => client.query(sql, params));
-        const row = result.rows[0];
-        await store.insertAuditLog(req.params.sourceId, {
-          ownerUserId: uid(req),
-          tableId: entry.tableId,
-          tableSchema: table.schema,
-          tableName: table.label,
-          operation: "insert",
-          rowIdentity: table.pkColumns.length ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) } : { ctid: row.ctid },
-          before: null,
-          after: row,
-        });
-        res.status(201).json({ row });
-        return;
-      }
-
-      if (entry.operation === "insert") {
-        const params = [];
-        const whereClause = compileRowIdentityWhere(table.label, entry.rowIdentity, params);
-        const sql = `DELETE FROM ${from} WHERE ${whereClause} RETURNING *, ctid::text AS ctid`;
-        const result = await runWriteTransaction(secrets.connectionString, (client) => client.query(sql, params));
-        if (result.rowCount === 0) {
-          res.status(404).json({ error: "This row no longer exists." });
-          return;
-        }
-        const row = result.rows[0];
-        await store.insertAuditLog(req.params.sourceId, {
-          ownerUserId: uid(req),
-          tableId: entry.tableId,
-          tableSchema: table.schema,
-          tableName: table.label,
-          operation: "delete",
-          rowIdentity: entry.rowIdentity,
-          before: row,
-          after: null,
-        });
-        res.json({ deletedCount: 1 });
-        return;
-      }
-
-      // update
-      if (!entry.before) {
-        res.status(400).json({ error: "Nothing to restore." });
-        return;
-      }
-      const cols = Object.keys(entry.before).filter((c) => table.columnNames.has(c));
-      const params = [];
-      const setParts = cols.map((c) => {
-        params.push(entry.before[c]);
-        return `${quoteIdent(c)} = $${params.length}`;
-      });
-      const whereClause = compileRowIdentityWhere(table.label, entry.rowIdentity, params);
-      const sql = `UPDATE ${from} SET ${setParts.join(", ")} WHERE ${whereClause} RETURNING *, ctid::text AS ctid`;
-      const result = await runWriteTransaction(secrets.connectionString, (client) => client.query(sql, params));
-      if (result.rowCount === 0) {
-        res.status(409).json({ error: "This row has since changed or no longer exists." });
-        return;
-      }
-      const row = result.rows[0];
-      await store.insertAuditLog(req.params.sourceId, {
-        ownerUserId: uid(req),
-        tableId: entry.tableId,
-        tableSchema: table.schema,
-        tableName: table.label,
-        operation: "update",
-        rowIdentity: entry.rowIdentity,
-        before: entry.after,
-        after: row,
-      });
-      res.json({ row });
-    } catch (err) {
-      sendQueryError(res, "undo", err);
-    }
+    await undoEntries(req, res, ids);
   }),
 );
 

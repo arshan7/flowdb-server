@@ -1080,6 +1080,42 @@ export async function insertAuditLog(sourceId, {
   return rows[0];
 }
 
+// Many audit rows in one statement (a bulk write or a batch undo). Returns
+// their ids in input order.
+export async function insertAuditLogs(sourceId, records) {
+  if (!records.length) return [];
+  const params = [];
+  const values = records.map((r) => {
+    const cols = [sourceId, r.ownerUserId, r.tableId, r.tableSchema, r.tableName, r.operation,
+      toAuditJson(r.rowIdentity), toAuditJson(r.before), toAuditJson(r.after)];
+    const ph = cols.map((v) => {
+      params.push(v);
+      return `$${params.length}`;
+    });
+    return `(${ph.join(", ")}, clock_timestamp())`;
+  });
+  const { rows } = await query(
+    `INSERT INTO tablespace_audit_log
+       (source_id, owner_user_id, table_id, table_schema, table_name, operation, row_identity, before, after, created_at)
+     VALUES ${values.join(", ")}
+     RETURNING id`,
+    params,
+  );
+  return rows.map((r) => Number(r.id));
+}
+
+export async function getAuditLogEntries(sourceId, ids) {
+  const { rows } = await query(
+    `SELECT id, source_id AS "sourceId", owner_user_id AS "ownerUserId", table_id AS "tableId",
+       table_schema AS "tableSchema", table_name AS "tableName", operation,
+       row_identity AS "rowIdentity", before, after, created_at AS "createdAt"
+     FROM tablespace_audit_log WHERE source_id = $1 AND id = ANY($2::bigint[])
+     ORDER BY id DESC`,
+    [sourceId, ids],
+  );
+  return rows;
+}
+
 export async function getAuditLogEntry(sourceId, auditId) {
   const { rows } = await query(
     `SELECT id, source_id AS "sourceId", owner_user_id AS "ownerUserId", table_id AS "tableId",
