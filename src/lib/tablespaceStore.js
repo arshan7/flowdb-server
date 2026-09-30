@@ -1142,3 +1142,45 @@ export async function listAuditLog(sourceId, { tableId = null, limit = 200 } = {
   );
   return rows;
 }
+
+// --- Saved views (Data screen): named table views, per owner -------------
+const VIEW_COLS = `id, table_id AS "tableId", name, view, created_at AS "createdAt", updated_at AS "updatedAt"`;
+
+export async function listSavedViews(sourceId, ownerUserId, tableId) {
+  const { rows } = await query(
+    `SELECT ${VIEW_COLS} FROM tablespace_saved_views
+     WHERE source_id = $1 AND owner_user_id = $2 AND table_id = $3
+     ORDER BY lower(name), id`,
+    [sourceId, ownerUserId, tableId],
+  );
+  return rows;
+}
+
+export async function createSavedView(sourceId, ownerUserId, { tableId, name, view }) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_saved_views (source_id, owner_user_id, table_id, name, view)
+     VALUES ($1, $2, $3, $4, $5) RETURNING ${VIEW_COLS}`,
+    [sourceId, ownerUserId, tableId, name, JSON.stringify(view)],
+  );
+  return rows[0];
+}
+
+// Only the fields given change. Null when it isn't this owner's view.
+export async function updateSavedView(sourceId, ownerUserId, id, { name, view }) {
+  const { rows } = await query(
+    `UPDATE tablespace_saved_views
+     SET name = COALESCE($4, name), view = COALESCE($5::jsonb, view), updated_at = now()
+     WHERE id = $1 AND source_id = $2 AND owner_user_id = $3
+     RETURNING ${VIEW_COLS}`,
+    [id, sourceId, ownerUserId, name ?? null, view === undefined ? null : JSON.stringify(view)],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteSavedView(sourceId, ownerUserId, id) {
+  const { rowCount } = await query(
+    `DELETE FROM tablespace_saved_views WHERE id = $1 AND source_id = $2 AND owner_user_id = $3`,
+    [id, sourceId, ownerUserId],
+  );
+  return rowCount > 0;
+}
