@@ -34,7 +34,7 @@ modelsRouter.post(
     // view filter over the model's OUTPUT columns, never part of the saved
     // model (that stays `model.filters`, resolved by resolveModelSql as
     // before, untouched here).
-    const { model: bodyModel, modelId, limit, offset = 0, pageSize, orderBy = null, filterGroup = null } = req.body || {};
+    const { model: bodyModel, modelId, limit, offset = 0, pageSize, orderBy = null, filterGroup = null, withTotal = false } = req.body || {};
     const size = ALLOWED_PAGE_SIZES.includes(pageSize)
       ? pageSize
       : Math.max(1, Math.min(Number(limit) || 50, 200));
@@ -86,6 +86,9 @@ modelsRouter.post(
       sql = `SELECT * FROM (${compiled.sql}) AS _ms${wc.clause}`;
       wrapped = true;
     }
+    // Counted before ORDER BY is added; the pager's "of N".
+    const countSql = `SELECT count(*)::bigint AS n FROM (${sql}) AS _mc`;
+    const countParams = [...params];
     if (orderBy && typeof orderBy === "object" && Number.isInteger(orderBy.ordinal) && orderBy.ordinal >= 1) {
       const maxOrdinal = Array.isArray(compiled.columns) ? compiled.columns.length : null;
       if (maxOrdinal && orderBy.ordinal > maxOrdinal) {
@@ -103,12 +106,16 @@ modelsRouter.post(
     }
 
     try {
-      const out = await runNativeQuery(secrets.connectionString, sql, params, { offset, pageSize: size });
+      const [out, counted] = await Promise.all([
+        runNativeQuery(secrets.connectionString, sql, params, { offset, pageSize: size }),
+        withTotal ? runNativeQuery(secrets.connectionString, countSql, countParams, { pageSize: 1 }) : null,
+      ]);
       const { rows, hasMore } = paginateRows(out.rows, size);
       res.json({
         columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
         rows,
         hasMore,
+        total: counted ? Number(counted.rows[0]?.n ?? 0) : null,
         sql: compiled.sql,
         params: compiled.params,
       });
