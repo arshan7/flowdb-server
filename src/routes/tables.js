@@ -1,7 +1,8 @@
 import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
-import { runWriteTransaction } from "../lib/queryEngine.js";
+import { runWriteTransaction, runQuery } from "../lib/queryEngine.js";
 import { buildCreateTable } from "../lib/ddl.js";
+import { planAlter, buildAlterStatements } from "../lib/alterTable.js";
 import { syncSource } from "../lib/syncSource.js";
 import { logger } from "../lib/logger.js";
 import { wrap, sendQueryError } from "./http.js";
@@ -105,6 +106,136 @@ tablesRouter.post(
         sync: null,
         syncError: "The table was created, but refreshing the schema failed. Use Sync now to pull it in.",
       });
+    }
+  }),
+);
+
+// Postgres codes an ALTER TABLE commonly fails with, in the user's words.
+const ALTER_ERRORS = {
+  "22P02": [400, "Some existing values can't be converted to the new type."],
+  "22007": [400, "Some existing values aren't valid dates or times."],
+  "22003": [400, "Some existing values are too big for the new type."],
+  "22001": [400, "Some existing values are longer than the new length."],
+  "42804": [400, "Some existing values can't be converted to the new type."],
+  "23502": [400, "A required column would have empty values: fill in the empty ones first, or give a new required column a default."],
+  "23505": [400, "A column you made unique has duplicate values."],
+  "2BP01": [409, "Something else in the database depends on that column (a link, view or index)."],
+  "42701": [409, "A column with that name already exists in the database."],
+  "42703": [409, "The table changed in the database since the last sync. Sync, then try again."],
+  "42501": [403, "The database user this source connects as isn't allowed to change this table."],
+};
+
+// Single-column UNIQUE constraint names, for turning "unique" off.
+async function uniqueConstraintNames(connectionString, schema, table) {
+  const rows = await runQuery(
+    connectionString,
+    `SELECT a.attname AS column_name, con.conname AS name
+       FROM pg_constraint con
+       JOIN pg_class rel ON rel.oid = con.conrelid
+       JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+       JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = con.conkey[1]
+      WHERE con.contype = 'u' AND array_length(con.conkey, 1) = 1
+        AND ns.nspname = $1 AND rel.relname = $2`,
+    [schema || "public", table],
+  );
+  return Object.fromEntries(rows.map((r) => [r.column_name, r.name]));
+}
+
+// POST { columns, dryRun? } - edit a live (synced) table's columns: the
+// designer sends the columns it wants (ids from the main branch); the diff
+// runs here. See docs/LIVE_TABLE_EDITS.md.
+//   dryRun -> { sql, changes }            (the review step)
+//   else   -> { sql, sync | null, syncError? }
+tablesRouter.post(
+  "/sources/:sourceId/tables/:tableId/alter",
+  wrap(async (req, res) => {
+    const { columns, dryRun } = req.body || {};
+    if (!Array.isArray(columns) || columns.some((c) => !c || typeof c.id !== "string")) {
+      res.status(400).json({ error: "Send the table's columns." });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "Connect this source to a database before changing tables." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const node = (branch?.nodes || []).find((n) => n.type === "tableNode" && n.id === req.params.tableId);
+    if (!node) {
+      res.status(404).json({ error: "That table wasn't found. Sync, then try again." });
+      return;
+    }
+    if (node.data?.sourceOrigin !== "synced") {
+      res.status(400).json({ error: "This table only exists in the design; there's nothing to change in the database." });
+      return;
+    }
+    const schema = node.data.schema ?? secrets.schema ?? null;
+    const table = node.data.label;
+
+    const plan = planAlter(node, columns);
+    if (plan.blocked.length) {
+      res.status(400).json({ error: plan.blocked[0], blocked: plan.blocked });
+      return;
+    }
+    if (plan.changes.length === 0) {
+      res.json({ sql: "", changes: 0 });
+      return;
+    }
+    let uniqueConstraints = {};
+    if (plan.changes.some((c) => c.op === "unique" && !c.unique)) {
+      try {
+        uniqueConstraints = await uniqueConstraintNames(secrets.connectionString, schema, table);
+      } catch (err) {
+        sendQueryError(res, "read constraints", err);
+        return;
+      }
+    }
+    const built = buildAlterStatements({ schema, table, changes: plan.changes, uniqueConstraints });
+    if (built.error) {
+      res.status(400).json({ error: built.error });
+      return;
+    }
+    const sql = built.statements.join("\n");
+    if (dryRun) {
+      res.json({ sql, changes: plan.changes.length });
+      return;
+    }
+
+    try {
+      await runWriteTransaction(secrets.connectionString, async (client) => {
+        for (const statement of built.statements) await client.query(statement);
+      });
+    } catch (err) {
+      const known = ALTER_ERRORS[err.code];
+      if (known) {
+        logger.warn(`[tables] alter failed (${err.code})`, err);
+        res.status(known[0]).json({ error: known[1], detail: err.message });
+        return;
+      }
+      sendQueryError(res, "change table", err);
+      return;
+    }
+
+    // Carry renames and new column ids into the design so the sync's
+    // name-matched refresh keeps every id (and what hangs off it).
+    const byId = new Map((node.data.columns || []).map((c) => [c.id, c]));
+    const patched = {
+      ...node,
+      data: { ...node.data, columns: columns.map((c) => (byId.has(c.id) ? { ...byId.get(c.id), name: c.name } : { ...c })) },
+    };
+    try {
+      await store.saveBranch(req.params.sourceId, branch.id, {
+        nodes: branch.nodes.map((n) => (n.id === node.id ? patched : n)),
+        edges: branch.edges,
+        enums: branch.enums,
+        pages: branch.pages,
+        schemaVersion: branch.schemaVersion,
+      });
+      const sync = await syncSource(req.params.sourceId);
+      res.json({ sql, sync });
+    } catch (err) {
+      logger.error("[tables] altered, but sync failed", err);
+      res.json({ sql, sync: null, syncError: "The table was changed, but refreshing the schema failed. Use Sync now to pull it in." });
     }
   }),
 );

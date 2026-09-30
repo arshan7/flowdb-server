@@ -130,3 +130,46 @@ test("reconcileSchema - a public-schema resync is byte-for-byte the old behavior
   assert.deepEqual(result.added, []);
   assert.deepEqual(result.ledger.tables, ["orders"]);
 });
+
+test("reconcileSchema - refreshes a synced table's columns from the database, keeping ids and app fields", () => {
+  const c = (id, name, type, extra = {}) => ({ id, name, type, typeParams: null, notNull: false, isUnique: false, isPrimaryKey: false, isForeignKey: false, references: null, default: "", ...extra });
+  const customers = tableNode("tc", "public", "customers", [c("cid", "id", "bigint", { isPrimaryKey: true })]);
+  const orders = tableNode("to", "public", "orders", [
+    c("oid", "id", "bigint", { isPrimaryKey: true }),
+    c("ocust", "customer_id", "bigint", { isForeignKey: true, references: { tableId: "tc", columnId: "cid" } }),
+    c("ostat", "status", "text", { displayName: "Order status", semanticType: "category" }),
+    c("onote", "note", "text"),
+  ]);
+  const edge = {
+    id: "e1", source: "tc", target: "to", sourceHandle: "tc-cid-source", targetHandle: "to-ocust-target",
+    data: { sourceColumnHandle: "tc-cid-source", targetColumnHandle: "to-ocust-target" },
+  };
+  const noteEdge = { id: "e2", source: "tc", target: "to", sourceHandle: "tc-cid-source", targetHandle: "to-onote-target" };
+  // Database now: status became integer + required, note dropped, total added.
+  const iCustomers = tableNode("n1", "public", "customers", [c("x1", "id", "bigint", { isPrimaryKey: true })]);
+  const iOrders = tableNode("n2", "public", "orders", [
+    c("x2", "id", "bigint", { isPrimaryKey: true }),
+    c("x3", "customer_id", "bigint", { isForeignKey: true, references: { tableId: "n1", columnId: "x1" } }),
+    c("x4", "status", "integer", { notNull: true }),
+    c("x5", "total", "decimal", { typeParams: { precision: 10, scale: 2 } }),
+  ]);
+  const iEdge = { id: "ie", source: "n1", target: "n2", sourceHandle: "n1-x1-source", targetHandle: "n2-x3-target", data: {} };
+  const result = reconcileSchema(
+    { nodes: [customers, orders], edges: [edge, noteEdge], enums: [] },
+    { nodes: [iCustomers, iOrders], edges: [iEdge], enums: [] },
+    { tables: ["customers", "orders"], edges: ["customers.id->orders.customer_id"] },
+  );
+  const cols = result.nodes.find((n) => n.id === "to").data.columns;
+  assert.deepEqual(cols.map((x) => [x.id, x.name, x.type]), [
+    ["oid", "id", "bigint"],
+    ["ocust", "customer_id", "bigint"],
+    ["ostat", "status", "integer"],
+    ["x5", "total", "decimal"],
+  ]);
+  const status = cols.find((x) => x.name === "status");
+  assert.equal(status.notNull, true);
+  assert.equal(status.displayName, "Order status", "app-only fields survive");
+  assert.equal(status.semanticType, "category");
+  assert.deepEqual(cols[1].references, { tableId: "tc", columnId: "cid" }, "references use final ids");
+  assert.deepEqual(result.edges.map((e) => e.id), ["e1"], "the dropped column's line goes, no duplicate line");
+});

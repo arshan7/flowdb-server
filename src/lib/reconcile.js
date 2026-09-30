@@ -46,6 +46,84 @@ function findColumnByHandle(node, handle) {
   );
 }
 
+// The database's facts about a column; everything else (display name, role,
+// comment) is the app's own and survives a refresh.
+const DB_COLUMN_FIELDS = ["name", "type", "typeParams", "default", "notNull", "isUnique", "isPrimaryKey", "isForeignKey", "references", "isIndex"];
+
+// Refreshes each already-synced table's columns from the introspected copy:
+// matched by name so column ids (and every edge / reference to them) stay,
+// new columns come in, dropped ones go. Returns introspected column id ->
+// final column id, for remapping references and edge handles.
+function refreshColumns(nextNodes, refreshed, nodeIdMap) {
+  const colIdMap = new Map();
+  for (const { idx, incoming } of refreshed) {
+    const byName = new Map((nextNodes[idx].data?.columns || []).map((c) => [c.name, c]));
+    for (const c of incoming.data?.columns || []) colIdMap.set(c.id, byName.get(c.name)?.id ?? c.id);
+  }
+  const remapRef = (ref) => {
+    if (!ref) return null;
+    const tableId = nodeIdMap.get(ref.tableId);
+    return tableId ? { tableId, columnId: colIdMap.get(ref.columnId) ?? ref.columnId } : null;
+  };
+  for (const { idx, incoming } of refreshed) {
+    const node = nextNodes[idx];
+    const byName = new Map((node.data?.columns || []).map((c) => [c.name, c]));
+    const columns = (incoming.data?.columns || []).map((c) => {
+      const kept = byName.get(c.name) || {};
+      const next = { ...kept, id: colIdMap.get(c.id) };
+      for (const f of DB_COLUMN_FIELDS) next[f] = c[f] ?? null;
+      next.references = remapRef(c.references);
+      next.isForeignKey = !!(c.isForeignKey && next.references);
+      if (c.autoIncrement) next.autoIncrement = true;
+      else delete next.autoIncrement;
+      return next;
+    });
+    const ic = incoming.data?.constraints;
+    const constraints = ic
+      ? {
+          ...node.data.constraints,
+          ...ic,
+          primaryKey: columns.filter((c) => c.isPrimaryKey).map((c) => c.id),
+          uniqueConstraints: (ic.uniqueConstraints || []).map((u) => ({
+            ...u,
+            columnIds: u.columnIds.map((id) => colIdMap.get(id) ?? id),
+          })),
+        }
+      : node.data.constraints;
+    nextNodes[idx] = { ...node, data: { ...node.data, columns, ...(constraints && { constraints }) } };
+  }
+  // References from newly added tables into refreshed ones.
+  for (let i = 0; i < nextNodes.length; i += 1) {
+    const n = nextNodes[i];
+    if (!n.data?.columns?.some((c) => c.references && colIdMap.has(c.references.columnId))) continue;
+    nextNodes[i] = {
+      ...n,
+      data: {
+        ...n.data,
+        columns: n.data.columns.map((c) =>
+          c.references && colIdMap.has(c.references.columnId)
+            ? {
+                ...c,
+                references: {
+                  tableId: nodeIdMap.get(c.references.tableId) ?? c.references.tableId,
+                  columnId: colIdMap.get(c.references.columnId),
+                },
+              }
+            : c,
+        ),
+      },
+    };
+  }
+  return colIdMap;
+}
+
+// An introspected edge handle rebuilt with the final node and column ids.
+function remapHandle(introNode, handle, finalNodeId, colIdMap, side) {
+  const col = findColumnByHandle(introNode, handle);
+  if (!col) return handle?.replace(introNode?.id ?? "", finalNodeId);
+  return `${finalNodeId}-${colIdMap.get(col.id) ?? col.id}-${side}`;
+}
+
 // A stable, name-based identity for a relationship - "orders.customer_id
 // -> customers.id" - independent of the transient node/column ids a fresh
 // introspection mints every single run. This is what the sync ledger
@@ -104,6 +182,8 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
   // touching one get dropped further down.
   const introspectedIdToFinalId = new Map();
   const nextNodes = [...existingNodes];
+  // Synced tables whose columns get refreshed from the database below.
+  const refreshed = [];
   let gridIndex = 0;
   const startY = maxNodeY(existingNodes) + GRID_MARGIN_Y;
 
@@ -146,13 +226,9 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
     // resync reports it as a phantom conflict, and "View data" / the live-
     // DB icon never light up for it because nothing ever writes the tag.
     if (existing.data?.sourceOrigin === "synced" || ledgerTables.has(key)) {
-      // Already synced in an earlier pass - its own columns/constraints are
-      // left untouched on resync. (v1 deliberately doesn't refresh them -
-      // doing that correctly means preserving column ids by name-match AND
-      // remapping every `references.columnId` pointer that used the
-      // introspected batch's fresh ids, real enough complexity to earn its
-      // own pass. New tables and conflicts - what was asked for - are
-      // unaffected.)
+      // Already synced in an earlier pass - its columns are refreshed from
+      // the database after this loop (refreshColumns: matched by name, ids
+      // kept), since the live table is the source of truth for them.
       //
       // Two in-place heals, both single scalars with no id remapping:
       //   - back-fill data.sourceOrigin on a node synced before the tag
@@ -166,11 +242,10 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
       if (existing.data?.schema == null && incoming.data?.schema != null) {
         patch.schema = incoming.data.schema;
       }
-      if (Object.keys(patch).length) {
-        const idx = nextNodes.indexOf(existing);
-        if (idx !== -1) {
-          nextNodes[idx] = { ...existing, data: { ...existing.data, ...patch } };
-        }
+      const idx = nextNodes.indexOf(existing);
+      if (idx !== -1) {
+        nextNodes[idx] = { ...existing, data: { ...existing.data, ...patch } };
+        refreshed.push({ idx, incoming });
       }
       introspectedIdToFinalId.set(incoming.id, existing.id);
       // Keep the ledger authoritative even when the match was tag-only.
@@ -179,6 +254,9 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
       conflicts.push({ name: key, reason: `A manual table named "${key}" already exists.` });
     }
   }
+
+  const colIdMap = refreshColumns(nextNodes, refreshed, introspectedIdToFinalId);
+  const refreshedIds = new Set(refreshed.map((r) => nextNodes[r.idx].id));
 
   // Additive only - an edge already present (matched by endpoint node ids
   // + column names) is left exactly as-is, never re-created/updated. Any
@@ -195,8 +273,8 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
     const targetId = introspectedIdToFinalId.get(incomingEdge.target);
     if (!sourceId || !targetId) continue;
 
-    const sourceHandle = incomingEdge.sourceHandle?.replace(incomingEdge.source, sourceId);
-    const targetHandle = incomingEdge.targetHandle?.replace(incomingEdge.target, targetId);
+    const sourceHandle = remapHandle(introspectedNodesById.get(incomingEdge.source), incomingEdge.sourceHandle, sourceId, colIdMap, "source");
+    const targetHandle = remapHandle(introspectedNodesById.get(incomingEdge.target), incomingEdge.targetHandle, targetId, colIdMap, "target");
     const key = `${sourceId}|${targetId}|${sourceHandle || ""}|${targetHandle || ""}`;
     if (existingEdgeKeys.has(key)) continue;
 
@@ -238,9 +316,21 @@ export function reconcileSchema(existingBranch, introspected, ledger) {
     existingEnumNames.add(incomingEnum.name);
   }
 
+  // A line whose column left a refreshed table (dropped in the database) goes too.
+  const nodesById = new Map(nextNodes.map((n) => [n.id, n]));
+  const liveEdges = nextEdges.filter((e) => {
+    for (const [nodeId, handle] of [
+      [e.source, e.data?.sourceColumnHandle || e.sourceHandle],
+      [e.target, e.data?.targetColumnHandle || e.targetHandle],
+    ]) {
+      if (refreshedIds.has(nodeId) && handle && !findColumnByHandle(nodesById.get(nodeId), handle)) return false;
+    }
+    return true;
+  });
+
   return {
     nodes: nextNodes,
-    edges: nextEdges,
+    edges: liveEdges,
     enums: nextEnums,
     added,
     conflicts,

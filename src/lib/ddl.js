@@ -36,14 +36,14 @@ const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_IDENT = 63; // Postgres truncates longer identifiers silently
 const MAX_COLUMNS = 200;
 
-function checkName(name, what) {
+export function checkName(name, what) {
   if (typeof name !== "string" || !name) return `${what} needs a name.`;
   if (name.length > MAX_IDENT) return `${what} "${name.slice(0, 20)}…" is longer than ${MAX_IDENT} characters.`;
   if (!NAME_RE.test(name)) return `${what} "${name}" can only use letters, numbers and _, and can't start with a number.`;
   return null;
 }
 
-function typeSql(col) {
+export function typeSql(col) {
   const def = COLUMN_TYPES[col.type];
   if (!def) return { error: `"${col.name}" has an unsupported type.` };
   if (def.length && col.length != null) {
@@ -64,7 +64,7 @@ function typeSql(col) {
 
 const quoteLiteral = (v) => `'${String(v).replace(/'/g, "''")}'`;
 
-function defaultSql(col) {
+export function defaultSql(col) {
   const d = col.default ?? { kind: "none" };
   if (!DEFAULT_KINDS.has(d.kind)) return { error: `"${col.name}" has an unsupported default.` };
   switch (d.kind) {

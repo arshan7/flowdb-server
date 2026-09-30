@@ -12,7 +12,7 @@ function cleanDefault(raw) {
   if (raw == null) return "";
   const value = String(raw).trim();
   if (/^nextval\(/i.test(value)) return "";
-  const withoutCast = value.replace(/::"?[a-zA-Z_ ]+"?(\[\])?$/, "");
+  const withoutCast = value.replace(/::"?[a-zA-Z_ ]+"?(\(\d+(,\s*\d+)?\))?(\[\])?$/, "");
   const unquoted = withoutCast.match(/^'(.*)'$/);
   return unquoted ? unquoted[1] : withoutCast;
 }
