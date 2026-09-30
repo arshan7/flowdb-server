@@ -587,6 +587,83 @@ dataRouter.delete(
   }),
 );
 
+// Delete every row a filter matches ("select all N matching" -> Delete). Like
+// the bulk update: a filter is required and the row count is capped; the
+// count and the delete run in one transaction. Audit rows keep each deleted
+// row, so undo can put them back.
+dataRouter.post(
+  "/sources/:sourceId/rows/bulk-delete",
+  wrap(async (req, res) => {
+    const { tableId, filters = [], filterGroup = null } = req.body || {};
+    if (!tableId) {
+      res.status(400).json({ error: "tableId is required." });
+      return;
+    }
+    if (!Array.isArray(filters)) {
+      res.status(400).json({ error: "filters must be an array." });
+      return;
+    }
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "This source isn't connected." });
+      return;
+    }
+    const table = await resolveWritableTable(req.params.sourceId, tableId, secrets);
+    if (table.error) {
+      res.status(table.status).json({ error: table.error });
+      return;
+    }
+    const params = [];
+    const wc = previewWhereClause(filterGroup, filters, table.columnNames, table.label, params);
+    if (wc.error) {
+      res.status(400).json({ error: wc.error });
+      return;
+    }
+    if (!wc.clause) {
+      res.status(400).json({ error: "A bulk delete needs at least one filter - it can't target the whole table." });
+      return;
+    }
+    const from = quoteTable(table.schema, table.label);
+    try {
+      const result = await runWriteTransaction(secrets.connectionString, async (client) => {
+        const counted = await client.query(`SELECT count(*)::bigint AS n FROM ${from}${wc.clause}`, params);
+        const n = Number(counted.rows?.[0]?.n ?? 0);
+        if (n > MAX_BULK_WRITE_ROWS) {
+          const err = new Error(
+            `This would delete ${n} rows, which is more than the ${MAX_BULK_WRITE_ROWS}-row bulk-write limit. Narrow the filter first.`,
+          );
+          err.isLimit = true;
+          throw err;
+        }
+        return client.query(`DELETE FROM ${from}${wc.clause} RETURNING *, ctid::text AS ctid`, params);
+      });
+      await Promise.all(
+        result.rows.map((row) =>
+          store.insertAuditLog(req.params.sourceId, {
+            ownerUserId: uid(req),
+            tableId,
+            tableSchema: table.schema,
+            tableName: table.label,
+            operation: "delete",
+            rowIdentity: table.pkColumns.length
+              ? { pk: Object.fromEntries(table.pkColumns.map((c) => [c, row[c]])) }
+              : { ctid: row.ctid },
+            before: row,
+            after: null,
+          }),
+        ),
+      );
+      res.json({ deletedCount: result.rows.length });
+    } catch (err) {
+      if (err.isLimit) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      sendQueryError(res, "bulk delete rows", err);
+    }
+  }),
+);
+
 // Duplicate one row. `overrides` supplies any column that must differ from
 // the source row (e.g. a UNIQUE column, or a non-serial primary key -
 // omitted PK columns are left out of the INSERT so Postgres can
