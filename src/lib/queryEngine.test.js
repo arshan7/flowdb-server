@@ -6,6 +6,7 @@ import {
   quoteTable,
   compileFilterCondition,
   compileFilterGroup,
+  countQueryOf,
 } from "./queryEngine.js";
 
 // A leaf compiler like the /preview route's - qualifies against one table.
@@ -348,4 +349,21 @@ test("compileFilterCondition - notin compiles to NOT = ANY over text", () => {
     'NOT ("orders"."status"::text = ANY($1))',
   );
   assert.deepEqual(params, [["paid", "7"]]);
+});
+
+test("countQueryOf strips the page window and its two params", () => {
+  const { sql, params } = compileQuery({
+    tableName: "orders",
+    measures: [],
+    dimensions: [{ id: "status", column: "status" }],
+    filters: [],
+    joins: [],
+    offset: 50,
+    pageSize: 50,
+  });
+  const q = countQueryOf(sql, params);
+  assert.ok(q.sql.startsWith("SELECT count(*)::bigint AS n FROM (SELECT"));
+  assert.ok(!/LIMIT/.test(q.sql));
+  assert.deepEqual(q.params, params.slice(0, -2));
+  assert.equal(countQueryOf("SELECT 1", []), null);
 });

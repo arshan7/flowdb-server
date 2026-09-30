@@ -436,6 +436,17 @@ export function compileQuery({
   return { sql, params, windowSize };
 }
 
+// The same query without its page window, counted - the pager's "of N".
+// Every compiled report query ends in ` LIMIT $a OFFSET $b` (the last two params).
+export function countQueryOf(sql, params) {
+  const m = / LIMIT \$\d+ OFFSET \$\d+$/.exec(sql);
+  if (!m) return null;
+  return {
+    sql: `SELECT count(*)::bigint AS n FROM (${sql.slice(0, m.index)}) AS _count`,
+    params: params.slice(0, -2),
+  };
+}
+
 // Trims the one lookahead row compileQuery's LIMIT (pageSize + 1) always
 // requests, and reports whether it was actually there.
 export function paginateRows(rows, pageSize = DEFAULT_PAGE_SIZE) {

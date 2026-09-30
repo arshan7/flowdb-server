@@ -1,7 +1,7 @@
 import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
 import { logger } from "../lib/logger.js";
-import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
+import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, countQueryOf, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
 import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
 import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../lib/joinResolve.js";
@@ -42,6 +42,20 @@ const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
 // (bounded in practice by the visiting-set cycle check, but that alone
 // doesn't stop a very long non-cyclic chain from recursing deep).
 const MAX_EXPR_DEPTH = 6;
+
+// Matching rows for the pager (cached like the rows), capped by the report's row limit.
+async function totalOf(sourceId, connectionString, compiled, rowLimit) {
+  const q = countQueryOf(compiled.sql, compiled.params);
+  if (!q) return null;
+  const key = cacheKey(sourceId, `count:${q.sql}`, q.params);
+  let n = getCachedQuery(key)?.rows;
+  if (n == null) {
+    const rows = await runQuery(connectionString, q.sql, q.params);
+    n = Number(rows[0]?.n ?? 0);
+    setCachedQuery(key, n);
+  }
+  return rowLimit != null ? Math.min(n, rowLimit) : n;
+}
 
 export const queryRouter = Router();
 
@@ -91,6 +105,7 @@ queryRouter.post(
       dimensionBuckets = {},
       orderBy = null,
       rowLimit = null,
+      withTotal = false,
     } = req.body || {};
     if (!tableId && !modelId && !dataset) {
       res.status(400).json({ error: "tableId, modelId, or a dataset is required." });
@@ -249,7 +264,9 @@ queryRouter.post(
           setCachedQuery(key, rawRows);
         }
         const { rows, hasMore } = paginateRows(rawRows, mCompiled.windowSize);
+        const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, mCompiled, rowLimit) : null;
         res.json({
+          total,
           columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation })),
           rows,
           hasMore,
@@ -394,7 +411,9 @@ queryRouter.post(
           setCachedQuery(key, rawRows);
         }
         const { rows, hasMore } = paginateRows(rawRows, directCompiled.windowSize);
+        const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, directCompiled, rowLimit) : null;
         res.json({
+          total,
           columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label })),
           rows,
           hasMore,
@@ -788,7 +807,9 @@ queryRouter.post(
         setCachedQuery(key, rawRows);
       }
       const { rows, hasMore } = paginateRows(rawRows, compiled.windowSize);
+      const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, compiled, rowLimit) : null;
       res.json({
+        total,
         columns: [...dimensions, ...measures].map((c) => ({ id: c.id, label: c.label })),
         rows,
         hasMore,
@@ -811,7 +832,7 @@ queryRouter.post(
 queryRouter.post(
   "/sources/:sourceId/query/native",
   wrap(async (req, res) => {
-    const { sql, vars = {}, offset = 0, pageSize = DEFAULT_PAGE_SIZE } = req.body || {};
+    const { sql, vars = {}, offset = 0, pageSize = DEFAULT_PAGE_SIZE, withTotal = false } = req.body || {};
     if (!sql || typeof sql !== "string" || !sql.trim()) {
       res.status(400).json({ error: "sql is required." });
       return;
@@ -841,7 +862,17 @@ queryRouter.post(
         setCachedQuery(key, raw);
       }
       const { rows, hasMore } = paginateRows(raw.rows, pageSize);
+      // Counted with the page window as runNativeQuery adds it, so countQueryOf can strip it.
+      const total = withTotal
+        ? await totalOf(
+            req.params.sourceId,
+            secrets.connectionString,
+            { sql: `SELECT * FROM (${boundSql}) AS _tablespace_sub LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, params: [...params, 0, 0] },
+            null,
+          )
+        : null;
       res.json({
+        total,
         columns: (raw.fields || []).map((name) => ({ id: name, label: name })),
         rows,
         hasMore,
