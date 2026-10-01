@@ -81,7 +81,7 @@ const anyRef = (col) => (col?.isForeignKey && col.references ? col.references : 
  *     { op: "dropDefault", name } | { op: "type", name, col } | { op: "setDefault", name, col }
  *     { op: "notNull", name, notNull } | { op: "unique", name, unique }
  *     { op: "add", id, col, notNull, unique } | { op: "addFk", name, refSchema, refTable, refColumn }
- *     { op: "renameTable", to }
+ *     { op: "dropPk" } | { op: "addPk", names } | { op: "renameTable", to }
  *   designOnly: app-only link edits, described for the review
  */
 export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
@@ -145,15 +145,13 @@ export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
 
   for (const old of before) {
     if (!wantedIds.has(old.id)) {
-      if (old.isPrimaryKey) blocked.push(`"${old.name}" is the primary key; removing it isn't supported for a live table.`);
-      else drops.push({ op: "drop", name: old.name });
+      drops.push({ op: "drop", name: old.name });
     }
   }
 
   for (const col of wanted) {
     const old = byId.get(col.id);
     if (!old) {
-      if (col.isPrimaryKey) blocked.push(`New column "${col.name}" can't be the primary key of a live table.`);
       planLink(null, col);
       const pg = toPgColumn(col);
       if (pg.error) blocked.push(pg.error);
@@ -162,9 +160,6 @@ export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
     }
     const name = col.name;
     if (old.name !== name) renames.push({ op: "rename", from: old.name, to: name });
-    if (!!old.isPrimaryKey !== !!col.isPrimaryKey) {
-      blocked.push(`Changing the primary key ("${name}") isn't supported for a live table.`);
-    }
     planLink(old, col);
     const typeChanged = old.type !== col.type || !sameTypeParams(old.typeParams, col.typeParams);
     const defaultChanged = !sameDefault(old.default, col.default);
@@ -183,6 +178,18 @@ export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
     if (!!old.isUnique !== !!col.isUnique && !col.isPrimaryKey) uniques.push({ op: "unique", name, unique: !!col.isUnique });
   }
 
+  // The primary key: dropped and re-made when its columns change. Dropping
+  // any of its columns already drops the constraint with it.
+  const oldPk = before.filter((c) => c.isPrimaryKey);
+  const newPk = wanted.filter((c) => c.isPrimaryKey);
+  const samePk = oldPk.length === newPk.length && oldPk.every((c) => newPk.some((n) => n.id === c.id));
+  const pkChanges = [];
+  const addPk = [];
+  if (!samePk) {
+    if (oldPk.length && oldPk.every((c) => wantedIds.has(c.id))) pkChanges.push({ op: "dropPk" });
+    if (newPk.length) addPk.push({ op: "addPk", names: newPk.map((c) => c.name) });
+  }
+
   const renameTable = [];
   if (tableName != null && tableName !== node?.data?.label) {
     const err = checkName(tableName, "The table");
@@ -194,7 +201,21 @@ export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
 
   return {
     designOnly,
-    changes: [...dropFks, ...drops, ...renames, ...dropDefaults, ...types, ...setDefaults, ...notNulls, ...uniques, ...adds, ...addFks, ...renameTable],
+    changes: [
+      ...dropFks,
+      ...pkChanges,
+      ...drops,
+      ...renames,
+      ...dropDefaults,
+      ...types,
+      ...setDefaults,
+      ...notNulls,
+      ...uniques,
+      ...adds,
+      ...addPk,
+      ...addFks,
+      ...renameTable,
+    ],
     blocked,
   };
 }
@@ -204,7 +225,7 @@ export function planAlter(node, wanted, { name: tableName, nodes = [] } = {}) {
  *   uniqueConstraints / fkConstraints: column name -> its single-column UNIQUE / FOREIGN KEY constraint (for dropping)
  * @returns {{ statements: string[] } | { error: string }}
  */
-export function buildAlterStatements({ schema, table, changes, uniqueConstraints = {}, fkConstraints = {} }) {
+export function buildAlterStatements({ schema, table, changes, uniqueConstraints = {}, fkConstraints = {}, pkConstraint = null }) {
   const t = `ALTER TABLE ${quoteTable(schema, table)}`;
   const out = [];
   for (const c of changes) {
@@ -268,6 +289,13 @@ export function buildAlterStatements({ schema, table, changes, uniqueConstraints
         );
         break;
       }
+      case "dropPk":
+        if (!pkConstraint) return { error: "Couldn't find the primary key in the database." };
+        out.push(`${t} DROP CONSTRAINT ${quoteIdent(pkConstraint)};`);
+        break;
+      case "addPk":
+        out.push(`${t} ADD CONSTRAINT ${quoteIdent(`${table}_pkey`.slice(0, MAX_IDENT))} PRIMARY KEY (${c.names.map(quoteIdent).join(", ")});`);
+        break;
       case "renameTable":
         out.push(`${t} RENAME TO ${quoteIdent(c.to)};`);
         break;

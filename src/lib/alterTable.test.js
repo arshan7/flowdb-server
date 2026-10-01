@@ -72,8 +72,7 @@ test("blocks what a live table can't take", () => {
     .map((c) => (c.id === "c2" ? { ...c, isForeignKey: true, references: { tableId: "t", columnId: "x" } } : c));
   next.push(col("n2", "1bad", "text"), col("n3", "note", "text"), col("n4", "weird", "money"));
   const { blocked } = planAlter(node, next);
-  assert.equal(blocked.length, 5);
-  assert.match(blocked.join("\n"), /primary key/);
+  assert.equal(blocked.length, 4);
   assert.match(blocked.join("\n"), /"status" links to a table that wasn't found/);
   assert.match(blocked.join("\n"), /letters, numbers/);
   assert.match(blocked.join("\n"), /Two columns are named "note"/);
@@ -142,4 +141,24 @@ test("renames the table last, after the column changes", () => {
     `ALTER TABLE "orders" RENAME TO "purchases";`,
   ]);
   assert.match(planAlter(node, cols(), { nodes, name: "customers" }).blocked[0], /already exists/);
+});
+
+test("primary key: move it, make it two columns, drop its column, add one to a new column", () => {
+  const moved = planAlter(node, cols().map((c) => ({ ...c, isPrimaryKey: c.id === "c4" })), { nodes });
+  assert.deepEqual(sql(moved.changes, { pkConstraint: "orders_pkey" }), [
+    `ALTER TABLE "orders" DROP CONSTRAINT "orders_pkey";`,
+    `ALTER TABLE "orders" ADD CONSTRAINT "orders_pkey" PRIMARY KEY ("note");`,
+  ]);
+  const pair = planAlter(node, withCol("c3", { isPrimaryKey: true }), { nodes });
+  assert.deepEqual(sql(pair.changes, { pkConstraint: "orders_pkey" }).at(-1), `ALTER TABLE "orders" ADD CONSTRAINT "orders_pkey" PRIMARY KEY ("id", "amount");`);
+  // Dropping the key column drops the constraint with it: no DROP CONSTRAINT.
+  const gone = planAlter(node, cols().filter((c) => c.id !== "c1"), { nodes });
+  assert.deepEqual(sql(gone.changes), [`ALTER TABLE "orders" DROP COLUMN "id";`]);
+  const fresh = planAlter(node, [...cols().filter((c) => c.id !== "c1"), col("n1", "uid", "uuid", { isPrimaryKey: true, default: "gen_random_uuid()" })], { nodes });
+  assert.deepEqual(sql(fresh.changes), [
+    `ALTER TABLE "orders" DROP COLUMN "id";`,
+    `ALTER TABLE "orders" ADD COLUMN "uid" uuid DEFAULT gen_random_uuid();`,
+    `ALTER TABLE "orders" ADD CONSTRAINT "orders_pkey" PRIMARY KEY ("uid");`,
+  ]);
+  assert.match(buildAlterStatements({ table: "orders", changes: moved.changes }).error, /primary key/);
 });

@@ -120,8 +120,8 @@ const ALTER_ERRORS = {
   "22001": [400, "Some existing values are longer than the new length."],
   "42804": [400, "Some existing values can't be converted to the new type."],
   "23502": [400, "A required column would have empty values: fill in the empty ones first, or give a new required column a default."],
-  "23505": [400, "A column you made unique has duplicate values."],
-  "2BP01": [409, "Something else in the database depends on that column (a link, view or index)."],
+  "23505": [400, "Some values repeat, so the column can't be unique or part of the key."],
+  "2BP01": [409, "Something else in the database depends on that (a link from another table, a view or an index). Remove that first."],
   "42701": [409, "A column with that name already exists in the database."],
   "42703": [409, "The table changed in the database since the last sync. Sync, then try again."],
   "42501": [403, "The database user this source connects as isn't allowed to change this table."],
@@ -144,6 +144,21 @@ async function fkConstraintNames(connectionString, schema, table) {
     [schema || "public", table],
   );
   return Object.fromEntries(rows.map((r) => [r.column_name, r.name]));
+}
+
+// Tables whose database links point at this one.
+async function linkingTables(connectionString, schema, table) {
+  const rows = await runQuery(
+    connectionString,
+    `SELECT DISTINCT src.relname AS name
+       FROM pg_constraint con
+       JOIN pg_class rel ON rel.oid = con.confrelid
+       JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+       JOIN pg_class src ON src.oid = con.conrelid
+      WHERE con.contype = 'f' AND ns.nspname = $1 AND rel.relname = $2 AND src.oid <> rel.oid`,
+    [schema || "public", table],
+  );
+  return rows.map((r) => r.name);
 }
 
 // A relationship line from a link column to what it references (same shape sync makes).
@@ -276,6 +291,23 @@ tablesRouter.post(
         return;
       }
     }
+    let pkConstraint = null;
+    if (plan.changes.some((c) => c.op === "dropPk")) {
+      try {
+        const rows = await runQuery(
+          secrets.connectionString,
+          `SELECT con.conname AS name FROM pg_constraint con
+             JOIN pg_class rel ON rel.oid = con.conrelid
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+            WHERE con.contype = 'p' AND ns.nspname = $1 AND rel.relname = $2`,
+          [schema || "public", table],
+        );
+        pkConstraint = rows[0]?.name ?? null;
+      } catch (err) {
+        sendQueryError(res, "read constraints", err);
+        return;
+      }
+    }
     let uniqueConstraints = {};
     if (plan.changes.some((c) => c.op === "unique" && !c.unique)) {
       try {
@@ -285,7 +317,7 @@ tablesRouter.post(
         return;
       }
     }
-    const built = buildAlterStatements({ schema, table, changes: plan.changes, uniqueConstraints, fkConstraints });
+    const built = buildAlterStatements({ schema, table, changes: plan.changes, uniqueConstraints, fkConstraints, pkConstraint });
     if (built.error) {
       res.status(400).json({ error: built.error });
       return;
@@ -306,7 +338,13 @@ tablesRouter.post(
       const known = ALTER_ERRORS[err.code];
       if (known) {
         logger.warn(`[tables] alter failed (${err.code})`, err);
-        res.status(known[0]).json({ error: known[1], detail: err.message });
+        let error = known[1];
+        // A key other tables link to: name them.
+        if (err.code === "2BP01" && plan.changes.some((c) => c.op === "dropPk" || c.op === "drop")) {
+          const linked = await linkingTables(secrets.connectionString, schema, table).catch(() => []);
+          if (linked.length) error = `${linked.join(", ")} link${linked.length === 1 ? "s" : ""} to this table's key. Remove ${linked.length === 1 ? "that link" : "those links"} first.`;
+        }
+        res.status(known[0]).json({ error, detail: err.message });
         return;
       }
       sendQueryError(res, "change table", err);
