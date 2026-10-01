@@ -4,6 +4,7 @@ import { logger } from "../lib/logger.js";
 import { runNativeQuery, paginateRows, ALLOWED_PAGE_SIZES, MAX_ROWS } from "../lib/queryEngine.js";
 import { previewWhereClause } from "../lib/previewFilters.js";
 import { resolveModelSql } from "../lib/modelSql.js";
+import { typeOfField } from "../lib/pgTypes.js";
 import { wrap } from "./http.js";
 
 function validateModelBody(b) {
@@ -112,7 +113,7 @@ modelsRouter.post(
       ]);
       const { rows, hasMore } = paginateRows(out.rows, size);
       res.json({
-        columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name })),
+        columns: (out.fields || []).map((f) => ({ id: f.name, label: f.name, type: typeOfField(f) })),
         rows,
         hasMore,
         total: counted ? Number(counted.rows[0]?.n ?? 0) : null,

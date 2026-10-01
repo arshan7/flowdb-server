@@ -3,6 +3,7 @@ import * as store from "../lib/tablespaceStore.js";
 import { logger } from "../lib/logger.js";
 import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, countQueryOf, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
+import { typeOfField } from "../lib/pgTypes.js";
 import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
 import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../lib/joinResolve.js";
 import { compileModelReport } from "../lib/modelEngine.js";
@@ -44,11 +45,11 @@ const QUERY_CALC_OPERATORS = new Set(["+", "-", "*", "/"]);
 const MAX_EXPR_DEPTH = 6;
 
 // Matching rows for the pager (cached like the rows), capped by the report's row limit.
-async function totalOf(sourceId, connectionString, compiled, rowLimit) {
+async function totalOf(sourceId, connectionString, compiled, rowLimit, fresh = false) {
   const q = countQueryOf(compiled.sql, compiled.params);
   if (!q) return null;
   const key = cacheKey(sourceId, `count:${q.sql}`, q.params);
-  let n = getCachedQuery(key)?.rows;
+  let n = fresh ? null : getCachedQuery(key)?.rows;
   if (n == null) {
     const rows = await runQuery(connectionString, q.sql, q.params);
     n = Number(rows[0]?.n ?? 0);
@@ -106,6 +107,8 @@ queryRouter.post(
       orderBy = null,
       rowLimit = null,
       withTotal = false,
+      // Refresh: skip the 30s result cache and read the database again.
+      fresh = false,
     } = req.body || {};
     if (!tableId && !modelId && !dataset) {
       res.status(400).json({ error: "tableId, modelId, or a dataset is required." });
@@ -257,14 +260,14 @@ queryRouter.post(
           `${modelId ? `model:${modelId}` : "dataset"}:${mCompiled.sql}`,
           mCompiled.params,
         );
-        let rawRows = getCachedQuery(key)?.rows;
+        let rawRows = fresh ? null : getCachedQuery(key)?.rows;
         const cached = !!rawRows;
         if (!rawRows) {
           rawRows = await runQuery(secrets.connectionString, mCompiled.sql, mCompiled.params);
           setCachedQuery(key, rawRows);
         }
         const { rows, hasMore } = paginateRows(rawRows, mCompiled.windowSize);
-        const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, mCompiled, rowLimit) : null;
+        const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, mCompiled, rowLimit, fresh) : null;
         res.json({
           total,
           columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation })),
@@ -404,14 +407,14 @@ queryRouter.post(
 
       try {
         const key = cacheKey(req.params.sourceId, `direct:${tableId}:${directCompiled.sql}`, directCompiled.params);
-        let rawRows = getCachedQuery(key)?.rows;
+        let rawRows = fresh ? null : getCachedQuery(key)?.rows;
         const cached = !!rawRows;
         if (!rawRows) {
           rawRows = await runQuery(secrets.connectionString, directCompiled.sql, directCompiled.params);
           setCachedQuery(key, rawRows);
         }
         const { rows, hasMore } = paginateRows(rawRows, directCompiled.windowSize);
-        const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, directCompiled, rowLimit) : null;
+        const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, directCompiled, rowLimit, fresh) : null;
         res.json({
           total,
           columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label })),
@@ -800,14 +803,14 @@ queryRouter.post(
       // by sourceId. A repeated Run/reopen of the same report within the
       // TTL window skips the live database entirely.
       const key = cacheKey(req.params.sourceId, compiled.sql, compiled.params);
-      let rawRows = getCachedQuery(key)?.rows;
+      let rawRows = fresh ? null : getCachedQuery(key)?.rows;
       const cached = !!rawRows;
       if (!rawRows) {
         rawRows = await runQuery(secrets.connectionString, compiled.sql, compiled.params);
         setCachedQuery(key, rawRows);
       }
       const { rows, hasMore } = paginateRows(rawRows, compiled.windowSize);
-      const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, compiled, rowLimit) : null;
+      const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, compiled, rowLimit, fresh) : null;
       res.json({
         total,
         columns: [...dimensions, ...measures].map((c) => ({ id: c.id, label: c.label })),
@@ -832,7 +835,7 @@ queryRouter.post(
 queryRouter.post(
   "/sources/:sourceId/query/native",
   wrap(async (req, res) => {
-    const { sql, vars = {}, offset = 0, pageSize = DEFAULT_PAGE_SIZE, withTotal = false } = req.body || {};
+    const { sql, vars = {}, offset = 0, pageSize = DEFAULT_PAGE_SIZE, withTotal = false, fresh = false } = req.body || {};
     if (!sql || typeof sql !== "string" || !sql.trim()) {
       res.status(400).json({ error: "sql is required." });
       return;
@@ -854,11 +857,11 @@ queryRouter.post(
     const { sql: boundSql, params } = resolveNativeVars(sql, vars && typeof vars === "object" ? vars : {});
     try {
       const key = cacheKey(req.params.sourceId, `native:${boundSql}:${offset}:${pageSize}`, params);
-      let raw = getCachedQuery(key);
+      let raw = fresh ? null : getCachedQuery(key);
       const cached = !!raw;
       if (!raw) {
         const out = await runNativeQuery(secrets.connectionString, boundSql, params, { offset, pageSize });
-        raw = { rows: out.rows, fields: out.fields.map((f) => f.name) };
+        raw = { rows: out.rows, fields: out.fields.map((f) => ({ name: f.name, type: typeOfField(f) })) };
         setCachedQuery(key, raw);
       }
       const { rows, hasMore } = paginateRows(raw.rows, pageSize);
@@ -869,11 +872,12 @@ queryRouter.post(
             secrets.connectionString,
             { sql: `SELECT * FROM (${boundSql}) AS _tablespace_sub LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, params: [...params, 0, 0] },
             null,
+            fresh,
           )
         : null;
       res.json({
         total,
-        columns: (raw.fields || []).map((name) => ({ id: name, label: name })),
+        columns: (raw.fields || []).map((f) => ({ id: f.name, label: f.name, type: f.type })),
         rows,
         hasMore,
         sql: boundSql,
