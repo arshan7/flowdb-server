@@ -1,7 +1,8 @@
 import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
 import { logger } from "../lib/logger.js";
-import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, countQueryOf, quoteQualified, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
+import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, countQueryOf, quoteQualified, streamQuery, withoutPageWindow, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
+import { streamExport, EXPORT_FORMATS, EXPORT_ROW_CAP } from "../lib/exporter.js";
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
 import { typeOfField } from "../lib/pgTypes.js";
 import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
@@ -60,6 +61,36 @@ async function totalOf(sourceId, connectionString, compiled, rowLimit, fresh = f
 
 export const queryRouter = Router();
 
+
+
+// Export (body.export = { format, name }): the same compiled query without its page
+// window, streamed to a CSV / JSON / XLSX download (lib/exporter.js), up to a million rows.
+const exportOf = (body) => {
+  const ex = body?.export;
+  return ex && EXPORT_FORMATS.includes(ex.format) ? { format: ex.format, name: typeof ex.name === "string" ? ex.name : "report" } : null;
+};
+async function sendExport(res, connectionString, sql, params, columns, ex) {
+  try {
+    await streamExport(res, {
+      format: ex.format,
+      name: ex.name,
+      columns,
+      run: (onBatch) => streamQuery(connectionString, sql, params, onBatch),
+    });
+  } catch (err) {
+    if (!res.headersSent) sendQueryError(res, "export", err);
+    else res.destroy(err);
+  }
+}
+async function sendReportExport(res, connectionString, compiled, rowLimit, columns, ex) {
+  const cap = Math.min(EXPORT_ROW_CAP, rowLimit ?? EXPORT_ROW_CAP);
+  const q = withoutPageWindow(compiled.sql, compiled.params, cap);
+  if (!q) {
+    res.status(400).json({ error: "This report can't be exported." });
+    return;
+  }
+  await sendExport(res, connectionString, q.sql, q.params, columns, ex);
+}
 
 // A custom measure written as a formula (lib/expr), e.g. SumIf([total], [status] = "paid").
 const isFormulaMeasure = (m) =>
@@ -263,6 +294,11 @@ queryRouter.post(
         res.status(400).json({ error: err.message });
         return;
       }
+      if (exportOf(req.body)) {
+        const cols = [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation }));
+        await sendReportExport(res, secrets.connectionString, mCompiled, rowLimit, cols, exportOf(req.body));
+        return;
+      }
       try {
         const key = cacheKey(
           req.params.sourceId,
@@ -422,6 +458,11 @@ queryRouter.post(
         return;
       }
 
+      if (exportOf(req.body)) {
+        const cols = [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label }));
+        await sendReportExport(res, secrets.connectionString, directCompiled, rowLimit, cols, exportOf(req.body));
+        return;
+      }
       try {
         const key = cacheKey(req.params.sourceId, `direct:${tableId}:${directCompiled.sql}`, directCompiled.params);
         let rawRows = fresh ? null : getCachedQuery(key)?.rows;
@@ -815,6 +856,11 @@ queryRouter.post(
       return;
     }
 
+    if (exportOf(req.body)) {
+      const cols = [...dimensions, ...measures].map((c) => ({ id: c.id, label: c.label }));
+      await sendReportExport(res, secrets.connectionString, compiled, rowLimit, cols, exportOf(req.body));
+      return;
+    }
     try {
       // Phase 4.4c - keyed by the exact compiled SQL+params (already
       // deterministic per resolved spec, offset/pageSize included), scoped
@@ -873,6 +919,18 @@ queryRouter.post(
     }
 
     const { sql: boundSql, params } = resolveNativeVars(sql, vars && typeof vars === "object" ? vars : {});
+    const ex = exportOf(req.body);
+    if (ex) {
+      // Column names come from a small first read; then every row streams.
+      try {
+        const probe = await runNativeQuery(secrets.connectionString, boundSql, params, { offset: 0, pageSize: 10 });
+        const cols = probe.fields.map((f) => ({ id: f.name, label: f.name }));
+        await sendExport(res, secrets.connectionString, `SELECT * FROM (${boundSql}) AS _tablespace_sub LIMIT ${EXPORT_ROW_CAP}`, params, cols, ex);
+      } catch (err) {
+        if (!res.headersSent) sendQueryError(res, "export", err);
+      }
+      return;
+    }
     try {
       const key = cacheKey(req.params.sourceId, `native:${boundSql}:${offset}:${pageSize}`, params);
       let raw = fresh ? null : getCachedQuery(key);

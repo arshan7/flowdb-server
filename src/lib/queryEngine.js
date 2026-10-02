@@ -524,6 +524,30 @@ export async function runQuery(connectionString, sql, params) {
   return result.rows;
 }
 
+// Exports: every row of a query, read through a cursor in batches so a million
+// rows never sit in memory. Read-only, like every report query; each FETCH gets
+// its own 2-minute budget.
+export async function streamQuery(connectionString, sql, params, onBatch, { batch = 5000 } = {}) {
+  return runInTransaction(connectionString, "READ ONLY", 120_000, async (client) => {
+    await client.query(`DECLARE _tablespace_export NO SCROLL CURSOR FOR ${sql}`, params);
+    for (;;) {
+      const r = await client.query(`FETCH ${Number(batch)} FROM _tablespace_export`);
+      if (!r.rows.length) break;
+      await onBatch(r.rows, r.fields);
+      if (r.rows.length < batch) break;
+    }
+    await client.query("CLOSE _tablespace_export");
+  });
+}
+
+// A compiled report query without its page window (LIMIT/OFFSET and their two
+// params), capped at `cap` rows instead - what an export runs.
+export function withoutPageWindow(sql, params, cap) {
+  const m = / LIMIT \$\d+ OFFSET \$\d+$/.exec(sql);
+  if (!m) return null;
+  return { sql: `${sql.slice(0, m.index)} LIMIT ${Math.max(0, Math.trunc(cap))}`, params: params.slice(0, -2) };
+}
+
 // Data-tab write path - runs `work(client)` inside a real READ WRITE
 // transaction against the connected source's own database. A shorter
 // timeout than reads: a write blocking behind a lock held elsewhere is a

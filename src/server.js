@@ -87,6 +87,8 @@ app.use(
     // Authorization carries the Clerk session token the frontend now sends
     // on every call alongside the existing x-api-key.
     allowedHeaders: ["Content-Type", "x-api-key", "Authorization"],
+    // Export downloads name their file here.
+    exposedHeaders: ["Content-Disposition"],
   }),
 );
 
