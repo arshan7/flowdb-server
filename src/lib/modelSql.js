@@ -1,7 +1,7 @@
 import { resolveNativeVars } from "./queryEngine.js";
 import { parseFormula } from "./formulaExpr.js";
 import { resolveJoins, normalizeJoinType } from "./joinResolve.js";
-import { compileModel } from "./modelEngine.js";
+import { compileModel, CAST_TARGETS } from "./modelEngine.js";
 import { QUERY_OPERATORS } from "./previewFilters.js";
 
 // Slice 5 - resolve a stored Model row into { sql, params, columns } using
@@ -135,7 +135,8 @@ export function resolveColumnFormula(tokens, nodeFor) {
       resolved.push(t);
     } else if (t.kind === "paren") {
       if (t.value !== "(" && t.value !== ")") return null;
-      resolved.push(t);
+      if (t.fn !== undefined && (t.value !== "(" || !CAST_TARGETS.includes(t.fn))) return null;
+      resolved.push(t.fn ? { kind: "paren", value: "(", fn: t.fn } : { kind: "paren", value: t.value });
     } else if (t.kind === "value") {
       const term = t.term || {};
       if (term.type === "constant") {
@@ -151,7 +152,8 @@ export function resolveColumnFormula(tokens, nodeFor) {
         const node = nodeFor(term.tableId);
         const col = (node?.data?.columns || []).find((x) => x.id === term.columnId);
         if (!node || !col) return null;
-        resolved.push({ kind: "value", node: { column: { tableName: node.data.label, columnName: col.name } } });
+        // The declared type lets compileScalarExpr cast correctly (text holding numbers, dates).
+        resolved.push({ kind: "value", node: { column: { tableName: node.data.label, columnName: col.name, type: col.type } } });
       }
     } else {
       return null;

@@ -184,3 +184,14 @@ test("legacyToTokens: 4 terms continue folding left-associatively", () => {
     termB: { label: "D" },
   });
 });
+
+test("parseFormula: a paren carrying fn is a convert-to, alone or inside math", () => {
+  const v = (n) => ({ kind: "value", node: { constant: n } });
+  const open = (fn) => ({ kind: "paren", value: "(", fn });
+  const close = { kind: "paren", value: ")" };
+  assert.deepEqual(parseFormula([open("text"), v(1), close]), { kind: "cast", to: "text", arg: { constant: 1 } });
+  const t = parseFormula([open("number"), v(1), { kind: "op", value: "+" }, v(2), close, { kind: "op", value: "*" }, v(3)]);
+  assert.equal(t.kind, "calculated");
+  assert.equal(t.termA.kind, "cast");
+  assert.equal(t.termA.arg.operator, "+");
+});

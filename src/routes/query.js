@@ -610,7 +610,8 @@ queryRouter.post(
           if (!QUERY_CALC_OPERATORS.has(t.value)) return null;
           resolved.push(t);
         } else if (t.kind === "paren") {
-          if (t.value !== "(" && t.value !== ")") return null;
+          // Convert-to functions (`fn`) are row-level - custom columns only.
+          if ((t.value !== "(" && t.value !== ")") || t.fn) return null;
           resolved.push(t);
         } else if (t.kind === "value") {
           const valueNode = resolveTerm(t.term, visiting, depth);

@@ -229,13 +229,14 @@ export function compileFilterGroup(node, compileLeaf, params, depth = 0, counter
 function compileTermExpr(term, baseTableName, crossSubqueries, params) {
   if (term.kind === "constant") {
     params.push(term.value);
-    return `$${params.length}`;
+    // Typed, so `SUM(qty) * 1.5` doesn't make Postgres read 1.5 as an integer.
+    return `$${params.length}::numeric`;
   }
   if (term.kind === "calculated") {
     const a = compileTermExpr(term.termA, baseTableName, crossSubqueries, params);
     const b = compileTermExpr(term.termB, baseTableName, crossSubqueries, params);
     const op = CALC_OPERATORS[term.operator];
-    return op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
+    return op === "/" ? `(${a}::float8 / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
   }
 
   if (!term.tableName || term.tableName === baseTableName) {
@@ -358,7 +359,8 @@ export function compileQuery({
         const a = compileTermExpr(measure.termA, tableName, crossSubqueries, params);
         const b = compileTermExpr(measure.termB, tableName, crossSubqueries, params);
         const op = CALC_OPERATORS[measure.operator];
-        expr = op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
+        // ::float8 so SUM(int) / COUNT(*) keeps its decimals instead of truncating.
+        expr = op === "/" ? `(${a}::float8 / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
       } else {
         expr = aggExpr(measure.aggregation, measure.columnName, tableName);
         // Post-parity - a plain measure can carry its own row-level

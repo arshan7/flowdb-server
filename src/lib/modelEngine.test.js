@@ -103,7 +103,7 @@ test("compileModel builder - custom column expression, constants parameterised i
     ],
     filters: [{ tableName: "orders", columnName: "status", operator: "eq", value: "paid" }],
   });
-  assert.match(sql, /\(\("orders"\."revenue" - "orders"\."cost"\) \* \$1\) AS "margin"/);
+  assert.match(sql, /\(\("orders"\."revenue" - "orders"\."cost"\) \* \$1::numeric\) AS "margin"/);
   // expr constant occupies $1 (SELECT order), the filter value $2 (WHERE after).
   assert.match(sql, /WHERE "orders"\."status" = \$2$/);
   assert.deepEqual(params, [1.08, "paid"]);
@@ -122,7 +122,7 @@ test("compileModel builder - custom column division guards with NULLIF", () => {
     baseTableName: "orders",
     columns: [{ kind: "exprTree", tree, alias: "unit_price" }],
   });
-  assert.match(sql, /\("orders"\."total" \/ NULLIF\("orders"\."qty", 0\)\) AS "unit_price"/);
+  assert.match(sql, /\("orders"\."total"::float8 \/ NULLIF\("orders"\."qty", 0\)\) AS "unit_price"/);
 });
 
 test("compileModel builder - text concat custom column emits concat() with a bound literal", () => {
@@ -145,7 +145,7 @@ test("compileModel builder - text concat custom column emits concat() with a bou
   });
   assert.match(
     sql,
-    /concat\(concat\("customers"\."first_name", \$1\), "customers"\."last_name"\) AS "full_name"/,
+    /concat\(concat\("customers"\."first_name", \$1::text\), "customers"\."last_name"\) AS "full_name"/,
   );
   assert.deepEqual(params, [" "]);
   assert.deepEqual(columns, ["full_name"]);
@@ -200,4 +200,28 @@ test("compileModel builder - join type picks the SQL keyword (left keeps orders 
     columns: [{ tableName: "customers", columnName: "name", alias: "customer" }],
   });
   assert.match(sql, /FROM "orders" LEFT JOIN "customers" ON "orders"\."customer_id" = "customers"\."id"/);
+});
+
+const typed = (name, type) => ({ column: { tableName: "t", columnName: name, type } });
+const exprSql = (tree) => compileModel({ kind: "builder", baseTableName: "t", columns: [{ kind: "exprTree", tree, alias: "v" }] }).sql;
+
+test("custom column types - integer division is decimal, text in math converts only when it looks like a number", () => {
+  assert.match(exprSql({ kind: "calculated", operator: "/", termA: typed("a", "integer"), termB: typed("b", "int4") }), /\("t"\."a"::float8 \/ NULLIF\("t"\."b", 0\)\)/);
+  const sql = exprSql({ kind: "calculated", operator: "+", termA: typed("price", "varchar(20)"), termB: { constant: 1 } });
+  assert.match(sql, /CASE WHEN btrim\("t"\."price"\) ~ '.+' THEN btrim\("t"\."price"\)::numeric END/);
+  assert.match(sql, /\$1::numeric/);
+});
+
+test("custom column types - date minus date is days, date plus a number moves by days, other date math is refused", () => {
+  assert.match(exprSql({ kind: "calculated", operator: "-", termA: typed("d1", "date"), termB: typed("d2", "date") }), /\("t"\."d1" - "t"\."d2"\) AS "v"/);
+  assert.match(exprSql({ kind: "calculated", operator: "+", termA: typed("d1", "date"), termB: { constant: 3 } }), /\("t"\."d1" \+ ROUND\(\(\$1::numeric\)::numeric\)::integer\)/);
+  assert.throws(() => exprSql({ kind: "calculated", operator: "*", termA: typed("d1", "date"), termB: { constant: 2 } }), /Dates can only be subtracted/);
+});
+
+test("custom column types - convert-to casts by target, refusing impossible ones", () => {
+  assert.match(exprSql({ kind: "cast", to: "text", arg: typed("a", "integer") }), /\("t"\."a"\)::text AS "v"/);
+  assert.match(exprSql({ kind: "cast", to: "integer", arg: typed("x", "numeric(10,2)") }), /ROUND\(\("t"\."x"\)::numeric\)::bigint/);
+  assert.match(exprSql({ kind: "cast", to: "date", arg: typed("ts", "timestamp with time zone") }), /\("t"\."ts"\)::date/);
+  assert.throws(() => exprSql({ kind: "cast", to: "number", arg: typed("d", "date") }), /A date can't be used as a number/);
+  assert.throws(() => exprSql({ kind: "cast", to: "rot13", arg: typed("a", "text") }), /invalid custom column/);
 });

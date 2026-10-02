@@ -40,7 +40,7 @@ export function legacyToTokens(measure) {
 //   expr    := sum (('&') sum)*        -- '&' = text concat, binds loosest
 //   sum     := product (('+'|'-') product)*
 //   product := factor (('*'|'/') factor)*
-//   factor  := VALUE | '(' expr ')'
+//   factor  := VALUE | '(' expr ')' | FN '(' expr ')'   -- FN = a paren token's `fn`
 // '&' is the lowest-precedence level on purpose: `a + b & c + d` reads as
 // `(a+b) & (c+d)` - you're almost always concatenating whole computed
 // pieces, not weaving concat into the middle of an arithmetic chain.
@@ -92,7 +92,8 @@ function parseFactor(tokens, pos) {
     if (!inner) return null;
     if (tokens[pos[0]]?.kind !== "paren" || tokens[pos[0]]?.value !== ")") return null;
     pos[0]++;
-    return inner;
+    // An opening paren can carry a convert-to function: number( … ), text( … ).
+    return t.fn ? { kind: "cast", to: t.fn, arg: inner } : inner;
   }
   if (t.kind === "value") {
     pos[0]++;
@@ -114,5 +115,6 @@ export function parseFormula(resolvedTokens) {
   const pos = [0];
   const tree = parseExpr(resolvedTokens, pos);
   if (!tree || pos[0] !== resolvedTokens.length) return null;
-  return tree.kind === "calculated" ? tree : null;
+  // A lone convert-to (`number(price_text)`) is a complete formula too.
+  return tree.kind === "calculated" || tree.kind === "cast" ? tree : null;
 }

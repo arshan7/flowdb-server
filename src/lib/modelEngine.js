@@ -25,37 +25,118 @@ const MODEL_ALIAS = "_tsm";
 const SCALAR_OPERATORS = { "+": "+", "-": "-", "*": "*", "/": "/" };
 
 // Compile a model's custom column - a row-level expression over its other
-// columns. Walks the same `{ kind:"calculated", operator, termA, termB }`
-// tree formulaExpr.parseFormula produces for calculated measures, but the
-// leaves here are plain scalars: a qualified column or a bound constant,
-// never an aggregate. The route (resolveModelSql) resolves the client's
-// token stream into this tree and validates every column ref first -
-// nothing here comes from a raw client string. `/` is guarded with NULLIF
-// so a zero divisor yields NULL, not a query error; `&` compiles to
-// concat() (NULL-tolerant, unlike `||`) so joining a name with a missing
-// middle name still yields the rest, not NULL.
+// columns. Walks the `{ kind:"calculated", operator, termA, termB }` tree
+// formulaExpr.parseFormula produces (plus `{ kind:"cast", to, arg }` for a
+// convert-to); leaves are a qualified column (with its declared `type`) or a
+// bound constant, never an aggregate. Every column ref was validated by
+// resolveModelSql - nothing here comes from a raw client string.
+// Typed so the SQL is right whatever the columns hold:
+// - `/` divides as a decimal (7 / 2 = 3.5, no 20-digit numeric scale) and a zero divisor yields NULL;
+// - a text column in math converts when it looks like a number, else NULL;
+// - date − date is days; date ± number moves by days; other date math is refused;
+// - `&` compiles to concat() (NULL-tolerant) so a missing part still joins the rest.
 function compileScalarExpr(node, params) {
-  if (!node || typeof node !== "object") throw new Error("This model has an invalid custom column.");
-  if (node.kind === "calculated") {
-    const a = compileScalarExpr(node.termA, params);
-    const b = compileScalarExpr(node.termB, params);
-    if (node.operator === "&") return `concat(${a}, ${b})`;
-    const op = SCALAR_OPERATORS[node.operator];
-    if (!op) throw new Error("This model has an invalid custom column.");
-    return op === "/" ? `(${a} / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
+  return compileTyped(node, params).sql;
+}
+
+export const CAST_TARGETS = ["number", "integer", "text", "date", "datetime"];
+
+const NUMBER_TEXT = String.raw`'^[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$'`;
+const DATE_TEXT = String.raw`'^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'`;
+const DATETIME_TEXT = String.raw`'^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([ T][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?'`;
+
+/** "number" | "text" | "date" | "datetime" | "bool" | "unknown" from a declared column type. */
+export function kindOfColumnType(type) {
+  const t = String(type || "").toLowerCase();
+  // No declared type: leave the value as it is rather than guess.
+  if (!t) return "unknown";
+  if (t.endsWith("[]")) return "text";
+  if (/^((small|big)?int(eger)?|int[248])\b|serial|numeric|decimal|real|double|float|money/.test(t)) return "number";
+  if (/^timestamp|^datetime/.test(t)) return "datetime";
+  if (/^date/.test(t)) return "date";
+  if (/^bool/.test(t)) return "bool";
+  return "text";
+}
+
+const bad = (msg) => {
+  throw new Error(msg);
+};
+
+// A text value as a number when it looks like one, else NULL (never a query error).
+const textToNumber = (sql) => `(CASE WHEN btrim(${sql}) ~ ${NUMBER_TEXT} THEN btrim(${sql})::numeric END)`;
+
+function asNumber(v) {
+  if (v.kind === "number" || v.kind === "unknown") return v.sql;
+  if (v.kind === "text") return textToNumber(v.sql);
+  if (v.kind === "bool") return `(${v.sql})::integer`;
+  return bad("A date can't be used as a number. Subtract two dates to get the days between them.");
+}
+
+function compileCast(to, v) {
+  switch (to) {
+    case "number":
+      return { sql: `(${asNumber(v)})::numeric`, kind: "number" };
+    case "integer":
+      return { sql: `ROUND((${asNumber(v)})::numeric)::bigint`, kind: "number" };
+    case "text":
+      return { sql: `(${v.sql})::text`, kind: "text" };
+    case "date":
+      if (v.kind === "date" || v.kind === "datetime") return { sql: `(${v.sql})::date`, kind: "date" };
+      if (v.kind === "text") return { sql: `(CASE WHEN btrim(${v.sql}) ~ ${DATE_TEXT} THEN substr(btrim(${v.sql}), 1, 10)::date END)`, kind: "date" };
+      return bad("Only text or a date and time can be converted to a date.");
+    case "datetime":
+      if (v.kind === "date" || v.kind === "datetime") return { sql: `(${v.sql})::timestamp`, kind: "datetime" };
+      if (v.kind === "text") return { sql: `(CASE WHEN btrim(${v.sql}) ~ ${DATETIME_TEXT} THEN btrim(${v.sql})::timestamp END)`, kind: "datetime" };
+      return bad("Only text or a date can be converted to a date and time.");
+    default:
+      return bad("This model has an invalid custom column.");
   }
-  if (node.column) return quoteQualified(node.column.tableName, node.column.columnName);
+}
+
+const isDate = (v) => v.kind === "date" || v.kind === "datetime";
+
+function compileDateMath(op, a, b) {
+  if (op === "-" && isDate(a) && isDate(b)) {
+    // Whole days for two dates; fractional days once a time is involved.
+    if (a.kind === "date" && b.kind === "date") return { sql: `(${a.sql} - ${b.sql})`, kind: "number" };
+    return { sql: `(EXTRACT(EPOCH FROM ((${a.sql})::timestamp - (${b.sql})::timestamp)) / 86400)`, kind: "number" };
+  }
+  const [d, n] = isDate(a) ? [a, b] : [b, a];
+  if ((op === "+" || (op === "-" && isDate(a))) && !isDate(n)) {
+    const days = asNumber(n);
+    if (d.kind === "date") return { sql: `(${d.sql} ${op} ROUND((${days})::numeric)::integer)`, kind: "date" };
+    return { sql: `((${d.sql})::timestamp ${op} (${days}) * interval '1 day')`, kind: "datetime" };
+  }
+  return bad("Dates can only be subtracted from each other, or have a number of days added or taken away.");
+}
+
+function compileTyped(node, params) {
+  if (!node || typeof node !== "object") bad("This model has an invalid custom column.");
+  if (node.kind === "cast") return compileCast(node.to, compileTyped(node.arg, params));
+  if (node.kind === "calculated") {
+    const a = compileTyped(node.termA, params);
+    const b = compileTyped(node.termB, params);
+    if (node.operator === "&") return { sql: `concat(${a.sql}, ${b.sql})`, kind: "text" };
+    const op = SCALAR_OPERATORS[node.operator];
+    if (!op) bad("This model has an invalid custom column.");
+    if (isDate(a) || isDate(b)) return compileDateMath(op, a, b);
+    const [x, y] = [asNumber(a), asNumber(b)];
+    return { sql: op === "/" ? `(${x}::float8 / NULLIF(${y}, 0))` : `(${x} ${op} ${y})`, kind: "number" };
+  }
+  if (node.column) {
+    return { sql: quoteQualified(node.column.tableName, node.column.columnName), kind: kindOfColumnType(node.column.type) };
+  }
   if (node.text !== undefined) {
-    if (typeof node.text !== "string") throw new Error("This model has an invalid custom column.");
+    if (typeof node.text !== "string") bad("This model has an invalid custom column.");
     params.push(node.text);
-    return `$${params.length}`;
+    return { sql: `$${params.length}::text`, kind: "text" };
   }
   if (node.constant !== undefined) {
-    if (!Number.isFinite(node.constant)) throw new Error("This model has an invalid custom column.");
+    if (!Number.isFinite(node.constant)) bad("This model has an invalid custom column.");
     params.push(node.constant);
-    return `$${params.length}`;
+    return { sql: `$${params.length}::numeric`, kind: "number" };
   }
-  throw new Error("This model has an invalid custom column.");
+  return bad("This model has an invalid custom column.");
 }
 
 // Compile a model to its own SELECT.
