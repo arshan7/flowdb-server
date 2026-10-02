@@ -1,12 +1,12 @@
 import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
 import { logger } from "../lib/logger.js";
-import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, countQueryOf, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
+import { compileQuery, runQuery, runNativeQuery, resolveNativeVars, paginateRows, countQueryOf, quoteQualified, ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE, MAX_ROWS } from "../lib/queryEngine.js";
 import { cacheKey, getCachedQuery, setCachedQuery } from "../lib/queryCache.js";
 import { typeOfField } from "../lib/pgTypes.js";
 import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
 import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../lib/joinResolve.js";
-import { compileModelReport } from "../lib/modelEngine.js";
+import { compileModelReport, kindOfColumnType } from "../lib/modelEngine.js";
 import { QUERY_OPERATORS } from "../lib/previewFilters.js";
 import { resolveModelSql, MAX_FORMULA_TOKENS, isDatasetSpec } from "../lib/modelSql.js";
 import { wrap, sendQueryError } from "./http.js";
@@ -59,6 +59,11 @@ async function totalOf(sourceId, connectionString, compiled, rowLimit, fresh = f
 }
 
 export const queryRouter = Router();
+
+
+// A custom measure written as a formula (lib/expr), e.g. SumIf([total], [status] = "paid").
+const isFormulaMeasure = (m) =>
+  m && m.aggregation === "expression" && typeof m.expression === "string" && m.expression.trim() !== "" && m.expression.length <= 4000;
 
 // Phase 4.2 (single table) / 4.4a (direct joins + SQL transparency) - runs
 // a report query against a Connected source's real live database. The
@@ -192,6 +197,10 @@ queryRouter.post(
       }
       const rMeasures = [];
       for (const m of modelMeasures) {
+        if (isFormulaMeasure(m)) {
+          rMeasures.push({ id: m.id, label: m.label, aggregation: "expression", expression: m.expression, columns: known });
+          continue;
+        }
         if (!m || !QUERY_AGGREGATIONS.has(m.aggregation)) {
           res.status(400).json({ error: `Invalid aggregation "${m?.aggregation}".` });
           return;
@@ -328,6 +337,14 @@ queryRouter.post(
 
       const rMeasures = [];
       for (const m of modelMeasures) {
+        if (isFormulaMeasure(m)) {
+          const resolve = (name) => {
+            const col = colsByName.get(name);
+            return col ? { sql: quoteQualified(node.data.label, col.name), kind: kindOfColumnType(col.type) } : null;
+          };
+          rMeasures.push({ id: m.id, label: m.label || "Custom", aggregation: "expression", expression: m.expression, resolve });
+          continue;
+        }
         if (!m || !QUERY_AGGREGATIONS.has(m.aggregation)) {
           res.status(400).json({ error: `Invalid aggregation "${m?.aggregation}".` });
           return;

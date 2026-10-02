@@ -38,3 +38,15 @@ test("resolveModelSql - a manual join keeps its pairs and takes its type", () =>
   assert.equal(error, undefined);
   assert.match(sql, /FULL JOIN "notes" ON "orders"\."ref" = "notes"\."order_ref"/);
 });
+
+test("resolveModelSql - a typed formula column compiles with [column] and [table.column] refs", () => {
+  const m = model([{ tableId: "t_c", type: "left" }]);
+  m.columns.push({ kind: "expr", alias: "label", text: 'Upper([customers.name]) & " #" & Text([id])' });
+  const { sql, params, error } = resolveModelSql(m, branch);
+  assert.equal(error, undefined);
+  assert.match(sql, /concat\(concat\(UPPER\(\("customers"\."name"\)::text\)|concat\(concat\(UPPER\("customers"\."name"\)/);
+  assert.match(sql, /\("orders"\."id"\)::text/);
+  assert.deepEqual(params, [" #"]);
+  const bad = resolveModelSql({ ...m, columns: [...m.columns.slice(0, 2), { kind: "expr", alias: "x", text: "[nope] + 1" }] }, branch);
+  assert.match(bad.error, /The custom column "x": There's no column called \[nope\]/);
+});

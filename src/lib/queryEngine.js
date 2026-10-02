@@ -1,6 +1,7 @@
 import pg from "pg";
 import { splitSsl, isSslRefusedError, sslFallbackAllowed } from "./pgIntrospect.js";
 import { joinKeyword } from "./joinResolve.js";
+import { compileFormulaMeasure } from "./modelEngine.js";
 
 // DATE (oid 1082) stays the database's own "2026-08-08" text. Parsed into a JS
 // Date it becomes local midnight, which serializes as the previous day in UTC
@@ -361,6 +362,9 @@ export function compileQuery({
         const op = CALC_OPERATORS[measure.operator];
         // ::float8 so SUM(int) / COUNT(*) keeps its decimals instead of truncating.
         expr = op === "/" ? `(${a}::float8 / NULLIF(${b}, 0))` : `(${a} ${op} ${b})`;
+      } else if (measure.aggregation === "expression") {
+        // A formula measure: [column] reads the base table's columns (measure.resolve).
+        expr = compileFormulaMeasure(measure, { column: measure.resolve, params, windowOrder: dimensions.map(dimExpr) });
       } else {
         expr = aggExpr(measure.aggregation, measure.columnName, tableName);
         // Post-parity - a plain measure can carry its own row-level

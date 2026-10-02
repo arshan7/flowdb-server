@@ -1,7 +1,8 @@
 import { resolveNativeVars } from "./queryEngine.js";
 import { parseFormula } from "./formulaExpr.js";
 import { resolveJoins, normalizeJoinType } from "./joinResolve.js";
-import { compileModel, CAST_TARGETS } from "./modelEngine.js";
+import { compileModel, CAST_TARGETS, kindOfColumnType } from "./modelEngine.js";
+import { quoteQualified } from "./queryEngine.js";
 import { QUERY_OPERATORS } from "./previewFilters.js";
 
 // Slice 5 - resolve a stored Model row into { sql, params, columns } using
@@ -73,6 +74,14 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
     // column ref validated against a real node/column) into the tree
     // modelEngine.compileScalarExpr walks; a raw client string never
     // reaches the SQL.
+    if (c && c.kind === "expr" && typeof c.text === "string") {
+      // A typed formula (lib/expr): compiled inside compileModel so its bound
+      // values number in column order.
+      const alias = (c.alias || "").trim();
+      if (!alias) return { error: "A custom column needs a name." };
+      columns.push({ kind: "exprText", text: c.text, alias, resolve: modelColumnResolver(base, joinNodes) });
+      continue;
+    }
     if (c && c.kind === "expr") {
       const alias = (c.alias || "").trim();
       if (!alias) return { error: "A custom column needs a name." };
@@ -182,4 +191,30 @@ export function isDatasetSpec(d) {
   if (!d || typeof d !== "object") return false;
   if (d.kind === "sql") return typeof d.sql === "string" && d.sql.trim().length > 0;
   return !!d.baseTableId && Array.isArray(d.columns) && d.columns.length > 0;
+}
+
+/**
+ * A formula's [column] lookup over a model's tables: [column] reads the base table
+ * first, then any joined table that has it (when only one does); [table.column]
+ * names the table.
+ * @returns {(name: string) => ({sql: string, kind: string} | null)}
+ */
+export function modelColumnResolver(base, joinNodes = []) {
+  const tables = [base, ...joinNodes].filter(Boolean);
+  const hit = (node, colName) => {
+    const col = (node.data?.columns || []).find((x) => x.name === colName);
+    return col ? { sql: quoteQualified(node.data.label, col.name), kind: kindOfColumnType(col.type) } : null;
+  };
+  return (name) => {
+    const dot = name.indexOf(".");
+    if (dot > 0) {
+      const node = tables.find((t) => t.data?.label === name.slice(0, dot));
+      const found = node && hit(node, name.slice(dot + 1));
+      if (found) return found;
+    }
+    const own = hit(base, name);
+    if (own) return own;
+    const others = joinNodes.map((n) => hit(n, name)).filter(Boolean);
+    return others.length === 1 ? others[0] : null;
+  };
 }

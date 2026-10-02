@@ -5,6 +5,7 @@
 // model-sourced report and a table-sourced one emit the same shapes for
 // buckets / sort / filters / paging.
 import { joinKeyword } from "./joinResolve.js";
+import { compileExpression } from "./expr/compile.js";
 import {
   quoteIdent,
   quoteQualified,
@@ -172,11 +173,18 @@ export function compileModel(spec) {
   // shapes before they reach here. Expression constants / text literals
   // push onto `params` in column order, ahead of the WHERE clause's own
   // params.
-  const selectParts = spec.columns.map((c) =>
-    c.kind === "exprTree"
+  const selectParts = spec.columns.map((c) => {
+    if (c.kind === "exprText") {
+      try {
+        return `${compileExpression(c.text, { mode: "row", column: c.resolve, params }).sql} AS ${quoteIdent(c.alias)}`;
+      } catch (e) {
+        throw new Error(`The custom column "${c.alias}": ${e.message}`);
+      }
+    }
+    return c.kind === "exprTree"
       ? `${compileScalarExpr(c.tree, params)} AS ${quoteIdent(c.alias)}`
-      : `${quoteQualified(c.tableName, c.columnName)} AS ${quoteIdent(c.alias)}`,
-  );
+      : `${quoteQualified(c.tableName, c.columnName)} AS ${quoteIdent(c.alias)}`;
+  });
   const joinParts = (spec.joinClauses || []).map((j) => {
     const from = j.fromTableName || spec.baseTableName;
     // `pairs` (a composite/multi-key join) AND-s several column equalities;
@@ -227,6 +235,12 @@ export function compileModelReport({
   const selectParts = [
     ...dimensions.map((d) => `${dimSql(d)} AS ${quoteIdent(d.id)}`),
     ...measures.map((m) => {
+      // A formula measure: [column] reads the model's output columns.
+      if (m.aggregation === "expression") {
+        const column = (name) => (m.columns?.has(name) ?? true ? { sql: quoteQualified(MODEL_ALIAS, name), kind: m.kinds?.[name] ?? "unknown" } : null);
+        const out = compileFormulaMeasure(m, { column, params, windowOrder: dimensions.map(dimSql) });
+        return `${out} AS ${quoteIdent(m.id)}`;
+      }
       let expr = aggExpr(m.aggregation, m.column, MODEL_ALIAS);
       // Post-parity - an "only where …" condition on a single measure,
       // compiled as an aggregate FILTER over the model's own output
@@ -260,4 +274,13 @@ export function compileModelReport({
   sql += ` OFFSET $${params.length}`;
 
   return { sql, params, windowSize };
+}
+
+/** A formula measure's SQL, with the measure named in any error. */
+export function compileFormulaMeasure(m, { column, params, windowOrder }) {
+  try {
+    return compileExpression(m.expression, { mode: "agg", column, params, windowOrder }).sql;
+  } catch (e) {
+    throw new Error(`${m.label || "The custom measure"}: ${e.message}`);
+  }
 }
