@@ -191,3 +191,13 @@ test("compileModelReport - dimensions only emits DISTINCT, no GROUP BY", () => {
   assert.match(sql, /SELECT DISTINCT "_tsm"\."a" AS "d1" FROM \(SELECT a FROM t\) AS "_tsm"/);
   assert.doesNotMatch(sql, /GROUP BY/);
 });
+
+test("compileModel builder - join type picks the SQL keyword (left keeps orders with no customer)", () => {
+  const { sql } = compileModel({
+    kind: "builder",
+    baseTableName: "orders",
+    joinClauses: [{ tableName: "customers", fromTableName: "orders", baseColumn: "customer_id", joinColumn: "id", type: "left" }],
+    columns: [{ tableName: "customers", columnName: "name", alias: "customer" }],
+  });
+  assert.match(sql, /FROM "orders" LEFT JOIN "customers" ON "orders"\."customer_id" = "customers"\."id"/);
+});

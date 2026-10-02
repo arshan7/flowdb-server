@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findJoinPath, buildForwardJoinGraph, resolveJoins, chainTo } from "./joinResolve.js";
+import { findJoinPath, buildForwardJoinGraph, resolveJoins, chainTo, joinKeyword } from "./joinResolve.js";
 
 function col(id, name, extra = {}) {
   return { id, name, ...extra };
@@ -104,4 +104,26 @@ test("buildForwardJoinGraph - pure forward chain is unaffected (orders -> custom
   const graph = buildForwardJoinGraph(ordersF, allNodesF);
   const chain = chainTo(graph, nodesByIdF, regionsF.id);
   assert.deepEqual(chain.map((h) => h.tableName), ["customers", "regions"]);
+});
+
+test("resolveJoins - join types: missing = inner; a chain's earlier hops go LEFT when the last keeps base rows", () => {
+  const inner = resolveJoins(ordersF, ["t_regionsF"], allNodesF, nodesByIdF);
+  assert.deepEqual(inner.joinClauses.map((j) => j.type), ["inner", "inner"]);
+  const left = resolveJoins(ordersF, ["t_regionsF"], allNodesF, nodesByIdF, null, { t_regionsF: "left" });
+  assert.deepEqual(left.joinClauses.map((j) => [j.tableName, j.type]), [["customers", "left"], ["regions", "left"]]);
+  const right = resolveJoins(ordersF, ["t_regionsF"], allNodesF, nodesByIdF, null, { t_regionsF: "right" });
+  assert.deepEqual(right.joinClauses.map((j) => j.type), ["inner", "right"]);
+  const junk = resolveJoins(ordersF, ["t_customersF"], allNodesF, nodesByIdF, null, { t_customersF: "cross; drop" });
+  assert.equal(junk.joinClauses[0].type, "inner");
+});
+
+test("resolveJoins - a hop shared by an inner and a left chain goes LEFT", () => {
+  const r = resolveJoins(ordersF, ["t_customersF", "t_regionsF"], allNodesF, nodesByIdF, null, { t_regionsF: "left" });
+  assert.deepEqual(r.joinClauses.map((j) => [j.tableName, j.type]), [["customers", "left"], ["regions", "left"]]);
+});
+
+test("joinKeyword - only the four join keywords ever reach SQL", () => {
+  assert.deepEqual(["inner", "left", "right", "full", "bogus", undefined].map(joinKeyword), [
+    "JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "JOIN", "JOIN",
+  ]);
 });

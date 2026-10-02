@@ -1,6 +1,6 @@
 import { resolveNativeVars } from "./queryEngine.js";
 import { parseFormula } from "./formulaExpr.js";
-import { resolveJoins } from "./joinResolve.js";
+import { resolveJoins, normalizeJoinType } from "./joinResolve.js";
 import { compileModel } from "./modelEngine.js";
 import { QUERY_OPERATORS } from "./previewFilters.js";
 
@@ -25,14 +25,17 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
   const base = nodesById.get(model.baseTableId);
   if (!base) return { error: "This model's base table no longer exists." };
 
-  // `joins` entries are either a plain tableId string (FK-resolved, the
-  // common case) or an explicit spec { tableId, baseColumnId, joinColumnId }
-  // for a table with no defined relationship - the user picked the join
-  // keys themselves in the Model builder.
+  // `joins` entries are a relationship join - a plain tableId string, or
+  // { tableId, type } once it has a join type - or an explicit spec
+  // { tableId, pairs, type? } for a table with no defined relationship (the
+  // user picked the join keys themselves in the Model builder).
   const rawJoins = Array.isArray(model.joins) ? model.joins : [];
-  const fkJoinIds = rawJoins.filter((j) => typeof j === "string");
-  const manualJoins = rawJoins.filter((j) => j && typeof j === "object");
-  const jr = resolveJoins(base, fkJoinIds, allTableNodes, nodesById, defaultSchema);
+  const isManual = (j) => j && typeof j === "object" && (Array.isArray(j.pairs) || j.baseColumnId);
+  const fkJoins = rawJoins.filter((j) => typeof j === "string" || (j && typeof j === "object" && !isManual(j)));
+  const fkJoinIds = fkJoins.map((j) => (typeof j === "string" ? j : j.tableId));
+  const joinTypes = Object.fromEntries(fkJoins.filter((j) => typeof j === "object").map((j) => [j.tableId, j.type]));
+  const manualJoins = rawJoins.filter(isManual);
+  const jr = resolveJoins(base, fkJoinIds, allTableNodes, nodesById, defaultSchema, joinTypes);
   if (jr.error) return { error: jr.error };
   const joinClauses = [...jr.joinClauses];
   const joinNodes = [...jr.joinNodes];
@@ -58,6 +61,7 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
       tableSchema: jn.data.schema ?? defaultSchema,
       fromTableName: base.data.label,
       pairs,
+      type: normalizeJoinType(mj.type),
     });
   }
   const nodeFor = (tid) => (tid === base.id ? base : joinNodes.find((n) => n.id === tid));

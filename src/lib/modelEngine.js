@@ -4,6 +4,7 @@
 // the model to aggregate over. Both reuse queryEngine's primitives so a
 // model-sourced report and a table-sourced one emit the same shapes for
 // buckets / sort / filters / paging.
+import { joinKeyword } from "./joinResolve.js";
 import {
   quoteIdent,
   quoteQualified,
@@ -103,7 +104,7 @@ export function compileModel(spec) {
     const on = onPairs
       .map((p) => `${quoteQualified(from, p.baseColumn)} = ${quoteQualified(j.tableName, p.joinColumn)}`)
       .join(" AND ");
-    return `JOIN ${quoteTable(j.tableSchema, j.tableName)} ON ${on}`;
+    return `${joinKeyword(j.type)} ${quoteTable(j.tableSchema, j.tableName)} ON ${on}`;
   });
   const whereParts = (spec.filters || []).map((f) =>
     compileFilterCondition(f.tableName, f.columnName, f.operator, f.value, params),

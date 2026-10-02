@@ -148,12 +148,20 @@ function buildJoinResolutionGraph(baseNode, allNodes) {
 // compiler so a report's joins and a builder Model's joins resolve by the
 // exact same rules. `joinedTableNames` dedupes hops shared by more than
 // one requested chain.
-export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById, defaultSchema = null) {
+// `joinTypes` ({ [tableId]: "inner"|"left"|"right"|"full" }, optional) sets
+// how each requested table joins; missing = inner. In a multi-hop chain only
+// the last hop takes the type itself - the hops leading to it go LEFT when
+// the type keeps unmatched base rows (left/full), so they aren't dropped
+// earlier in the chain. A hop shared by two chains goes LEFT if either asks.
+export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById, defaultSchema = null, joinTypes = {}) {
   const forwardGraph = buildJoinResolutionGraph(baseNode, allTableNodes);
   const joinNodes = [];
   const joinClauses = [];
   const joinedTableNames = new Set();
+  const clauseByKey = new Map();
   for (const joinTableId of joinTableIds || []) {
+    const type = normalizeJoinType(joinTypes?.[joinTableId]);
+    const keepsBase = type === "left" || type === "full";
     const joinNode = nodesById.get(joinTableId);
     if (!joinNode || joinNode.type !== "tableNode") return { error: `Table ${joinTableId} not found.` };
     const direct = findJoinPath(baseNode, joinNode);
@@ -173,22 +181,30 @@ export function resolveJoins(baseNode, joinTableIds, allTableNodes, nodesById, d
         error: `"${joinNode.data?.label}" isn't reachable from "${baseNode.data?.label}" through a direct or many-to-one relationship.`,
       };
     }
-    for (const hop of chain) {
+    for (const [i, hop] of chain.entries()) {
+      const hopType = i === chain.length - 1 ? type : keepsBase ? "left" : "inner";
       // Dedupe by table id, not label - two schemas in one source can hold
       // a same-named table, and a by-label lookup would attach the wrong
       // node (and its wrong schema) to the JOIN.
       const hopNode = nodesById.get(hop.tableId) || allTableNodes.find((n) => n.data?.label === hop.tableName);
       const hopKey = hop.tableId || hop.tableName;
-      if (joinedTableNames.has(hopKey)) continue;
+      if (joinedTableNames.has(hopKey)) {
+        const existing = clauseByKey.get(hopKey);
+        if (existing && existing.type === "inner" && hopType !== "inner") existing.type = hopType;
+        continue;
+      }
       joinedTableNames.add(hopKey);
       const fromTableName = hop.fromTableId === baseNode.id ? baseNode.data.label : nodesById.get(hop.fromTableId)?.data?.label;
-      joinClauses.push({
+      const clause = {
         tableName: hop.tableName,
         tableSchema: hopNode?.data?.schema ?? defaultSchema,
         fromTableName,
         baseColumn: hop.baseColumn,
         joinColumn: hop.joinColumn,
-      });
+        type: hopType,
+      };
+      clauseByKey.set(hopKey, clause);
+      joinClauses.push(clause);
       if (hopNode) joinNodes.push(hopNode);
     }
   }
@@ -218,3 +234,15 @@ export function chainTo(graph, nodesById, targetId) {
   }
   return hops;
 }
+
+export const JOIN_TYPES = ["inner", "left", "right", "full"];
+const JOIN_SQL = { inner: "JOIN", left: "LEFT JOIN", right: "RIGHT JOIN", full: "FULL JOIN" };
+
+// Anything unknown or missing is an inner join - what every model saved
+// before join types existed compiled to.
+export function normalizeJoinType(type) {
+  return JOIN_TYPES.includes(type) ? type : "inner";
+}
+
+/** The SQL keyword for a join clause's `type`. */
+export const joinKeyword = (type) => JOIN_SQL[normalizeJoinType(type)];

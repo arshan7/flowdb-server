@@ -1,5 +1,6 @@
 import pg from "pg";
 import { splitSsl, isSslRefusedError, sslFallbackAllowed } from "./pgIntrospect.js";
+import { joinKeyword } from "./joinResolve.js";
 
 // DATE (oid 1082) stays the database's own "2026-08-08" text. Parsed into a JS
 // Date it becomes local midnight, which serializes as the previous day in UTC
@@ -391,7 +392,7 @@ export function compileQuery({
   // `tableName` for every join built before that existed.
   const joinParts = joins.map(
     (j) =>
-      `JOIN ${quoteTable(j.tableSchema, j.tableName)} ON ${quoteQualified(j.fromTableName || tableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
+      `${joinKeyword(j.type)} ${quoteTable(j.tableSchema, j.tableName)} ON ${quoteQualified(j.fromTableName || tableName, j.baseColumn)} = ${quoteQualified(j.tableName, j.joinColumn)}`,
   );
 
   // Dimensions-only -> DISTINCT (no aggregation happening, so GROUP BY
