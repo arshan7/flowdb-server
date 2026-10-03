@@ -9,6 +9,7 @@ import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
 import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../lib/joinResolve.js";
 import { compileModelReport, kindOfColumnType } from "../lib/modelEngine.js";
 import { QUERY_OPERATORS } from "../lib/previewFilters.js";
+import { metricExpression } from "../lib/expr/metric.js";
 import { resolveModelSql, MAX_FORMULA_TOKENS, isDatasetSpec } from "../lib/modelSql.js";
 import { wrap, sendQueryError } from "./http.js";
 
@@ -373,6 +374,24 @@ queryRouter.post(
 
       const rMeasures = [];
       for (const m of modelMeasures) {
+        // A saved metric of this table, used live: its definition as a formula.
+        if (m && m.aggregation === "metric") {
+          const metric = (node.data?.semanticModel?.measures || []).find((x) => x.id === m.metricId);
+          if (!metric) {
+            res.status(400).json({ error: "This report uses a metric that no longer exists." });
+            return;
+          }
+          let expression;
+          try {
+            expression = metricExpression(metric, node);
+          } catch (err) {
+            res.status(400).json({ error: `${metric.label || "A metric"}: ${err.message}` });
+            return;
+          }
+          m.aggregation = "expression";
+          m.expression = expression;
+          m.label = m.label || metric.label;
+        }
         if (isFormulaMeasure(m)) {
           const resolve = (name) => {
             const col = colsByName.get(name);
