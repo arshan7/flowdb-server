@@ -584,7 +584,7 @@ export async function deleteReport(sourceId, reportId) {
 // route per tile.
 const DASHBOARD_COLUMNS = `
   id, source_id AS "sourceId", name, report_ids AS "reportIds",
-  layout, text_tiles AS "textTiles", parameters,
+  layout, text_tiles AS "textTiles", parameters, settings,
   collection_id AS "collectionId", is_favorite AS "isFavorite",
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
@@ -655,14 +655,15 @@ export function renameDashboard(sourceId, dashboardId, name) {
 export async function updateDashboard(sourceId, dashboardId, patch = {}) {
   const sets = [];
   const values = [dashboardId, sourceId];
-  const col = (name, value) => {
-    values.push(toJson(value || []));
+  const col = (name, value, empty = []) => {
+    values.push(toJson(value || empty));
     sets.push(`${name} = $${values.length}`);
   };
   if (patch.reportIds !== undefined) col("report_ids", patch.reportIds);
   if (patch.layout !== undefined) col("layout", patch.layout);
   if (patch.textTiles !== undefined) col("text_tiles", patch.textTiles);
   if (patch.parameters !== undefined) col("parameters", patch.parameters);
+  if (patch.settings !== undefined) col("settings", patch.settings, {});
   if (sets.length === 0) return getDashboard(sourceId, dashboardId);
   const { rows } = await query(
     `UPDATE tablespace_dashboards SET ${sets.join(", ")}, updated_at = now()

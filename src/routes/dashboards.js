@@ -110,8 +110,16 @@ dashboardsRouter.put(
       }
       patch[key] = body[key];
     }
+    // Tabs and filter behaviour: an object.
+    if (body.settings !== undefined) {
+      if (!body.settings || typeof body.settings !== "object" || Array.isArray(body.settings)) {
+        res.status(400).json({ error: "settings must be an object." });
+        return;
+      }
+      patch.settings = body.settings;
+    }
     if (Object.keys(patch).length === 0) {
-      res.status(400).json({ error: "Nothing to update - send reportIds, layout, textTiles, and/or parameters." });
+      res.status(400).json({ error: "Nothing to update - send reportIds, layout, textTiles, parameters and/or settings." });
       return;
     }
     const dashboard = await store.updateDashboard(req.params.sourceId, req.params.dashboardId, patch);
