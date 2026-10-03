@@ -109,9 +109,7 @@ const isFormulaMeasure = (m) =>
 // has no other validation on save (see saveBranch), so a hand-crafted
 // request could otherwise have written anything into
 // semanticModel.aggregation before this route ever reads it back.
-queryRouter.post(
-  "/sources/:sourceId/query",
-  wrap(async (req, res) => {
+export async function handleReportQuery(req, res) {
     const {
       tableId,
       // Slice 5 - a report reads from a table OR a Model. When `modelId`
@@ -906,8 +904,8 @@ queryRouter.post(
     } catch (err) {
       sendQueryError(res, "query", err);
     }
-  }),
-);
+}
+queryRouter.post("/sources/:sourceId/query", wrap(handleReportQuery));
 
 // Slice 4 - native SQL. No semantic-model resolution: the client sends raw
 // SELECT text with {{vars}}, resolveNativeVars turns those into bound $N
@@ -915,9 +913,7 @@ queryRouter.post(
 // wrapped in `SELECT * FROM (<sql>) LIMIT/OFFSET` (see its comment for the
 // three safety layers). Same source-scoping and 30s result cache as the
 // semantic route.
-queryRouter.post(
-  "/sources/:sourceId/query/native",
-  wrap(async (req, res) => {
+export async function handleNativeQuery(req, res) {
     const { sql, vars = {}, offset = 0, pageSize = DEFAULT_PAGE_SIZE, withTotal = false, fresh = false } = req.body || {};
     if (!sql || typeof sql !== "string" || !sql.trim()) {
       res.status(400).json({ error: "sql is required." });
@@ -986,5 +982,5 @@ queryRouter.post(
       // need; it never contains the connection string.
       res.status(400).json({ error: err.message || "Query failed." });
     }
-  }),
-);
+}
+queryRouter.post("/sources/:sourceId/query/native", wrap(handleNativeQuery));

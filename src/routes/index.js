@@ -16,6 +16,7 @@ import { branchesRouter } from "./branches.js";
 import { checkpointsRouter } from "./checkpoints.js";
 import { viewsRouter } from "./views.js";
 import { exprRouter } from "./expr.js";
+import { alertsRouter } from "./alerts.js";
 
 // One router per resource (see docs/PROJECT_STRUCTURE.md in the client repo for the
 // mirrored layout). Order matters: account routes register before the ownership
@@ -65,6 +66,7 @@ apiRouter.use(branchesRouter);
 apiRouter.use(checkpointsRouter);
 apiRouter.use(viewsRouter);
 apiRouter.use(exprRouter);
+apiRouter.use(alertsRouter);
 
 // eslint-disable-next-line no-unused-vars
 apiRouter.use((err, req, res, next) => {

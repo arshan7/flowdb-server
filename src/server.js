@@ -9,6 +9,7 @@ import { clerkWebhookHandler } from "./routes/clerkWebhook.js";
 import { requireApiKey } from "./middleware/apiKey.js";
 import { requireUser } from "./middleware/requireUser.js";
 import { startSyncScheduler } from "./lib/syncScheduler.js";
+import { startAlertScheduler } from "./lib/alerts/runner.js";
 import { startQueryCacheSweeper } from "./lib/queryCache.js";
 import { pool } from "./lib/db.js";
 import { initErrorReporting } from "./lib/errorReporting.js";
@@ -150,6 +151,7 @@ const server = app.listen(port, () => {
 });
 
 startSyncScheduler();
+startAlertScheduler();
 startQueryCacheSweeper();
 
 // Render (and most PaaS) send SIGTERM on deploy/scale-down and then

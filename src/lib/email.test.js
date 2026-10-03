@@ -34,3 +34,14 @@ test("sendWelcomeEmail: without RESEND_API_KEY -> skipped, never throws", async 
     if (had !== undefined) process.env.RESEND_API_KEY = had;
   }
 });
+
+test("buildAlertEmail - escapes values, caps rows, links the report", async () => {
+  const { buildAlertEmail } = await import("./email.js");
+  const rows = Array.from({ length: 25 }, (_, i) => ({ s: i === 0 ? "<b>x</b>" : `r${i}`, n: i }));
+  const { subject, html, text } = buildAlertEmail({ reportName: "Paid orders", what: "has results", columns: [{ id: "s", label: "Status" }, { id: "n", label: "N" }], rows, reportUrl: "https://app/r/1" });
+  assert.equal(subject, "Alert: Paid orders has results");
+  assert.ok(html.includes("&lt;b&gt;x&lt;/b&gt;"));
+  assert.ok(!html.includes("<b>x</b>"));
+  assert.ok(html.includes("and 5 more rows"));
+  assert.ok(text.includes("Open the report: https://app/r/1"));
+});

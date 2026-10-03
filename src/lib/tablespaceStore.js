@@ -1185,3 +1185,95 @@ export async function deleteSavedView(sourceId, ownerUserId, id) {
   );
   return rowCount > 0;
 }
+
+// --- Alerts (migration b4e8f27a1c63) ---------------------------------------------
+// An alert watches one report on a schedule and emails its owner's list when its
+// condition holds; lib/alerts/runner.js runs the due ones.
+const ALERT_COLUMNS = `
+  id, source_id AS "sourceId", report_id AS "reportId", owner_user_id AS "ownerUserId",
+  condition, schedule, timezone, recipients, request, active,
+  next_run_at AS "nextRunAt", last_run_at AS "lastRunAt", last_sent_at AS "lastSentAt",
+  last_state AS "lastState", last_error AS "lastError", created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function listAlerts(sourceId, reportId = null) {
+  const { rows } = await query(
+    `SELECT ${ALERT_COLUMNS} FROM tablespace_alerts WHERE source_id = $1 AND ($2::int IS NULL OR report_id = $2) ORDER BY created_at`,
+    [sourceId, reportId],
+  );
+  return rows;
+}
+
+export async function getAlert(sourceId, alertId) {
+  const { rows } = await query(`SELECT ${ALERT_COLUMNS} FROM tablespace_alerts WHERE id = $1 AND source_id = $2`, [alertId, sourceId]);
+  return rows[0] || null;
+}
+
+export async function createAlert(sourceId, a) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_alerts (source_id, report_id, owner_user_id, condition, schedule, timezone, recipients, request, active, next_run_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING ${ALERT_COLUMNS}`,
+    [sourceId, a.reportId, a.ownerUserId, toJson(a.condition), toJson(a.schedule), a.timezone, toJson(a.recipients), toJson(a.request), a.active, a.nextRunAt],
+  );
+  return rows[0];
+}
+
+export async function updateAlert(sourceId, alertId, patch) {
+  const sets = [];
+  const values = [alertId, sourceId];
+  const set = (col, v) => {
+    values.push(v);
+    sets.push(`${col} = $${values.length}`);
+  };
+  for (const [k, col] of [["condition", "condition"], ["schedule", "schedule"], ["recipients", "recipients"], ["request", "request"]]) {
+    if (patch[k] !== undefined) set(col, toJson(patch[k]));
+  }
+  if (patch.timezone !== undefined) set("timezone", patch.timezone);
+  if (patch.active !== undefined) set("active", patch.active);
+  if (patch.nextRunAt !== undefined) set("next_run_at", patch.nextRunAt);
+  if (patch.lastState !== undefined) set("last_state", patch.lastState);
+  if (!sets.length) return getAlert(sourceId, alertId);
+  const { rows } = await query(
+    `UPDATE tablespace_alerts SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND source_id = $2 RETURNING ${ALERT_COLUMNS}`,
+    values,
+  );
+  return rows[0] || null;
+}
+
+export async function deleteAlert(sourceId, alertId) {
+  const { rowCount } = await query(`DELETE FROM tablespace_alerts WHERE id = $1 AND source_id = $2`, [alertId, sourceId]);
+  return rowCount > 0;
+}
+
+/**
+ * Due alerts, claimed: each one's next_run_at moves out of reach in the same
+ * statement (SKIP LOCKED), so two server instances never run one alert twice.
+ * The runner then sets the real next time.
+ */
+export async function claimDueAlerts(limit = 20) {
+  const { rows } = await query(
+    `UPDATE tablespace_alerts SET next_run_at = now() + interval '15 minutes'
+     WHERE id IN (
+       SELECT id FROM tablespace_alerts
+       WHERE active AND next_run_at IS NOT NULL AND next_run_at <= now()
+       ORDER BY next_run_at LIMIT $1 FOR UPDATE SKIP LOCKED
+     ) RETURNING ${ALERT_COLUMNS}`,
+    [limit],
+  );
+  return rows;
+}
+
+export async function finishAlertRun(alertId, { nextRunAt, lastState, sent, error }) {
+  await query(
+    `UPDATE tablespace_alerts SET next_run_at = $2, last_run_at = now(), last_state = COALESCE($3, last_state),
+       last_sent_at = CASE WHEN $4 THEN now() ELSE last_sent_at END, last_error = $5
+     WHERE id = $1`,
+    [alertId, nextRunAt, lastState ?? null, !!sent, error ?? null],
+  );
+}
+
+/** The email address of a Clerk user we know, or null. */
+export async function userEmail(userId) {
+  const { rows } = await query(`SELECT email FROM tablespace_users WHERE clerk_user_id = $1`, [userId]).catch(() => ({ rows: [] }));
+  return rows[0]?.email ?? null;
+}
