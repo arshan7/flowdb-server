@@ -12,6 +12,7 @@ import { QUERY_OPERATORS } from "../lib/previewFilters.js";
 import { metricExpression } from "../lib/expr/metric.js";
 import { resolveModelSql, MAX_FORMULA_TOKENS, isDatasetSpec } from "../lib/modelSql.js";
 import { wrap, sendQueryError } from "./http.js";
+import { cleanShowAs } from "../lib/showAs.js";
 
 // Reporting-parity slice 1 - `distinct` (COUNT DISTINCT) and `median`
 // (PERCENTILE_CONT 0.5) join the simple-measure aggregations. They're
@@ -288,6 +289,7 @@ export async function handleReportQuery(req, res) {
           rowLimit,
           offset,
           pageSize,
+          showAs: cleanShowAs(req.body.showAs, rMeasures.map((m) => m.id)),
         });
       } catch (err) {
         res.status(400).json({ error: err.message });
@@ -469,6 +471,7 @@ export async function handleReportQuery(req, res) {
           pageSize,
           orderBy: directOrderBy,
           rowLimit,
+          showAs: cleanShowAs(req.body.showAs, rMeasures.map((m) => m.id)),
         });
       } catch (err) {
         res.status(400).json({ error: err.message });
@@ -867,6 +870,7 @@ export async function handleReportQuery(req, res) {
         pageSize,
         orderBy: resolvedOrderBy,
         rowLimit,
+        showAs: cleanShowAs(req.body.showAs, measures.map((m) => m.id)),
       });
     } catch (err) {
       res.status(400).json({ error: err.message });

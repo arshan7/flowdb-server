@@ -2,6 +2,7 @@ import pg from "pg";
 import { splitSsl, isSslRefusedError, sslFallbackAllowed } from "./pgIntrospect.js";
 import { joinKeyword } from "./joinResolve.js";
 import { compileFormulaMeasure } from "./modelEngine.js";
+import { showAsExpr } from "./showAs.js";
 
 // DATE (oid 1082) stays the database's own "2026-08-08" text. Parsed into a JS
 // Date it becomes local midnight, which serializes as the previous day in UTC
@@ -335,6 +336,8 @@ export function compileQuery({
   // rows the report can ever return, independent of the paging window.
   orderBy = null,
   rowLimit = null,
+  // { [measureId]: "percent" | "running" | "change" | "percentChange" } (lib/showAs.js)
+  showAs = {},
 }) {
   if (measures.length === 0 && dimensions.length === 0) {
     throw new Error("Pick at least one dimension or measure.");
@@ -383,6 +386,7 @@ export function compileQuery({
         );
         if (mfParts.length) expr += ` FILTER (WHERE ${mfParts.join(" AND ")})`;
       }
+      if (showAs[measure.id]) expr = showAsExpr(expr, showAs[measure.id], dimensions.map((d) => ({ sql: dimExpr(d), time: !!d.bucket })));
       return `${expr} AS ${quoteIdent(measure.id)}`;
     }),
   ];

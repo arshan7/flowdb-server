@@ -6,6 +6,7 @@
 // buckets / sort / filters / paging.
 import { joinKeyword } from "./joinResolve.js";
 import { compileExpression } from "./expr/compile.js";
+import { showAsExpr } from "./showAs.js";
 import {
   quoteIdent,
   quoteQualified,
@@ -224,6 +225,7 @@ export function compileModelReport({
   rowLimit = null,
   offset = 0,
   pageSize = DEFAULT_PAGE_SIZE,
+  showAs = {},
 }) {
   if (measures.length === 0 && dimensions.length === 0) {
     throw new Error("Pick at least one column or measure.");
@@ -236,10 +238,11 @@ export function compileModelReport({
     ...dimensions.map((d) => `${dimSql(d)} AS ${quoteIdent(d.id)}`),
     ...measures.map((m) => {
       // A formula measure: [column] reads the model's output columns.
+      const shown = (expr) => (showAs[m.id] ? showAsExpr(expr, showAs[m.id], dimensions.map((d) => ({ sql: dimSql(d), time: !!d.bucket }))) : expr);
       if (m.aggregation === "expression") {
         const column = (name) => (m.columns?.has(name) ?? true ? { sql: quoteQualified(MODEL_ALIAS, name), kind: m.kinds?.[name] ?? "unknown" } : null);
         const out = compileFormulaMeasure(m, { column, params, windowOrder: dimensions.map(dimSql) });
-        return `${out} AS ${quoteIdent(m.id)}`;
+        return `${shown(out)} AS ${quoteIdent(m.id)}`;
       }
       let expr = aggExpr(m.aggregation, m.column, MODEL_ALIAS);
       // Post-parity - an "only where …" condition on a single measure,
@@ -251,7 +254,7 @@ export function compileModelReport({
         compileFilterCondition(MODEL_ALIAS, f.column, f.operator, f.value, params),
       );
       if (mfParts.length) expr += ` FILTER (WHERE ${mfParts.join(" AND ")})`;
-      return `${expr} AS ${quoteIdent(m.id)}`;
+      return `${shown(expr)} AS ${quoteIdent(m.id)}`;
     }),
   ];
   const whereParts = filters.map((f) => compileFilterCondition(MODEL_ALIAS, f.column, f.operator, f.value, params));
