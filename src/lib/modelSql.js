@@ -100,7 +100,14 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
   if (columns.length === 0) return { error: "This model exposes no columns." };
 
   const filters = [];
+  // A row filter by output column name ({column, operator, value}) - what the
+  // recipe editor saves - applies over the model's own rows.
+  const rowFilters = [];
   for (const f of model.filters || []) {
+    if (f && typeof f.column === "string" && f.tableId == null) {
+      rowFilters.push({ column: f.column, operator: f.operator, value: f.value });
+      continue;
+    }
     const n = nodeFor(f.tableId);
     const col = (n?.data?.columns || []).find((x) => x.id === f.columnId);
     if (!n || !col || !QUERY_OPERATORS.has(f.operator)) return { error: "This model has an invalid filter." };
@@ -115,6 +122,7 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
       joinClauses,
       columns,
       filters,
+      rowFilters,
     });
   } catch (err) {
     return { error: err.message };

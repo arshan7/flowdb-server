@@ -50,3 +50,18 @@ test("resolveModelSql - a typed formula column compiles with [column] and [table
   const bad = resolveModelSql({ ...m, columns: [...m.columns.slice(0, 2), { kind: "expr", alias: "x", text: "[nope] + 1" }] }, branch);
   assert.match(bad.error, /The custom column "x": There's no column called \[nope\]/);
 });
+
+test("row filters by output column read the finished rows", () => {
+  const r = resolveModelSql(
+    {
+      kind: "builder",
+      baseTableId: "t1",
+      columns: [{ tableId: "t1", columnId: "c1" }, { tableId: "t1", columnId: "c2" }],
+      filters: [{ column: "status", operator: "eq", value: "paid" }],
+    },
+    { nodes: [node("t1", "orders", [{ id: "c1", name: "status", type: "text" }, { id: "c2", name: "total", type: "numeric" }])] },
+  );
+  assert.equal(r.error, undefined);
+  assert.match(r.sql, /^SELECT \* FROM \(SELECT .* FROM "orders"\) AS "_tsr" WHERE "_tsr"."status" = \$1$/);
+  assert.deepEqual(r.params, ["paid"]);
+});

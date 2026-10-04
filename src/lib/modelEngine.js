@@ -159,6 +159,8 @@ function compileTyped(node, params) {
 //
 // Returns { sql, params, columns }. `sql` is NOT parenthesised - the
 // caller wraps it.
+const ROW_ALIAS = "_tsr";
+
 export function compileModel(spec) {
   if (spec.kind === "sql") {
     return { sql: String(spec.sql || ""), params: spec.params || [], columns: null };
@@ -204,6 +206,11 @@ export function compileModel(spec) {
   let sql = `SELECT ${selectParts.join(", ")} FROM ${quoteTable(spec.baseTableSchema, spec.baseTableName)}`;
   if (joinParts.length) sql += ` ${joinParts.join(" ")}`;
   if (whereParts.length) sql += ` WHERE ${whereParts.join(" AND ")}`;
+  // Row filters name output columns (a formula column too), so they read the finished rows.
+  if (spec.rowFilters?.length) {
+    const outer = spec.rowFilters.map((f) => compileAnyFilter(ROW_ALIAS, f, params));
+    sql = `SELECT * FROM (${sql}) AS ${quoteIdent(ROW_ALIAS)} WHERE ${outer.join(" AND ")}`;
+  }
 
   return { sql, params, columns: spec.columns.map((c) => c.alias) };
 }
