@@ -106,3 +106,19 @@ test("loadJoinedModels fetches nested joins once and stops on a cycle", async ()
   assert.deepEqual([...out.keys()], ["1", "2"]);
   assert.deepEqual(asked, [1, 2]);
 });
+
+test("a formula reads a joined Model's column by [Model.column] or a unique [column]", () => {
+  const m = {
+    kind: "builder",
+    baseTableId: "t_o",
+    joins: [{ modelId: 9, pairs: [{ baseColumnId: "o_cust", column: "customer" }] }],
+    columns: [
+      { tableId: "t_o", columnId: "o_id" },
+      { kind: "expr", alias: "who", text: "[Customer totals.name] & \" #\" & [customer]" },
+    ],
+  };
+  const { sql, error } = resolveModelSql(m, branch, null, new Map([["9", custTotals]]));
+  assert.equal(error, undefined);
+  assert.match(sql, /"model_9"\."name"/);
+  assert.match(sql, /"model_9"\."customer"/);
+});

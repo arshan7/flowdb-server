@@ -86,6 +86,7 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
   }
   // Joined Models: compiled here, placed as subqueries by compileModel.
   const joinedOut = new Map(); // modelId -> its output column names (null: a SQL model)
+  const joinedRefs = []; // what formulas can read from joined Models
   for (const mj of modelJoins) {
     const id = String(mj.modelId);
     if (depth >= MAX_MODEL_DEPTH) return { error: "Models join each other too deeply." };
@@ -103,11 +104,13 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
     }
     if (!pairs.length) return { error: "A join to a model needs columns to match on." };
     joinedOut.set(id, sub.columns);
+    joinedRefs.push({ label: row.name || id, alias: joinedModelAlias(id), columns: sub.columns, kinds: sub.kinds || {} });
     joinClauses.push({ subquery: sub, tableName: joinedModelAlias(id), fromTableName: base.data.label, pairs, type: normalizeJoinType(mj.type) });
   }
   const nodeFor = (tid) => (tid === base.id ? base : joinNodes.find((n) => n.id === tid));
 
   const columns = [];
+  const kinds = {}; // output column -> kind, for a model that joins this one
   for (const c of model.columns || []) {
     // A custom column - a row-level arithmetic formula over the model's
     // other columns. Its token stream is resolved + parsed here (every
@@ -119,7 +122,8 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
       // values number in column order.
       const alias = (c.alias || "").trim();
       if (!alias) return { error: "A custom column needs a name." };
-      columns.push({ kind: "exprText", text: c.text, alias, resolve: modelColumnResolver(base, joinNodes) });
+      columns.push({ kind: "exprText", text: c.text, alias, resolve: modelColumnResolver(base, joinNodes, joinedRefs) });
+      kinds[alias] = c.resultKind === "datetime" ? "date" : c.resultKind || "unknown";
       continue;
     }
     if (c && c.kind === "expr") {
@@ -135,7 +139,9 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
       if (out === undefined || typeof c.column !== "string" || (out && !out.includes(c.column))) {
         return { error: "This model references a column that no longer exists." };
       }
-      columns.push({ tableName: joinedModelAlias(c.modelId), columnName: c.column, alias: (c.alias || "").trim() || c.column });
+      const outAlias = (c.alias || "").trim() || c.column;
+      columns.push({ tableName: joinedModelAlias(c.modelId), columnName: c.column, alias: outAlias });
+      kinds[outAlias] = joinedRefs.find((r) => r.alias === joinedModelAlias(c.modelId))?.kinds[c.column] ?? "unknown";
       continue;
     }
     const n = nodeFor(c.tableId);
@@ -144,6 +150,7 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
     // Only FROM/JOIN positions need a schema prefix; a column ref like
     // "table"."col" binds to the range-table entry regardless of schema.
     columns.push({ tableName: n.data.label, columnName: col.name, alias: (c.alias || "").trim() || col.name });
+    kinds[(c.alias || "").trim() || col.name] = kindOfColumnType(col.type);
   }
   if (columns.length === 0) return { error: "This model exposes no columns." };
 
@@ -163,7 +170,9 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
   }
 
   try {
-    return compileModel({
+    return {
+      kinds,
+      ...compileModel({
       kind: "builder",
       baseTableName: base.data.label,
       baseTableSchema: base.data.schema ?? defaultSchema,
@@ -171,7 +180,8 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
       columns,
       filters,
       rowFilters,
-    });
+    }),
+    };
   } catch (err) {
     return { error: err.message };
   }
@@ -255,8 +265,11 @@ export function isDatasetSpec(d) {
  * names the table.
  * @returns {(name: string) => ({sql: string, kind: string} | null)}
  */
-export function modelColumnResolver(base, joinNodes = []) {
+export function modelColumnResolver(base, joinNodes = [], joinedModels = []) {
   const tables = [base, ...joinNodes].filter(Boolean);
+  // A joined Model's column: [Model name.column], or [column] when only it has that name.
+  const modelHit = (m, colName) =>
+    !m.columns || m.columns.includes(colName) ? { sql: quoteQualified(m.alias, colName), kind: m.kinds?.[colName] ?? "unknown" } : null;
   const hit = (node, colName) => {
     const col = (node.data?.columns || []).find((x) => x.name === colName);
     return col ? { sql: quoteQualified(node.data.label, col.name), kind: kindOfColumnType(col.type) } : null;
@@ -268,9 +281,14 @@ export function modelColumnResolver(base, joinNodes = []) {
       const found = node && hit(node, name.slice(dot + 1));
       if (found) return found;
     }
+    const m = joinedModels.find((x) => name.startsWith(`${x.label}.`));
+    if (m) {
+      const found = modelHit(m, name.slice(m.label.length + 1));
+      if (found) return found;
+    }
     const own = hit(base, name);
     if (own) return own;
-    const others = joinNodes.map((n) => hit(n, name)).filter(Boolean);
+    const others = [...joinNodes.map((n) => hit(n, name)), ...joinedModels.filter((x) => x.columns?.includes(name)).map((x) => modelHit(x, name))].filter(Boolean);
     return others.length === 1 ? others[0] : null;
   };
 }
