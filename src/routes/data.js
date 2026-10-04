@@ -721,7 +721,7 @@ dataRouter.post(
     }
 
     const pkSet = new Set(table.pkColumns);
-    const cols = [...table.columnNames].filter((name) => !pkSet.has(name) || Object.prototype.hasOwnProperty.call(overrides, name));
+    const cols = [...table.columnNames.keys()].filter((name) => !pkSet.has(name) || Object.prototype.hasOwnProperty.call(overrides, name));
     const from = quoteTable(table.schema, table.label);
     const params = [];
     const selectExprs = cols.map((c) => {
