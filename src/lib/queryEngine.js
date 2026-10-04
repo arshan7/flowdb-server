@@ -9,7 +9,7 @@ import { showAsExpr } from "./showAs.js";
 // for any server east of Greenwich - every date showed one day early.
 pg.types.setTypeParser(1082, (value) => value);
 
-const AGGREGATIONS = { count: "COUNT", sum: "SUM", avg: "AVG", min: "MIN", max: "MAX" };
+const AGGREGATIONS = { count: "COUNT", sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", stddev: "STDDEV_SAMP", variance: "VAR_SAMP" };
 // Reporting-parity slice 1 - `date_trunc` units a dimension can be grouped
 // by. Same fixed-map discipline as OPERATORS/CALC_OPERATORS: the client
 // sends a key, only a value from this map ever reaches the SQL string.

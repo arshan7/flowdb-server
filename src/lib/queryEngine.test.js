@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  aggExpr,
   compileQuery,
   resolveNativeVars,
   quoteTable,
@@ -374,4 +375,9 @@ test("compileLinkedCondition - filters through a link column with a subquery", (
   const sql = compileLinkedCondition("order_items", "order_id", { tableName: "orders", tableSchema: null, keyColumn: "id", column: "status" }, "in", ["paid", "shipped"], params);
   assert.equal(sql, '"order_items"."order_id" IN (SELECT "orders"."id" FROM "orders" WHERE "orders"."status"::text = ANY($1))');
   assert.deepEqual(params, [["paid", "shipped"]]);
+});
+
+test("standard deviation and variance aggregate a column", () => {
+  assert.equal(aggExpr("stddev", "total", "orders"), 'STDDEV_SAMP("orders"."total")');
+  assert.equal(aggExpr("variance", "total", "orders"), 'VAR_SAMP("orders"."total")');
 });

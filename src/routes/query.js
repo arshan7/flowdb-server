@@ -20,7 +20,7 @@ import { cleanShowAs } from "../lib/showAs.js";
 // compileTermExpr's pre-aggregate-then-LEFT-JOIN machinery, so a formula
 // term can't pick them (a simple base-table measure, and a measure-ref
 // term pointing at one, still can - both stay on the base table).
-const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max", "distinct", "median"]);
+const QUERY_AGGREGATIONS = new Set(["count", "sum", "avg", "min", "max", "distinct", "median", "stddev", "variance"]);
 
 // Post-4.4b - "value" (a directly-related table's column, read as-is, not
 // really aggregated) is a term-only concept, deliberately NOT in
