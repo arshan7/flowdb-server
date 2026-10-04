@@ -159,7 +159,7 @@ export async function handleReportQuery(req, res) {
       // Refresh: skip the 30s result cache and read the database again.
       fresh = false,
     } = req.body || {};
-    if (!tableId && !modelId && !dataset) {
+    if (!tableId && !modelId && !bodyDataset) {
       res.status(400).json({ error: "tableId, modelId, or a dataset is required." });
       return;
     }
