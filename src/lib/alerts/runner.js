@@ -42,7 +42,16 @@ export async function runAlert(alert, { force = false } = {}) {
   const report = await store.getReport(alert.sourceId, alert.reportId);
   if (!report) throw new Error("The report this alert watches no longer exists.");
   const result = await runRequest(alert.sourceId, alert.request);
-  const outcome = checkAlert(alert.condition, result, alert.lastState);
+  // The report's time grouping, so a weekly alert judges the last whole week.
+  const body = alert.request?.body || {};
+  const first = body.dimensions?.[0];
+  const firstId = body.dimensionIds?.[0];
+  const period = first?.bucket
+    ? { dimId: first.id, bucket: first.bucket }
+    : firstId && body.dimensionBuckets?.[firstId]
+      ? { dimId: firstId, bucket: body.dimensionBuckets[firstId] }
+      : null;
+  const outcome = checkAlert(alert.condition, result, alert.lastState, period);
   if (!outcome.send && !force) return { sent: false, met: outcome.state === "met", state: outcome.state };
   const measureLabel = (result.columns || []).find((c) => c.id === alert.condition?.measureId)?.label;
   const what = force && !outcome.send ? "(test)" : describeCondition(alert.condition, measureLabel);

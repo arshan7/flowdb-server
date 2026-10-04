@@ -23,3 +23,11 @@ test("a goal alert reads the latest value and sends once per crossing", () => {
 test("conditions read in plain words", () => {
   assert.equal(describeCondition({ kind: "goal", direction: "below", value: 1000 }, "Revenue"), "Revenue is below 1,000");
 });
+
+test("a weekly alert judges the last whole week, not the one in progress", () => {
+  const goal = { kind: "goal", measureId: "n", direction: "below", value: 10, repeat: "every" };
+  const rows = [{ wk: "2026-09-21", n: 12 }, { wk: "2026-09-28", n: 3 }];
+  const now = new Date("2026-10-01T12:00:00Z"); // a Thursday in the week of Sep 28
+  assert.equal(checkAlert(goal, { rows }, null, { dimId: "wk", bucket: "week" }, now).value, 12);
+  assert.equal(checkAlert(goal, { rows }, null, null, now).value, 3);
+});
