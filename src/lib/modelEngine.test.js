@@ -225,3 +225,8 @@ test("custom column types - convert-to casts by target, refusing impossible ones
   assert.throws(() => exprSql({ kind: "cast", to: "number", arg: typed("d", "date") }), /A date can't be used as a number/);
   assert.throws(() => exprSql({ kind: "cast", to: "rot13", arg: typed("a", "text") }), /invalid custom column/);
 });
+
+test("compileModelReport with nothing summarized returns the rows", () => {
+  const r = compileModelReport({ modelSql: 'SELECT * FROM "orders"', filters: [{ column: "status", operator: "eq", value: "paid" }], orderBy: { field: "id", direction: "desc" }, pageSize: 10 });
+  assert.match(r.sql, /^SELECT \* FROM \(SELECT \* FROM "orders"\) AS "_tsm" WHERE "_tsm"."status" = \$1 ORDER BY "id" DESC LIMIT \$2 OFFSET \$3$/);
+});

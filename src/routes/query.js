@@ -140,7 +140,7 @@ export async function handleReportQuery(req, res) {
       // columns) but not yet persisted as an owned Model. Same
       // { baseTableId, joins, columns, filters } shape a saved report
       // carries; compiled and aggregated over exactly like a `modelId`.
-      dataset = null,
+      dataset: bodyDataset = null,
       dimensions: modelDimensions = [],
       measures: modelMeasures = [],
       joinTableIds = [],
@@ -183,6 +183,24 @@ export async function handleReportQuery(req, res) {
     }
 
     const branch = await store.getMainBranch(req.params.sourceId);
+
+    // Nothing summarized: the rows themselves. A plain table reads as a model of all its columns.
+    const rowsOnly = !modelDimensions.length && !modelMeasures.length && (direct || modelId || bodyDataset);
+    let dataset = bodyDataset;
+    if (rowsOnly && direct && !modelId && !dataset) {
+      const t = (branch?.nodes || []).find((n) => n.id === tableId && n.type === "tableNode");
+      if (!t) {
+        res.status(404).json({ error: "Table not found." });
+        return;
+      }
+      dataset = {
+        kind: "builder",
+        baseTableId: tableId,
+        joins: [],
+        columns: (t.data?.columns || []).filter((c) => c.reportVisibility !== "hidden").map((c) => ({ tableId, columnId: c.id, alias: "" })),
+        filters: [],
+      };
+    }
 
     // Slice 5 - model-sourced report. The model compiles to a subquery;
     // dims/measures aggregate over its OUTPUT columns (validated against
@@ -312,7 +330,7 @@ export async function handleReportQuery(req, res) {
       let resolvedOrderBy = null;
       if (orderBy && orderBy.field) {
         const sortable = new Set([...rDims, ...rMeasures].map((c) => c.id));
-        if (!sortable.has(orderBy.field)) {
+        if (!(rowsOnly ? checkCol(orderBy.field) : sortable.has(orderBy.field))) {
           res.status(400).json({ error: "Can't sort by a field that isn't in the report." });
           return;
         }
@@ -337,8 +355,12 @@ export async function handleReportQuery(req, res) {
         res.status(400).json({ error: err.message });
         return;
       }
+      // Rows mode returns the model's own columns.
+      const outCols = rowsOnly
+        ? (compiledModel.columns || []).map((c) => ({ id: c, label: c }))
+        : [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation }));
       if (exportOf(req.body)) {
-        const cols = [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation }));
+        const cols = outCols;
         await sendReportExport(res, secrets.connectionString, mCompiled, rowLimit, cols, exportOf(req.body));
         return;
       }
@@ -358,7 +380,7 @@ export async function handleReportQuery(req, res) {
         const total = withTotal ? await totalOf(req.params.sourceId, secrets.connectionString, mCompiled, rowLimit, fresh) : null;
         res.json({
           total,
-          columns: [...rDims, ...rMeasures].map((c) => ({ id: c.id, label: c.label || c.column || c.aggregation })),
+          columns: outCols.length || !rows.length ? outCols : Object.keys(rows[0]).map((c) => ({ id: c, label: c })),
           rows,
           hasMore,
           sql: mCompiled.sql,

@@ -235,11 +235,10 @@ export function compileModelReport({
   pageSize = DEFAULT_PAGE_SIZE,
   showAs = {},
 }) {
-  if (measures.length === 0 && dimensions.length === 0) {
-    throw new Error("Pick at least one column or measure.");
-  }
   // modelParams occupy $1..$N; everything pushed below continues from there.
   const params = [...modelParams];
+  // Nothing summarized: the model's rows as they are (filtered, sorted, paged).
+  const rowsOnly = measures.length === 0 && dimensions.length === 0;
 
   const dimSql = (d) => dimExpr({ tableName: MODEL_ALIAS, columnName: d.column, bucket: d.bucket });
   const selectParts = [
@@ -268,7 +267,7 @@ export function compileModelReport({
   const whereParts = filters.map((f) => compileAnyFilter(MODEL_ALIAS, f, params));
 
   const distinct = dimensions.length > 0 && measures.length === 0 ? "DISTINCT " : "";
-  let sql = `SELECT ${distinct}${selectParts.join(", ")} FROM (${modelSql}) AS ${quoteIdent(MODEL_ALIAS)}`;
+  let sql = `SELECT ${distinct}${rowsOnly ? "*" : selectParts.join(", ")} FROM (${modelSql}) AS ${quoteIdent(MODEL_ALIAS)}`;
   if (whereParts.length) sql += ` WHERE ${whereParts.join(" AND ")}`;
   if (dimensions.length > 0 && measures.length > 0) {
     sql += ` GROUP BY ${dimensions.map(dimSql).join(", ")}`;
@@ -276,6 +275,9 @@ export function compileModelReport({
   if (orderBy && orderBy.field) {
     const dir = SORT_DIRECTIONS[orderBy.direction] || "ASC";
     sql += ` ORDER BY ${quoteIdent(orderBy.field)} ${dir}`;
+  } else if (rowsOnly) {
+    // Rows keep a stable order across pages: by the first column (usually the key).
+    sql += " ORDER BY 1";
   }
 
   const windowSize = rowLimit != null ? Math.max(0, Math.min(pageSize, rowLimit - offset)) : pageSize;
