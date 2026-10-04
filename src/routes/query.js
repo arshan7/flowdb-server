@@ -94,6 +94,19 @@ async function sendReportExport(res, connectionString, compiled, rowLimit, colum
   await sendExport(res, connectionString, q.sql, q.params, columns, ex);
 }
 
+// A dashboard filter on a linked table's column (f.via = { column }), through a link
+// column `fkCol`: the linked table, its key and the column, all from stored nodes.
+// Returns null when there's no `via`, false when it can't be resolved.
+function resolveVia(fkCol, via, nodes, defaultSchema) {
+  if (!via) return null;
+  const ref = fkCol?.references;
+  const t = ref && nodes.find((n) => n.id === ref.tableId && n.type === "tableNode");
+  const key = t && (t.data?.columns || []).find((c) => c.id === ref.columnId);
+  const col = t && typeof via.column === "string" && (t.data?.columns || []).find((c) => c.name === via.column);
+  if (!t || !key || !col) return false;
+  return { tableName: t.data.label, tableSchema: t.data.schema ?? defaultSchema, keyColumn: key.name, column: col.name };
+}
+
 // A custom measure written as a formula (lib/expr), e.g. SumIf([total], [status] = "paid").
 const isFormulaMeasure = (m) =>
   m && m.aggregation === "expression" && typeof m.expression === "string" && m.expression.trim() !== "" && m.expression.length <= 4000;
@@ -282,7 +295,19 @@ export async function handleReportQuery(req, res) {
           res.status(400).json({ error: "Invalid filter." });
           return;
         }
-        rFilters.push({ column: f.column, operator: f.operator, value: f.value });
+        // Linked: the Model's column must be a table's link column, by the name it has here.
+        let via = null;
+        if (f.via) {
+          const nodes = branch?.nodes || [];
+          const spec = model.kind === "builder" ? (model.columns || []).find((c) => !c.kind && (c.alias?.trim() || nodes.find((n) => n.id === c.tableId)?.data?.columns?.find((x) => x.id === c.columnId)?.name) === f.column) : null;
+          const fkCol = spec && nodes.find((n) => n.id === spec.tableId)?.data?.columns?.find((x) => x.id === spec.columnId);
+          via = resolveVia(fkCol, f.via, nodes, secrets.schema ?? null);
+          if (!via) {
+            res.status(400).json({ error: "Invalid filter." });
+            return;
+          }
+        }
+        rFilters.push({ column: f.column, operator: f.operator, value: f.value, ...(via && { via }) });
       }
       let resolvedOrderBy = null;
       if (orderBy && orderBy.field) {
@@ -462,7 +487,12 @@ export async function handleReportQuery(req, res) {
           res.status(400).json({ error: "Invalid filter." });
           return;
         }
-        rFilters.push({ tableName: node.data.label, columnName: col.name, operator: f.operator, value: f.value });
+        const via = resolveVia(col, f.via, branch?.nodes || [], directSchema);
+        if (via === false) {
+          res.status(400).json({ error: "Invalid filter." });
+          return;
+        }
+        rFilters.push({ tableName: node.data.label, columnName: col.name, operator: f.operator, value: f.value, ...(via && { via }) });
       }
 
       let directOrderBy = null;

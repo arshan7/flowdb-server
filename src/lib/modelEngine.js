@@ -14,6 +14,7 @@ import {
   aggExpr,
   dimExpr,
   compileFilterCondition,
+  compileAnyFilter,
   SORT_DIRECTIONS,
   DEFAULT_PAGE_SIZE,
 } from "./queryEngine.js";
@@ -257,7 +258,7 @@ export function compileModelReport({
       return `${shown(expr)} AS ${quoteIdent(m.id)}`;
     }),
   ];
-  const whereParts = filters.map((f) => compileFilterCondition(MODEL_ALIAS, f.column, f.operator, f.value, params));
+  const whereParts = filters.map((f) => compileAnyFilter(MODEL_ALIAS, f, params));
 
   const distinct = dimensions.length > 0 && measures.length === 0 ? "DISTINCT " : "";
   let sql = `SELECT ${distinct}${selectParts.join(", ")} FROM (${modelSql}) AS ${quoteIdent(MODEL_ALIAS)}`;

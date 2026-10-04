@@ -5,6 +5,7 @@ import {
   resolveNativeVars,
   quoteTable,
   compileFilterCondition,
+  compileLinkedCondition,
   compileFilterGroup,
   countQueryOf,
 } from "./queryEngine.js";
@@ -366,4 +367,11 @@ test("countQueryOf strips the page window and its two params", () => {
   assert.ok(!/LIMIT/.test(q.sql));
   assert.deepEqual(q.params, params.slice(0, -2));
   assert.equal(countQueryOf("SELECT 1", []), null);
+});
+
+test("compileLinkedCondition - filters through a link column with a subquery", () => {
+  const params = [];
+  const sql = compileLinkedCondition("order_items", "order_id", { tableName: "orders", tableSchema: null, keyColumn: "id", column: "status" }, "in", ["paid", "shipped"], params);
+  assert.equal(sql, '"order_items"."order_id" IN (SELECT "orders"."id" FROM "orders" WHERE "orders"."status"::text = ANY($1))');
+  assert.deepEqual(params, [["paid", "shipped"]]);
 });

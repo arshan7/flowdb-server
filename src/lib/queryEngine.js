@@ -145,6 +145,20 @@ export function compileFilterCondition(tableName, columnName, operator, value, p
   return `${colExpr} ${OPERATORS[operator]} $${params.length}`;
 }
 
+// A condition on a linked table's column, through this table's link column:
+// order_items.order_id IN (SELECT orders.id FROM orders WHERE orders.status = $1).
+// `via`: { tableName, tableSchema, keyColumn, column } - all resolved by the route.
+export function compileLinkedCondition(tableName, columnName, via, operator, value, params) {
+  const inner = compileFilterCondition(via.tableName, via.column, operator, value, params);
+  return `${quoteQualified(tableName, columnName)} IN (SELECT ${quoteQualified(via.tableName, via.keyColumn)} FROM ${quoteTable(via.tableSchema, via.tableName)} WHERE ${inner})`;
+}
+
+/** A filter entry, linked or on the table's own column. */
+export const compileAnyFilter = (tableName, f, params) =>
+  f.via
+    ? compileLinkedCondition(tableName, f.columnName ?? f.column, f.via, f.operator, f.value, params)
+    : compileFilterCondition(tableName, f.columnName ?? f.column, f.operator, f.value, params);
+
 // A nested AND/OR filter tree. A node is either a LEAF - compiled by the
 // caller's `compileLeaf(leaf, params)`, which keeps that route's own
 // column-name validation and just returns a parameterized SQL fragment (or
@@ -391,7 +405,7 @@ export function compileQuery({
     }),
   ];
 
-  const whereParts = filters.map((f) => compileFilterCondition(f.tableName, f.columnName, f.operator, f.value, params));
+  const whereParts = filters.map((f) => compileAnyFilter(f.tableName, f, params));
 
   // Each join is resolved server-side (route) against a real relationship
   // before ever reaching here - baseColumn/joinColumn are always real,
