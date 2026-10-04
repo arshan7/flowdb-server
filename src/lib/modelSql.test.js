@@ -122,3 +122,18 @@ test("a formula reads a joined Model's column by [Model.column] or a unique [col
   assert.match(sql, /"model_9"\."name"/);
   assert.match(sql, /"model_9"\."customer"/);
 });
+
+test("a summarized model groups and totals its own rows", () => {
+  const m = {
+    kind: "builder",
+    baseTableId: "t_o",
+    joins: [],
+    columns: [{ tableId: "t_o", columnId: "o_cust" }, { tableId: "t_o", columnId: "o_id" }],
+    summary: { groups: [{ column: "customer_id" }], measures: [{ aggregation: "count", alias: "orders" }, { aggregation: "max", column: "id", alias: "last_order" }] },
+  };
+  const { sql, columns, error } = resolveModelSql(m, branch);
+  assert.equal(error, undefined);
+  assert.match(sql, /^SELECT "_tss"\."customer_id" AS "customer_id", COUNT\(\*\) AS "orders", MAX\("_tss"\."id"\) AS "last_order" FROM \(SELECT .*\) AS "_tss" GROUP BY "_tss"\."customer_id"$/);
+  assert.deepEqual(columns, ["customer_id", "orders", "last_order"]);
+  assert.match(resolveModelSql({ ...m, summary: { groups: [{ column: "nope" }], measures: [] } }, branch).error, /doesn't have/);
+});

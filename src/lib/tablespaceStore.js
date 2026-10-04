@@ -735,7 +735,7 @@ export async function deleteCollection(sourceId, collectionId) {
 // create / full-update / partial-meta-update split).
 const MODEL_COLUMNS = `
   id, source_id AS "sourceId", name, kind,
-  base_table_id AS "baseTableId", joins, columns, filters,
+  base_table_id AS "baseTableId", joins, columns, filters, summary,
   sql, sql_vars AS "sqlVars",
   collection_id AS "collectionId", is_favorite AS "isFavorite",
   owner_report_id AS "ownerReportId",
@@ -850,13 +850,15 @@ const modelValues = (m) => [
   toJson(m.filters || []),
   m.kind === "sql" ? (m.sql ?? "") : null,
   toJson(m.sqlVars || []),
+  // Group by + calculations over the model's rows; builder models only.
+  m.kind !== "sql" && m.summary ? toJson(m.summary) : null,
 ];
 
 export async function createModel(sourceId, m) {
   const { rows } = await query(
     `INSERT INTO tablespace_models
-       (source_id, name, kind, base_table_id, joins, columns, filters, sql, sql_vars, collection_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       (source_id, name, kind, base_table_id, joins, columns, filters, sql, sql_vars, summary, collection_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING ${MODEL_COLUMNS}`,
     [sourceId, ...modelValues(m), m.collectionId ?? null],
   );
@@ -867,7 +869,7 @@ export async function updateModel(sourceId, modelId, m) {
   const { rows } = await query(
     `UPDATE tablespace_models
      SET name = $3, kind = $4, base_table_id = $5, joins = $6, columns = $7, filters = $8,
-         sql = $9, sql_vars = $10, updated_at = now()
+         sql = $9, sql_vars = $10, summary = $11, updated_at = now()
      WHERE id = $1 AND source_id = $2 RETURNING ${MODEL_COLUMNS}`,
     [modelId, sourceId, ...modelValues(m)],
   );

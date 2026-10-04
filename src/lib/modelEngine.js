@@ -224,6 +224,36 @@ export function compileModel(spec) {
   return { sql, params, columns: spec.columns.map((c) => c.alias) };
 }
 
+// A summarized model: its rows grouped and totalled - "one row per order with its
+// total quantity". `summary` = { groups: [{ column, bucket? }], measures: [{ aggregation,
+// column?, alias }] } over the model's output columns. Output columns: groups, then measures.
+const SUMMARY_ALIAS = "_tss";
+export const SUMMARY_AGGREGATIONS = new Set(["count", "sum", "avg", "median", "min", "max", "distinct", "stddev", "variance"]);
+export function compileSummary(modelSql, summary, known = null) {
+  const groups = Array.isArray(summary?.groups) ? summary.groups : [];
+  const measures = Array.isArray(summary?.measures) ? summary.measures : [];
+  if (!groups.length && !measures.length) throw new Error("A summary needs a group or a calculation.");
+  const has = (c) => typeof c === "string" && (!known || known.includes(c));
+  const outs = [];
+  const dims = groups.map((g) => {
+    if (!has(g.column)) throw new Error(`The summary groups by a column the model doesn't have: ${g.column}`);
+    outs.push(g.column);
+    return dimExpr({ tableName: SUMMARY_ALIAS, columnName: g.column, bucket: g.bucket || null });
+  });
+  const aggs = measures.map((m) => {
+    if (!SUMMARY_AGGREGATIONS.has(m.aggregation)) throw new Error("The summary has an unknown calculation.");
+    if (m.aggregation !== "count" && !has(m.column)) throw new Error(`The summary reads a column the model doesn't have: ${m.column}`);
+    const alias = String(m.alias || "").trim();
+    if (!alias || outs.includes(alias)) throw new Error("Each summary calculation needs its own name.");
+    outs.push(alias);
+    return `${aggExpr(m.aggregation, m.column, SUMMARY_ALIAS)} AS ${quoteIdent(alias)}`;
+  });
+  const select = [...dims.map((d, i) => `${d} AS ${quoteIdent(groups[i].column)}`), ...aggs];
+  let sql = `SELECT ${select.join(", ")} FROM (${modelSql}) AS ${quoteIdent(SUMMARY_ALIAS)}`;
+  if (dims.length) sql += ` GROUP BY ${dims.join(", ")}`;
+  return { sql, columns: outs };
+}
+
 // Wrap a compiled model as `FROM (<modelSql>) AS _tsm` and aggregate over
 // it. Mirrors compileQuery's tail (SELECT dims+measures, GROUP BY, ORDER
 // BY, LIMIT/OFFSET) but every reference is `_tsm."<output column>"` by

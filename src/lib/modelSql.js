@@ -1,7 +1,7 @@
 import { resolveNativeVars } from "./queryEngine.js";
 import { parseFormula } from "./formulaExpr.js";
 import { resolveJoins, normalizeJoinType } from "./joinResolve.js";
-import { compileModel, CAST_TARGETS, kindOfColumnType } from "./modelEngine.js";
+import { compileModel, compileSummary, CAST_TARGETS, kindOfColumnType } from "./modelEngine.js";
 import { quoteQualified } from "./queryEngine.js";
 import { QUERY_OPERATORS } from "./previewFilters.js";
 
@@ -30,6 +30,8 @@ export async function loadJoinedModels(model, getModel, out = new Map(), depth =
   }
   return out;
 }
+
+const hasSummary = (s) => !!s && ((s.groups?.length ?? 0) > 0 || (s.measures?.length ?? 0) > 0);
 
 export function resolveModelSql(model, branch, defaultSchema = null, joinedModels = new Map(), depth = 0) {
   if (model.kind === "sql") {
@@ -170,9 +172,7 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
   }
 
   try {
-    return {
-      kinds,
-      ...compileModel({
+    const rows = compileModel({
       kind: "builder",
       baseTableName: base.data.label,
       baseTableSchema: base.data.schema ?? defaultSchema,
@@ -180,8 +180,14 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
       columns,
       filters,
       rowFilters,
-    }),
-    };
+    });
+    if (!hasSummary(model.summary)) return { kinds, ...rows };
+    // Summarized: grouped and totalled over those rows.
+    const sum = compileSummary(rows.sql, model.summary, rows.columns);
+    const sumKinds = {};
+    for (const g of model.summary.groups || []) sumKinds[g.column] = g.bucket ? "date" : kinds[g.column] ?? "unknown";
+    for (const m of model.summary.measures || []) sumKinds[m.alias] = ["min", "max"].includes(m.aggregation) ? kinds[m.column] ?? "unknown" : "number";
+    return { sql: sum.sql, params: rows.params, columns: sum.columns, kinds: sumKinds };
   } catch (err) {
     return { error: err.message };
   }
