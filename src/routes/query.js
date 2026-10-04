@@ -9,7 +9,7 @@ import { legacyToTokens, parseFormula } from "../lib/formulaExpr.js";
 import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../lib/joinResolve.js";
 import { compileModelReport, kindOfColumnType } from "../lib/modelEngine.js";
 import { QUERY_OPERATORS } from "../lib/previewFilters.js";
-import { metricExpression } from "../lib/expr/metric.js";
+import { metricExpression, metricExpressionOnModel } from "../lib/expr/metric.js";
 import { resolveModelSql, MAX_FORMULA_TOKENS, isDatasetSpec } from "../lib/modelSql.js";
 import { wrap, sendQueryError } from "./http.js";
 import { cleanShowAs } from "../lib/showAs.js";
@@ -228,6 +228,23 @@ export async function handleReportQuery(req, res) {
       }
       const rMeasures = [];
       for (const m of modelMeasures) {
+        // A saved metric of the Model's base table: its definition, in the Model's column names.
+        if (m && m.aggregation === "metric") {
+          const base = (branch?.nodes || []).find((n) => n.id === model.baseTableId);
+          const metric = (base?.data?.semanticModel?.measures || []).find((x) => x.id === m.metricId);
+          if (!metric) {
+            res.status(400).json({ error: "This report uses a metric that no longer exists." });
+            return;
+          }
+          try {
+            m.expression = metricExpressionOnModel(metric, base, model);
+          } catch (err) {
+            res.status(400).json({ error: `${metric.label || "A metric"}: ${err.message}` });
+            return;
+          }
+          m.aggregation = "expression";
+          m.label = m.label || metric.label;
+        }
         if (isFormulaMeasure(m)) {
           rMeasures.push({ id: m.id, label: m.label, aggregation: "expression", expression: m.expression, columns: known });
           continue;

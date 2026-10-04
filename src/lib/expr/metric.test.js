@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { metricExpression } from "./metric.js";
+import { metricExpression, metricExpressionOnModel } from "./metric.js";
 import { compileExpression } from "./compile.js";
 
 const node = {
@@ -48,4 +48,11 @@ test("metrics become formulas that compile as measures", () => {
 
 test("a metric on another table is refused with a pointer", () => {
   assert.throws(() => metricExpression(m("m_x"), node), /open it as a Metrics report/);
+});
+
+test("a metric on a Model uses the Model's column names", () => {
+  const model = { kind: "builder", baseTableId: "t_o", columns: [{ tableId: "t_o", columnId: "c_total", alias: "amount" }, { tableId: "t_o", columnId: "c_status", alias: "" }] };
+  assert.equal(metricExpressionOnModel(m("m_paid"), node, model), 'SumIf([amount], [status] = "paid")');
+  assert.throws(() => metricExpressionOnModel(m("m_big"), node, model), /"qty", which this data leaves out/);
+  assert.throws(() => metricExpressionOnModel(m("m_rev"), node, { kind: "sql" }), /their own table/);
 });

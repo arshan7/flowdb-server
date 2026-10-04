@@ -80,3 +80,28 @@ export function metricExpression(measure, node, depth = 0) {
   }
   return term(measure);
 }
+
+/**
+ * A metric of `base`, as formula text over a Model (or a report's shaped data) built
+ * from that table: its columns go by the names the Model gives them.
+ * @param {object} measure
+ * @param {object} base - the Model's base table node
+ * @param {{kind: string, baseTableId: string, columns?: object[]}} model
+ */
+export function metricExpressionOnModel(measure, base, model) {
+  if (model.kind !== "builder" || model.baseTableId !== base.id) {
+    throw new MetricError("Saved metrics work on data built from their own table.");
+  }
+  const outName = new Map();
+  for (const c of model.columns || []) {
+    if (c && !c.kind && c.tableId === base.id) outName.set(c.columnId, (c.alias || "").trim() || null);
+  }
+  const columns = (base.data?.columns || []).map((c) => (outName.has(c.id) ? { ...c, name: outName.get(c.id) || c.name } : c));
+  const used = (base.data?.columns || []).filter((c) => !outName.has(c.id)).map((c) => c.id);
+  const node = { ...base, data: { ...base.data, columns } };
+  const text = metricExpression(measure, node);
+  // A column the Model leaves out can't be read; say which one.
+  const missing = used.map((id) => base.data.columns.find((c) => c.id === id)).find((c) => text.includes(`[${c.name}]`));
+  if (missing) throw new MetricError(`It needs the column "${missing.name}", which this data leaves out.`);
+  return text;
+}
