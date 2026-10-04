@@ -10,7 +10,7 @@ import { resolveJoins, findJoinPath, buildForwardJoinGraph, chainTo } from "../l
 import { compileModelReport, kindOfColumnType } from "../lib/modelEngine.js";
 import { QUERY_OPERATORS } from "../lib/previewFilters.js";
 import { metricExpression, metricExpressionOnModel } from "../lib/expr/metric.js";
-import { resolveModelSql, MAX_FORMULA_TOKENS, isDatasetSpec } from "../lib/modelSql.js";
+import { loadJoinedModels, resolveModelSql, MAX_FORMULA_TOKENS, isDatasetSpec } from "../lib/modelSql.js";
 import { wrap, sendQueryError } from "./http.js";
 import { cleanShowAs } from "../lib/showAs.js";
 
@@ -237,7 +237,8 @@ export async function handleReportQuery(req, res) {
                 filters: Array.isArray(dataset.filters) ? dataset.filters : [],
               };
       }
-      const compiledModel = resolveModelSql(model, branch, secrets.schema ?? null);
+      const joined = await loadJoinedModels(model, (id) => store.getModel(req.params.sourceId, id));
+      const compiledModel = resolveModelSql(model, branch, secrets.schema ?? null, joined);
       if (compiledModel.error) {
         res.status(400).json({ error: compiledModel.error });
         return;

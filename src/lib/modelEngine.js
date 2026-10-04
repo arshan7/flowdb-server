@@ -161,6 +161,9 @@ function compileTyped(node, params) {
 // caller wraps it.
 const ROW_ALIAS = "_tsr";
 
+// "$1" -> "$<1 + shift>": a subquery's placeholders after the outer query's.
+const shiftSubquery = (sql, shift) => (shift ? sql.replace(/\$(\d+)/g, (_, n) => `$${Number(n) + shift}`) : sql);
+
 export function compileModel(spec) {
   if (spec.kind === "sql") {
     return { sql: String(spec.sql || ""), params: spec.params || [], columns: null };
@@ -197,6 +200,12 @@ export function compileModel(spec) {
     const on = onPairs
       .map((p) => `${quoteQualified(from, p.baseColumn)} = ${quoteQualified(j.tableName, p.joinColumn)}`)
       .join(" AND ");
+    // A joined Model: its SQL as a subquery, its placeholders after the ones so far.
+    if (j.subquery) {
+      const shift = params.length;
+      params.push(...j.subquery.params);
+      return `${joinKeyword(j.type)} (${shiftSubquery(j.subquery.sql, shift)}) AS ${quoteIdent(j.tableName)} ON ${on}`;
+    }
     return `${joinKeyword(j.type)} ${quoteTable(j.tableSchema, j.tableName)} ON ${on}`;
   });
   const whereParts = (spec.filters || []).map((f) =>

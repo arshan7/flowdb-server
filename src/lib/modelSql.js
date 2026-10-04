@@ -13,7 +13,25 @@ import { QUERY_OPERATORS } from "./previewFilters.js";
 // `defaultSchema` (the source's pinned connection_schema, or null for an
 // all-schemas source) is the FROM/JOIN schema fallback for any base/join
 // node that predates schema tagging - node.data.schema always wins.
-export function resolveModelSql(model, branch, defaultSchema = null) {
+// A joined Model (`{ modelId, pairs: [{ baseColumnId, column }], type }`) joins as a
+// subquery; `joinedModels` maps its id to the stored row (see loadJoinedModels).
+const MAX_MODEL_DEPTH = 3;
+export const joinedModelAlias = (id) => `model_${id}`;
+const isModelJoin = (j) => j && typeof j === "object" && j.modelId != null;
+
+/** The Models a model joins (and theirs), fetched once: id -> row. Cycles stop. */
+export async function loadJoinedModels(model, getModel, out = new Map(), depth = 0) {
+  if (depth >= MAX_MODEL_DEPTH) return out;
+  for (const j of Array.isArray(model?.joins) ? model.joins : []) {
+    if (!isModelJoin(j) || out.has(String(j.modelId))) continue;
+    const m = await getModel(j.modelId);
+    out.set(String(j.modelId), m || null);
+    if (m) await loadJoinedModels(m, getModel, out, depth + 1);
+  }
+  return out;
+}
+
+export function resolveModelSql(model, branch, defaultSchema = null, joinedModels = new Map(), depth = 0) {
   if (model.kind === "sql") {
     if (!model.sql || !model.sql.trim()) return { error: "This model has no SQL." };
     const defaults = {};
@@ -30,7 +48,8 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
   // { tableId, type } once it has a join type - or an explicit spec
   // { tableId, pairs, type? } for a table with no defined relationship (the
   // user picked the join keys themselves in the Model builder).
-  const rawJoins = Array.isArray(model.joins) ? model.joins : [];
+  const rawJoins = (Array.isArray(model.joins) ? model.joins : []).filter((j) => !isModelJoin(j));
+  const modelJoins = (Array.isArray(model.joins) ? model.joins : []).filter(isModelJoin);
   const isManual = (j) => j && typeof j === "object" && (Array.isArray(j.pairs) || j.baseColumnId);
   const fkJoins = rawJoins.filter((j) => typeof j === "string" || (j && typeof j === "object" && !isManual(j)));
   const fkJoinIds = fkJoins.map((j) => (typeof j === "string" ? j : j.tableId));
@@ -65,6 +84,27 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
       type: normalizeJoinType(mj.type),
     });
   }
+  // Joined Models: compiled here, placed as subqueries by compileModel.
+  const joinedOut = new Map(); // modelId -> its output column names (null: a SQL model)
+  for (const mj of modelJoins) {
+    const id = String(mj.modelId);
+    if (depth >= MAX_MODEL_DEPTH) return { error: "Models join each other too deeply." };
+    const row = joinedModels.get(id);
+    if (!row) return { error: "This joins a model that no longer exists." };
+    const sub = resolveModelSql(row, branch, defaultSchema, joinedModels, depth + 1);
+    if (sub.error) return { error: `The joined model "${row.name || id}": ${sub.error}` };
+    const pairs = [];
+    for (const p of Array.isArray(mj.pairs) ? mj.pairs : []) {
+      const bCol = (base.data?.columns || []).find((c) => c.id === p.baseColumnId);
+      if (!bCol || typeof p.column !== "string" || (sub.columns && !sub.columns.includes(p.column))) {
+        return { error: "A join to a model references a column that no longer exists." };
+      }
+      pairs.push({ baseColumn: bCol.name, joinColumn: p.column });
+    }
+    if (!pairs.length) return { error: "A join to a model needs columns to match on." };
+    joinedOut.set(id, sub.columns);
+    joinClauses.push({ subquery: sub, tableName: joinedModelAlias(id), fromTableName: base.data.label, pairs, type: normalizeJoinType(mj.type) });
+  }
   const nodeFor = (tid) => (tid === base.id ? base : joinNodes.find((n) => n.id === tid));
 
   const columns = [];
@@ -88,6 +128,14 @@ export function resolveModelSql(model, branch, defaultSchema = null) {
       const tree = resolveColumnFormula(c.tokens, nodeFor);
       if (!tree) return { error: `The custom column "${alias}" has an incomplete or invalid formula.` };
       columns.push({ kind: "exprTree", tree, alias });
+      continue;
+    }
+    if (c && c.modelId != null) {
+      const out = joinedOut.get(String(c.modelId));
+      if (out === undefined || typeof c.column !== "string" || (out && !out.includes(c.column))) {
+        return { error: "This model references a column that no longer exists." };
+      }
+      columns.push({ tableName: joinedModelAlias(c.modelId), columnName: c.column, alias: (c.alias || "").trim() || c.column });
       continue;
     }
     const n = nodeFor(c.tableId);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveModelSql } from "./modelSql.js";
+import { loadJoinedModels, resolveModelSql } from "./modelSql.js";
 
 const node = (id, label, columns) => ({ id, type: "tableNode", data: { label, columns } });
 const orders = node("t_o", "orders", [
@@ -64,4 +64,45 @@ test("row filters by output column read the finished rows", () => {
   assert.equal(r.error, undefined);
   assert.match(r.sql, /^SELECT \* FROM \(SELECT .* FROM "orders"\) AS "_tsr" WHERE "_tsr"."status" = \$1$/);
   assert.deepEqual(r.params, ["paid"]);
+});
+
+// A saved Model joined into another: customer totals with a status filter (a bound value).
+const custTotals = {
+  name: "Customer totals",
+  kind: "builder",
+  baseTableId: "t_c",
+  joins: [],
+  columns: [{ tableId: "t_c", columnId: "c_id", alias: "customer" }, { tableId: "t_c", columnId: "c_name" }],
+  filters: [{ column: "name", operator: "neq", value: "test" }],
+};
+
+test("a joined Model compiles as a subquery, its placeholders after the outer ones", () => {
+  const m = {
+    kind: "builder",
+    baseTableId: "t_o",
+    joins: [{ modelId: 9, type: "left", pairs: [{ baseColumnId: "o_cust", column: "customer" }] }],
+    columns: [{ tableId: "t_o", columnId: "o_id" }, { modelId: 9, column: "name", alias: "customer_name" }],
+    filters: [{ column: "id", operator: "gt", value: 5 }],
+  };
+  const { sql, params, error, columns } = resolveModelSql(m, branch, null, new Map([["9", custTotals]]));
+  assert.equal(error, undefined);
+  assert.match(sql, /LEFT JOIN \(SELECT \* FROM \(SELECT .* FROM "customers"\) AS "_tsr" WHERE .*\$1.*\) AS "model_9" ON "orders"\."customer_id" = "model_9"\."customer"/);
+  assert.match(sql, /"model_9"\."name" AS "customer_name"/);
+  assert.match(sql, /WHERE .*\$2/);
+  assert.deepEqual(params, ["test", 5]);
+  assert.deepEqual(columns, ["id", "customer_name"]);
+});
+
+test("a joined Model that's gone, or a column it doesn't have, is an error", () => {
+  const m = { kind: "builder", baseTableId: "t_o", joins: [{ modelId: 9, pairs: [{ baseColumnId: "o_cust", column: "nope" }] }], columns: [{ tableId: "t_o", columnId: "o_id" }] };
+  assert.match(resolveModelSql(m, branch, null, new Map()).error, /no longer exists/);
+  assert.match(resolveModelSql(m, branch, null, new Map([["9", custTotals]])).error, /no longer exists/);
+});
+
+test("loadJoinedModels fetches nested joins once and stops on a cycle", async () => {
+  const rows = { 1: { joins: [{ modelId: 2 }] }, 2: { joins: [{ modelId: 1 }] } };
+  const asked = [];
+  const out = await loadJoinedModels({ joins: [{ modelId: 1 }] }, async (id) => (asked.push(id), rows[id]));
+  assert.deepEqual([...out.keys()], ["1", "2"]);
+  assert.deepEqual(asked, [1, 2]);
 });

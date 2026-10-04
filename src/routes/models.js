@@ -3,7 +3,7 @@ import * as store from "../lib/tablespaceStore.js";
 import { logger } from "../lib/logger.js";
 import { runNativeQuery, paginateRows, ALLOWED_PAGE_SIZES, MAX_ROWS } from "../lib/queryEngine.js";
 import { previewWhereClause } from "../lib/previewFilters.js";
-import { resolveModelSql } from "../lib/modelSql.js";
+import { loadJoinedModels, resolveModelSql } from "../lib/modelSql.js";
 import { typeOfField } from "../lib/pgTypes.js";
 import { wrap } from "./http.js";
 
@@ -54,7 +54,8 @@ modelsRouter.post(
       res.status(400).json({ error: "A model or modelId is required." });
       return;
     }
-    const compiled = resolveModelSql(model, branch, secrets.schema ?? null);
+    const joined = await loadJoinedModels(model, (id) => store.getModel(req.params.sourceId, id));
+    const compiled = resolveModelSql(model, branch, secrets.schema ?? null, joined);
     if (compiled.error) {
       res.status(400).json({ error: compiled.error });
       return;
