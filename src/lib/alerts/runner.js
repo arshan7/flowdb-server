@@ -11,7 +11,7 @@ const PAGE = 500;
 
 // The query handlers export; imported lazily so this module loads without the
 // whole route tree (and its database pool) in unit tests.
-async function runRequest(sourceId, request) {
+export async function runRequest(sourceId, request, pageSize = PAGE) {
   const { handleReportQuery, handleNativeQuery } = await import("../../routes/query.js");
   const handler = request.endpoint === "native" ? handleNativeQuery : handleReportQuery;
   return new Promise((resolve, reject) => {
@@ -28,7 +28,7 @@ async function runRequest(sourceId, request) {
       set() {},
       setHeader() {},
     };
-    handler({ params: { sourceId: String(sourceId) }, body: { ...request.body, offset: 0, pageSize: PAGE, withTotal: false, fresh: true } }, res).catch(reject);
+    handler({ params: { sourceId: String(sourceId) }, body: { ...request.body, offset: 0, pageSize, withTotal: false, fresh: true } }, res).catch(reject);
   });
 }
 

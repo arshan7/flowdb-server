@@ -1274,6 +1274,87 @@ export async function finishAlertRun(alertId, { nextRunAt, lastState, sent, erro
   );
 }
 
+// --- Dashboard subscriptions (migration c7f1a2d9e4b6) ----------------------------
+// A dashboard emailed on a schedule; lib/subscriptions/runner.js runs the due ones.
+const SUBSCRIPTION_COLUMNS = `
+  id, source_id AS "sourceId", dashboard_id AS "dashboardId", owner_user_id AS "ownerUserId",
+  schedule, timezone, recipients, attachment, filter_values AS "filterValues", tiles, active,
+  next_run_at AS "nextRunAt", last_run_at AS "lastRunAt", last_sent_at AS "lastSentAt",
+  last_error AS "lastError", created_at AS "createdAt", updated_at AS "updatedAt"
+`;
+
+export async function listSubscriptions(sourceId, dashboardId = null) {
+  const { rows } = await query(
+    `SELECT ${SUBSCRIPTION_COLUMNS} FROM tablespace_subscriptions WHERE source_id = $1 AND ($2::int IS NULL OR dashboard_id = $2) ORDER BY created_at`,
+    [sourceId, dashboardId],
+  );
+  return rows;
+}
+
+export async function getSubscription(sourceId, id) {
+  const { rows } = await query(`SELECT ${SUBSCRIPTION_COLUMNS} FROM tablespace_subscriptions WHERE id = $1 AND source_id = $2`, [id, sourceId]);
+  return rows[0] || null;
+}
+
+export async function createSubscription(sourceId, s) {
+  const { rows } = await query(
+    `INSERT INTO tablespace_subscriptions (source_id, dashboard_id, owner_user_id, schedule, timezone, recipients, attachment, filter_values, tiles, active, next_run_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ${SUBSCRIPTION_COLUMNS}`,
+    [sourceId, s.dashboardId, s.ownerUserId, toJson(s.schedule), s.timezone, toJson(s.recipients), s.attachment, toJson(s.filterValues || {}), toJson(s.tiles), s.active, s.nextRunAt],
+  );
+  return rows[0];
+}
+
+export async function updateSubscription(sourceId, id, patch) {
+  const sets = [];
+  const values = [id, sourceId];
+  const set = (col, v) => {
+    values.push(v);
+    sets.push(`${col} = $${values.length}`);
+  };
+  for (const [k, col] of [["schedule", "schedule"], ["recipients", "recipients"], ["filterValues", "filter_values"], ["tiles", "tiles"]]) {
+    if (patch[k] !== undefined) set(col, toJson(patch[k]));
+  }
+  if (patch.timezone !== undefined) set("timezone", patch.timezone);
+  if (patch.attachment !== undefined) set("attachment", patch.attachment);
+  if (patch.active !== undefined) set("active", patch.active);
+  if (patch.nextRunAt !== undefined) set("next_run_at", patch.nextRunAt);
+  if (!sets.length) return getSubscription(sourceId, id);
+  const { rows } = await query(
+    `UPDATE tablespace_subscriptions SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND source_id = $2 RETURNING ${SUBSCRIPTION_COLUMNS}`,
+    values,
+  );
+  return rows[0] || null;
+}
+
+export async function deleteSubscription(sourceId, id) {
+  const { rowCount } = await query(`DELETE FROM tablespace_subscriptions WHERE id = $1 AND source_id = $2`, [id, sourceId]);
+  return rowCount > 0;
+}
+
+/** Due subscriptions, claimed the same way as claimDueAlerts. */
+export async function claimDueSubscriptions(limit = 10) {
+  const { rows } = await query(
+    `UPDATE tablespace_subscriptions SET next_run_at = now() + interval '15 minutes'
+     WHERE id IN (
+       SELECT id FROM tablespace_subscriptions
+       WHERE active AND next_run_at IS NOT NULL AND next_run_at <= now()
+       ORDER BY next_run_at LIMIT $1 FOR UPDATE SKIP LOCKED
+     ) RETURNING ${SUBSCRIPTION_COLUMNS}`,
+    [limit],
+  );
+  return rows;
+}
+
+export async function finishSubscriptionRun(id, { nextRunAt, sent, error }) {
+  await query(
+    `UPDATE tablespace_subscriptions SET next_run_at = $2, last_run_at = now(),
+       last_sent_at = CASE WHEN $3 THEN now() ELSE last_sent_at END, last_error = $4
+     WHERE id = $1`,
+    [id, nextRunAt, !!sent, error ?? null],
+  );
+}
+
 /** The email address of a Clerk user we know, or null. */
 export async function userEmail(userId) {
   const { rows } = await query(`SELECT email FROM tablespace_users WHERE clerk_user_id = $1`, [userId]).catch(() => ({ rows: [] }));

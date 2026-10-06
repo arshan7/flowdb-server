@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildWelcomeEmail, sendWelcomeEmail } from "./email.js";
+import { buildSubscriptionEmail, buildWelcomeEmail, sendWelcomeEmail } from "./email.js";
 
 test("buildWelcomeEmail: personalised greeting + CTA link", () => {
   const { subject, html, text } = buildWelcomeEmail({ name: "Ada", appUrl: "https://app.example.com" });
@@ -44,4 +44,21 @@ test("buildAlertEmail - escapes values, caps rows, links the report", async () =
   assert.ok(!html.includes("<b>x</b>"));
   assert.ok(html.includes("and 5 more rows"));
   assert.ok(text.includes("Open the report: https://app/r/1"));
+});
+
+test("subscription email: each report's first rows, failures named, link", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ n: i }));
+  const e = buildSubscriptionEmail({
+    dashboardName: "Sales",
+    tiles: [
+      { name: "Orders", columns: [{ id: "n", label: "N" }], rows },
+      { name: "Broken", error: "relation does not exist" },
+    ],
+    dashboardUrl: "https://app/d/1",
+    attached: true,
+  });
+  assert.equal(e.subject, "Sales - dashboard");
+  assert.match(e.html, /…and 2 more rows in the attachment/);
+  assert.match(e.html, /Couldn&#39;t run|Couldn't run: relation does not exist/);
+  assert.match(e.text, /Open the dashboard: https:\/\/app\/d\/1/);
 });

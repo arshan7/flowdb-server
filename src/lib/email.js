@@ -159,13 +159,61 @@ export function buildAlertEmail({ reportName, what, columns, rows, reportUrl }) 
   return { subject, html, text };
 }
 
+// --- Dashboard subscriptions -----------------------------------------------------
+const TILE_ROWS = 10;
+const tableHtml = (columns, rows) => {
+  const th = columns.map((c) => `<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #e4e1d7;font-size:12px;color:#6f6b62">${esc(c.label || c.id)}</th>`).join("");
+  const trs = rows
+    .map((r) => `<tr>${columns.map((c) => `<td style="padding:6px 10px;border-bottom:1px solid #f1efe9;font-size:13px">${esc(r[c.id])}</td>`).join("")}</tr>`)
+    .join("");
+  return `<table style="border-collapse:collapse;width:100%"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
+};
+
+/**
+ * A dashboard email: each report's first rows (or its error), and a link. Pure - unit-tested.
+ * @param {{dashboardName: string, tiles: {name: string, columns?: object[], rows?: object[], error?: string}[],
+ *   dashboardUrl: string, attached?: boolean}} p
+ */
+export function buildSubscriptionEmail({ dashboardName, tiles, dashboardUrl, attached = false }) {
+  const subject = `${dashboardName} - dashboard`;
+  const section = (t) => {
+    const head = `<h3 style="font-size:15px;margin:24px 0 8px">${esc(t.name)}</h3>`;
+    if (t.error) return `${head}<p style="color:#b42318;font-size:13px">Couldn't run: ${esc(t.error)}</p>`;
+    const rows = t.rows || [];
+    const more = rows.length > TILE_ROWS ? `<p style="color:#6f6b62;font-size:13px">…and ${rows.length - TILE_ROWS} more rows${attached ? " in the attachment" : ""}.</p>` : "";
+    return `${head}${rows.length ? tableHtml(t.columns || [], rows.slice(0, TILE_ROWS)) : '<p style="color:#6f6b62;font-size:13px">No rows.</p>'}${more}`;
+  };
+  const html = `<div style="font-family:Inter,Segoe UI,Arial,sans-serif;color:#1b1a18;max-width:640px">
+<p style="font-size:15px"><strong>${esc(dashboardName)}</strong></p>${tiles.map(section).join("")}
+<p style="margin-top:24px"><a href="${esc(dashboardUrl)}" style="color:#1b8a5a">Open the dashboard</a></p>
+<p style="color:#9c9686;font-size:12px">You get this because someone subscribed you to this dashboard in Tablespace.</p></div>`;
+  const text = [
+    dashboardName,
+    ...tiles.flatMap((t) => {
+      if (t.error) return ["", t.name, `Couldn't run: ${t.error}`];
+      const cols = t.columns || [];
+      return ["", t.name, cols.map((c) => c.label || c.id).join("\t"), ...(t.rows || []).slice(0, TILE_ROWS).map((r) => cols.map((c) => r[c.id] ?? "").join("\t"))];
+    }),
+    "",
+    `Open the dashboard: ${dashboardUrl}`,
+  ].join("\n");
+  return { subject, html, text };
+}
+
 /** Sends one email; never throws. @returns {{sent: boolean, skipped?: string, error?: string}} */
-export async function sendEmail({ to, subject, html, text }) {
+export async function sendEmail({ to, subject, html, text, attachments }) {
   if (!to || (Array.isArray(to) && !to.length)) return { sent: false, skipped: "no recipient" };
   const resend = getClient();
   if (!resend) return { sent: false, skipped: "not configured" };
   try {
-    const { error } = await resend.emails.send({ from: process.env.ALERT_EMAIL_FROM || process.env.WELCOME_EMAIL_FROM || FROM_FALLBACK, to, subject, html, text });
+    const { error } = await resend.emails.send({
+      from: process.env.ALERT_EMAIL_FROM || process.env.WELCOME_EMAIL_FROM || FROM_FALLBACK,
+      to,
+      subject,
+      html,
+      text,
+      ...(attachments?.length ? { attachments } : {}),
+    });
     if (error) {
       logger.error("[email] send rejected", error instanceof Error ? error : new Error(String(error)));
       return { sent: false, error: error.message || String(error) };

@@ -219,3 +219,18 @@ export async function streamExport(res, { format, name, columns, run }) {
   res.end();
   return count;
 }
+
+/** The same file, as a Buffer (an email attachment). */
+export async function exportToBuffer({ format, name, columns, rows }) {
+  const chunks = [];
+  const sink = {
+    setHeader() {},
+    write(c) {
+      chunks.push(Buffer.from(c));
+      return true;
+    },
+    end() {},
+  };
+  await streamExport(sink, { format, name, columns, run: (onBatch) => onBatch(rows) });
+  return Buffer.concat(chunks);
+}
