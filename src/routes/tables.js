@@ -1,6 +1,6 @@
 import { Router } from "express";
 import * as store from "../lib/tablespaceStore.js";
-import { runWriteTransaction, runQuery } from "../lib/queryEngine.js";
+import { runWriteTransaction, runQuery, quoteTable } from "../lib/queryEngine.js";
 import { buildCreateTable } from "../lib/ddl.js";
 import { planAlter, buildAlterStatements } from "../lib/alterTable.js";
 import { syncSource } from "../lib/syncSource.js";
@@ -372,6 +372,79 @@ tablesRouter.post(
     } catch (err) {
       logger.error("[tables] altered, but sync failed", err);
       res.json({ sql, sync: null, syncError: "The table was changed, but refreshing the schema failed. Use Sync now to pull it in." });
+    }
+  }),
+);
+
+// POST { confirmName, dryRun? } - drop a live (synced) table in the database.
+// The name must be typed back; no CASCADE, so links from other tables block it.
+//   dryRun -> { sql, rows, linkedBy }     (what the confirm step shows)
+//   else   -> { sql, sync | null, syncError? }  (sync takes it out of the design)
+tablesRouter.post(
+  "/sources/:sourceId/tables/:tableId/drop",
+  wrap(async (req, res) => {
+    const { confirmName, dryRun } = req.body || {};
+    const secrets = await store.getSourceConnectionSecrets(req.params.sourceId);
+    if (!secrets) {
+      res.status(400).json({ error: "Connect this source to a database before deleting tables." });
+      return;
+    }
+    const branch = await store.getMainBranch(req.params.sourceId);
+    const node = (branch?.nodes || []).find((n) => n.type === "tableNode" && n.id === req.params.tableId);
+    if (!node) {
+      res.status(404).json({ error: "That table wasn't found. Sync, then try again." });
+      return;
+    }
+    if (node.data?.sourceOrigin !== "synced") {
+      res.status(400).json({ error: "This table only exists in the design; there's nothing to delete in the database." });
+      return;
+    }
+    const schema = node.data.schema ?? secrets.schema ?? null;
+    const table = node.data.label;
+    const sql = `DROP TABLE ${quoteTable(schema, table)};`;
+
+    if (dryRun) {
+      try {
+        const [count] = await runQuery(secrets.connectionString, `SELECT count(*)::bigint AS n FROM ${quoteTable(schema, table)}`);
+        const linkedBy = await linkingTables(secrets.connectionString, schema, table);
+        res.json({ sql, rows: Number(count?.n ?? 0), linkedBy });
+      } catch (err) {
+        sendQueryError(res, "read table", err);
+      }
+      return;
+    }
+    if (confirmName !== table) {
+      res.status(400).json({ error: `Type “${table}” to delete it.` });
+      return;
+    }
+
+    try {
+      await runWriteTransaction(secrets.connectionString, (client) => client.query(sql));
+    } catch (err) {
+      if (err.code === "2BP01") {
+        const linked = await linkingTables(secrets.connectionString, schema, table).catch(() => []);
+        res.status(409).json({
+          error: linked.length
+            ? `${linked.join(", ")} link${linked.length === 1 ? "s" : ""} to this table. Remove ${linked.length === 1 ? "that link" : "those links"} first.`
+            : ALTER_ERRORS["2BP01"][1],
+          detail: err.message,
+        });
+        return;
+      }
+      if (err.code === "42501") {
+        res.status(403).json({ error: "The database user this source connects as isn't allowed to delete this table." });
+        return;
+      }
+      sendQueryError(res, "delete table", err);
+      return;
+    }
+
+    try {
+      const sync = await syncSource(req.params.sourceId);
+      res.json({ sql, sync });
+    } catch (err) {
+      logger.error("[tables] dropped, but sync failed", err);
+      res.json({ sql, sync: null, syncError: "The table was deleted, but refreshing the schema failed. Use Sync now." });
     }
   }),
 );
