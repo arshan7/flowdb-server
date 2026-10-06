@@ -6,6 +6,7 @@ import {
   resolveNativeVars,
   quoteTable,
   compileFilterCondition,
+  parseRelativeDate,
   compileLinkedCondition,
   compileFilterGroup,
   countQueryOf,
@@ -380,4 +381,23 @@ test("compileLinkedCondition - filters through a link column with a subquery", (
 test("standard deviation and variance aggregate a column", () => {
   assert.equal(aggExpr("stddev", "total", "orders"), 'STDDEV_SAMP("orders"."total")');
   assert.equal(aggExpr("variance", "total", "orders"), 'VAR_SAMP("orders"."total")');
+});
+
+test("relative dates: the last N units, with an optional offset", () => {
+  const params = [];
+  const sql = compileFilterCondition("orders", "created_at", "past", "30 day 1 year", params);
+  assert.equal(sql, `("orders"."created_at" >= CURRENT_DATE - $1::interval - $2::interval AND "orders"."created_at" < CURRENT_DATE + 1 - $2::interval)`);
+  assert.deepEqual(params, ["30 day", "1 year"]);
+});
+
+test("relative dates: this unit, no parameters", () => {
+  const params = [];
+  assert.match(compileFilterCondition("o", "d", "this", "month", params), /DATE_TRUNC\('month', CURRENT_DATE\)/);
+  assert.deepEqual(params, []);
+});
+
+test("relative dates: anything else is refused", () => {
+  assert.throws(() => compileFilterCondition("o", "d", "past", "30 days; drop", []), /invalid/);
+  assert.throws(() => compileFilterCondition("o", "d", "this", "decade", []), /invalid/);
+  assert.equal(parseRelativeDate("past", "0 day"), null);
 });

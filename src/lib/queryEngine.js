@@ -126,6 +126,7 @@ export function dimExpr(dim) {
 // reached from preview - the shared helper just stays complete.
 export function compileFilterCondition(tableName, columnName, operator, value, params) {
   const colExpr = quoteQualified(tableName, columnName);
+  if (operator === "past" || operator === "this") return compileRelativeDate(colExpr, operator, value, params);
   if (operator === "isnull") return `${colExpr} IS NULL`;
   if (operator === "notnull") return `${colExpr} IS NOT NULL`;
   if (operator === "in") {
@@ -143,6 +144,33 @@ export function compileFilterCondition(tableName, columnName, operator, value, p
   }
   params.push(operator === "contains" ? `%${value}%` : value);
   return `${colExpr} ${OPERATORS[operator]} $${params.length}`;
+}
+
+// Relative dates, worked out when the query runs so a saved report moves with the
+// calendar. "past" = "30 day" or "30 day 1 year" (the last 30 days, starting a
+// year ago): [today - 30 days - offset, tomorrow - offset). "this" = "month".
+const DATE_UNITS = new Set(["day", "week", "month", "quarter", "year"]);
+const RELATIVE_RE = /^(\d{1,4}) (day|week|month|quarter|year)(?: (\d{1,4}) (day|week|month|quarter|year))?$/;
+
+export function parseRelativeDate(operator, value) {
+  if (operator === "this") return DATE_UNITS.has(value) ? { unit: value } : null;
+  const m = RELATIVE_RE.exec(String(value ?? "").trim());
+  if (!m || Number(m[1]) < 1) return null;
+  return { n: Number(m[1]), unit: m[2], ago: m[3] ? { n: Number(m[3]), unit: m[4] } : null };
+}
+
+function compileRelativeDate(colExpr, operator, value, params) {
+  const rel = parseRelativeDate(operator, value);
+  if (!rel) throw Object.assign(new Error("A relative date filter has an invalid value."), { isFriendly: true });
+  if (operator === "this") {
+    const start = `DATE_TRUNC('${rel.unit}', CURRENT_DATE)`;
+    return `(${colExpr} >= ${start} AND ${colExpr} < ${start} + INTERVAL '1 ${rel.unit}')`;
+  }
+  params.push(`${rel.n} ${rel.unit}`);
+  const span = `$${params.length}::interval`;
+  params.push(rel.ago ? `${rel.ago.n} ${rel.ago.unit}` : "0 day");
+  const ago = `$${params.length}::interval`;
+  return `(${colExpr} >= CURRENT_DATE - ${span} - ${ago} AND ${colExpr} < CURRENT_DATE + 1 - ${ago})`;
 }
 
 // A condition on a linked table's column, through this table's link column:

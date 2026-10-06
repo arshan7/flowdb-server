@@ -4,7 +4,7 @@ const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const isDayList = (type, list) =>
   /date|timestamp/i.test(String(type || "")) && list.every((v) => DAY_RE.test(String(v)));
 
-export const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains", "in"]);
+export const QUERY_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "contains", "in", "past", "this"]);
 
 // Data-browse /preview row filters - plain-language operators ("is", "is
 // not", "contains", "greater than"..., "is empty", "is not empty", "is any
