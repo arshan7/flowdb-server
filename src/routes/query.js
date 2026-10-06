@@ -235,6 +235,8 @@ export async function handleReportQuery(req, res) {
                 joins: Array.isArray(dataset.joins) ? dataset.joins : [],
                 columns: dataset.columns,
                 filters: Array.isArray(dataset.filters) ? dataset.filters : [],
+                // A summarized Model edited in the report keeps its summary (checked when compiled).
+                ...(dataset.summary && typeof dataset.summary === "object" ? { summary: dataset.summary } : {}),
               };
       }
       const joined = await loadJoinedModels(model, (id) => store.getModel(req.params.sourceId, id));
