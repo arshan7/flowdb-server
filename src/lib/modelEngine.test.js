@@ -48,6 +48,31 @@ test("compileModel builder - multi-key join AND-s every column pair", () => {
   );
 });
 
+test("compileModel builder - a pair can compare with <, >= etc. (date ranges)", () => {
+  const { sql } = compileModel({
+    kind: "builder",
+    baseTableName: "orders",
+    joinClauses: [
+      {
+        tableName: "prices",
+        fromTableName: "orders",
+        pairs: [
+          { baseColumn: "product_id", joinColumn: "product_id" },
+          { baseColumn: "ordered_at", joinColumn: "valid_from", op: ">=" },
+          { baseColumn: "ordered_at", joinColumn: "valid_to", op: "<" },
+          { baseColumn: "status", joinColumn: "status", op: "bogus" },
+        ],
+      },
+    ],
+    columns: [{ tableName: "prices", columnName: "price", alias: "price" }],
+    filters: [],
+  });
+  assert.match(
+    sql,
+    /ON "orders"\."product_id" = "prices"\."product_id" AND "orders"\."ordered_at" >= "prices"\."valid_from" AND "orders"\."ordered_at" < "prices"\."valid_to" AND "orders"\."status" = "prices"\."status"/,
+  );
+});
+
 test("compileModel sql - passed through, columns unknown", () => {
   const out = compileModel({ kind: "sql", sql: "SELECT a, b FROM t WHERE a = $1", params: [7] });
   assert.equal(out.sql, "SELECT a, b FROM t WHERE a = $1");

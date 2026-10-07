@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findJoinPath, buildForwardJoinGraph, resolveJoins, chainTo, joinKeyword } from "./joinResolve.js";
+import { findJoinPath, buildForwardJoinGraph, resolveJoins, chainTo, joinKeyword, joinOp } from "./joinResolve.js";
 
 function col(id, name, extra = {}) {
   return { id, name, ...extra };
@@ -126,4 +126,8 @@ test("joinKeyword - only the four join keywords ever reach SQL", () => {
   assert.deepEqual(["inner", "left", "right", "full", "bogus", undefined].map(joinKeyword), [
     "JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "JOIN", "JOIN",
   ]);
+});
+
+test("joinOp - only the six comparisons ever reach SQL", () => {
+  assert.deepEqual(["=", "!=", "<", "<=", ">", ">=", "; DROP", undefined].map(joinOp), ["=", "<>", "<", "<=", ">", ">=", "=", "="]);
 });

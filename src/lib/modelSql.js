@@ -74,7 +74,7 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
       const bCol = (base.data?.columns || []).find((c) => c.id === p.baseColumnId);
       const jCol = (jn.data?.columns || []).find((c) => c.id === p.joinColumnId);
       if (!bCol || !jCol) return { error: "This model's join references a column that no longer exists." };
-      pairs.push({ baseColumn: bCol.name, joinColumn: jCol.name });
+      pairs.push({ baseColumn: bCol.name, joinColumn: jCol.name, op: p.op });
     }
     if (!pairs.length) return { error: "This model's join has no matching columns." };
     if (!joinNodes.some((n) => n.id === jn.id)) joinNodes.push(jn);
@@ -102,7 +102,7 @@ export function resolveModelSql(model, branch, defaultSchema = null, joinedModel
       if (!bCol || typeof p.column !== "string" || (sub.columns && !sub.columns.includes(p.column))) {
         return { error: "A join to a model references a column that no longer exists." };
       }
-      pairs.push({ baseColumn: bCol.name, joinColumn: p.column });
+      pairs.push({ baseColumn: bCol.name, joinColumn: p.column, op: p.op });
     }
     if (!pairs.length) return { error: "A join to a model needs columns to match on." };
     joinedOut.set(id, sub.columns);

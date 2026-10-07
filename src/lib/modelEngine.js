@@ -4,7 +4,7 @@
 // the model to aggregate over. Both reuse queryEngine's primitives so a
 // model-sourced report and a table-sourced one emit the same shapes for
 // buckets / sort / filters / paging.
-import { joinKeyword } from "./joinResolve.js";
+import { joinKeyword, joinOp } from "./joinResolve.js";
 import { compileExpression } from "./expr/compile.js";
 import { showAsExpr } from "./showAs.js";
 import {
@@ -198,7 +198,7 @@ export function compileModel(spec) {
     // a plain FK join carries a single baseColumn/joinColumn instead.
     const onPairs = Array.isArray(j.pairs) && j.pairs.length ? j.pairs : [{ baseColumn: j.baseColumn, joinColumn: j.joinColumn }];
     const on = onPairs
-      .map((p) => `${quoteQualified(from, p.baseColumn)} = ${quoteQualified(j.tableName, p.joinColumn)}`)
+      .map((p) => `${quoteQualified(from, p.baseColumn)} ${joinOp(p.op)} ${quoteQualified(j.tableName, p.joinColumn)}`)
       .join(" AND ");
     // A joined Model: its SQL as a subquery, its placeholders after the ones so far.
     if (j.subquery) {

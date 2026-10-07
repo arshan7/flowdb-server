@@ -246,3 +246,10 @@ export function normalizeJoinType(type) {
 
 /** The SQL keyword for a join clause's `type`. */
 export const joinKeyword = (type) => JOIN_SQL[normalizeJoinType(type)];
+
+// Join-condition comparisons a pair may use; anything else is "=".
+const JOIN_OPS = { "=": "=", "!=": "<>", "<": "<", "<=": "<=", ">": ">", ">=": ">=" };
+export const JOIN_OP_KEYS = Object.keys(JOIN_OPS);
+
+/** The SQL comparison for a join pair's `op`. */
+export const joinOp = (op) => JOIN_OPS[op] || "=";
